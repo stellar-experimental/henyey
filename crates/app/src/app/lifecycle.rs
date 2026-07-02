@@ -364,7 +364,7 @@ impl App {
         // Get message receiver from overlay
         let message_rx = self.overlay().await.map(|o| o.subscribe());
 
-        let mut message_rx = match message_rx {
+        let message_rx = match message_rx {
             Some(rx) => rx,
             None => {
                 tracing::warn!("Overlay not started, running without network");
@@ -373,6 +373,22 @@ impl App {
                 drop(tx);
                 rx
             }
+        };
+
+        // Dedicated inbound-flood consumer (maxtps iter 6): bulk overlay
+        // traffic (Transaction / FloodAdvert / FloodDemand / peer chatter) is
+        // consumed on its own spawned task instead of a main-select arm. At
+        // the ~1470 tx/s ceiling this arm did ~20 s of inline work per 30 s
+        // window (maxtps_loop: broadcast ≈ 0.5 ms × 36-44 k msgs), starving
+        // SCP intake (median 92-109 ms channel wait) and the close/trigger
+        // path. SCP envelopes and fetch responses keep their dedicated
+        // channels + select arms; only the broadcast-channel firehose moves.
+        // The task holds a Weak<App> (upgrade per message) so it never keeps
+        // the App alive after shutdown; it exits on channel close or upgrade
+        // failure and is aborted on loop exit.
+        let flood_consumer_task = {
+            let weak = { self.self_arc.read().await.clone() };
+            tokio::spawn(Self::run_flood_consumer(weak, message_rx))
         };
 
         // Get dedicated SCP message receiver (never drops messages)
@@ -489,6 +505,13 @@ impl App {
         // `dispatch_peer_maintenance`, which keeps rounds strictly serial (skip a
         // tick if a prior round is still running) and is aborted on shutdown.
         let mut peer_maintenance_task: Option<tokio::task::JoinHandle<()>> = None;
+
+        // In-flight guard for the offloaded batched tx-advert flush (maxtps
+        // iter 6). Same coalesced serial pattern as peer maintenance above:
+        // one flush at a time, skipped ticks re-run next period, aborted on
+        // shutdown (the flush is periodic + idempotent-enough: an aborted
+        // flush leaves un-adverted hashes queued for the next period).
+        let mut tx_advert_flush_task: Option<tokio::task::JoinHandle<()>> = None;
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -908,6 +931,19 @@ impl App {
                         latency_ms = scp_msg.received_at.elapsed().as_millis(),
                         "SCP message arrived via dedicated channel"
                     );
+                    // [maxtps_scp] time spent queued in the dedicated SCP
+                    // channel before the event loop picked it up (slow-only).
+                    {
+                        let intake_ms = scp_msg.received_at.elapsed().as_millis() as u64;
+                        if intake_ms > 50 {
+                            tracing::info!(
+                                target: "maxtps_scp",
+                                slot = scp_slot,
+                                intake_ms,
+                                "slow_intake"
+                            );
+                        }
+                    }
                     self.pump_scp_intake(scp_msg, &mut verified_rx).await;
                     // After processing an SCP message (which may buffer an
                     // EXTERNALIZE), kick off a buffered close if none is running.
@@ -980,68 +1016,9 @@ impl App {
                 // SCP, fetch-response, and fetch-request messages no longer arrive here —
                 // they are routed exclusively to dedicated channels at the overlay layer.
                 // The skip guards below are kept as defensive fallbacks.
-                msg = message_rx.recv() => {
-                    self.set_phase(3); // 3 = broadcast
-                    match msg {
-                        Ok(overlay_msg) => {
-                            // Skip SCP messages from broadcast channel — they are already
-                            // handled via the dedicated SCP channel above.
-                            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
-                                continue;
-                            }
-                            // Skip fetch response and request messages from broadcast channel —
-                            // they are handled via the dedicated fetch channel above.
-                            if matches!(
-                                overlay_msg.message,
-                                StellarMessage::GeneralizedTxSet(_)
-                                    | StellarMessage::TxSet(_)
-                                    | StellarMessage::DontHave(_)
-                                    | StellarMessage::ScpQuorumset(_)
-                                    | StellarMessage::GetScpState(_)
-                                    | StellarMessage::GetScpQuorumset(_)
-                                    | StellarMessage::GetTxSet(_)
-                            ) {
-                                continue;
-                            }
-                            let delivery_latency = overlay_msg.received_at.elapsed();
-                            let msg_type = match &overlay_msg.message {
-                                StellarMessage::ScpMessage(_) => "SCP",
-                                StellarMessage::Transaction(_) => "TX",
-                                StellarMessage::TxSet(_) => "TxSet",
-                                StellarMessage::GeneralizedTxSet(_) => {
-                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
-                                    "GeneralizedTxSet"
-                                },
-                                StellarMessage::ScpQuorumset(_) => {
-                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
-                                    "ScpQuorumset"
-                                },
-                                StellarMessage::GetTxSet(_) => "GetTxSet",
-                                StellarMessage::Hello(_) => "Hello",
-                                StellarMessage::Peers(_) => "Peers",
-                                _ => "Other",
-                            };
-                            tracing::debug!(msg_type, latency_ms = delivery_latency.as_millis(), "Received overlay message");
-                            self.handle_overlay_message(overlay_msg).await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // Only non-critical messages (TX floods) flow through the
-                            // broadcast channel now, so lag is expected under load.
-                            // [maxtps_diag] Count dropped flood messages — under load
-                            // these are demanded txs the node never receives, forcing
-                            // re-demands (stellar_overlay_demand_timeout_total) and
-                            // leaving the agreed set short. Core never drops flooded
-                            // txs (flow-controlled per-peer queues).
-                            metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total")
-                                .increment(n);
-                            tracing::debug!(skipped = n, "Overlay broadcast receiver lagged (non-critical messages only)");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            tracing::info!("Overlay broadcast channel closed");
-                            break;
-                        }
-                    }
-                }
+                // NOTE (maxtps iter 6): the broadcast-channel (inbound flood)
+                // arm that lived here moved to the dedicated
+                // `run_flood_consumer` task spawned before this loop.
 
                 // Broadcast outbound SCP envelopes
                 envelope = scp_rx.recv() => {
@@ -1260,11 +1237,27 @@ impl App {
                     self.log_stats().await;
                 }
 
-                // Batched tx advert flush (parity: ignoreIfOutOfSync)
+                // Batched tx advert flush (parity: ignoreIfOutOfSync).
+                // Offloaded off the event loop (maxtps iter 6): at the ~1470
+                // tx/s ceiling one flush costs ~100 ms inline (22-peer ×
+                // per-hash advert bookkeeping under the tx-queue store lock),
+                // occupying up to 60% of the loop and starving SCP intake
+                // (measured via maxtps_loop: tx_advert_flush up to 18.3 s per
+                // 30 s window). Same coalesced fire-and-not-awaited pattern as
+                // dispatch_peer_maintenance: strictly serial via the in-flight
+                // guard, skipped tick re-runs next period, abort on shutdown.
                 _ = tx_advert_interval.tick() => {
                     if self.herder.is_tracking() {
                         self.set_phase(21); // 21 = tx_advert_flush
-                        self.flush_tx_adverts().await;
+                        // Upgrade the self Weak into an owned Arc for the
+                        // detached task (same mechanism as peer maintenance).
+                        let app = self.self_arc.read().await.upgrade();
+                        if let Some(app) = app {
+                            dispatch_peer_maintenance(
+                                async move { app.flush_tx_adverts().await },
+                                &mut tx_advert_flush_task,
+                            );
+                        }
                     }
                 }
 
@@ -1402,6 +1395,11 @@ impl App {
                     // and best-effort reconnects, so an abort mid-flight is
                     // harmless — a skipped round simply re-runs on next startup.
                     if let Some(h) = peer_maintenance_task.take() {
+                        h.abort();
+                    }
+                    // Abort any in-flight advert flush (maxtps iter 6) — the
+                    // process is exiting; un-flushed adverts are moot.
+                    if let Some(h) = tx_advert_flush_task.take() {
                         h.abort();
                     }
                     break;
@@ -1548,12 +1546,34 @@ impl App {
                 phase_dispatch_start.elapsed(),
                 self.event_loop_phase.load(Ordering::Relaxed),
             );
+            // [maxtps_loop] accumulate per-phase BODY time for the stats-tick
+            // dump (which arm occupies the event loop under load). Measured
+            // from the arm's `set_phase` stamp — NOT from the loop top — so
+            // the select-wait is excluded (the first version attributed idle
+            // waits to whichever arm fired next, misattributing up to 60% of
+            // a window). Capped at the whole-iteration elapsed in case the
+            // fired arm never stamped a phase (stale stamp guard).
+            {
+                let ph = self.event_loop_phase.load(Ordering::Relaxed) as usize;
+                if ph < self.phase_time_us.len() {
+                    let now_ns = self.start_instant.elapsed().as_nanos() as u64;
+                    let entered = self.phase_entered_ns.load(Ordering::Relaxed);
+                    let body_us = now_ns.saturating_sub(entered) / 1_000;
+                    let iter_us = phase_dispatch_start.elapsed().as_micros() as u64;
+                    self.phase_time_us[ph].fetch_add(body_us.min(iter_us), Ordering::Relaxed);
+                    self.phase_count[ph].fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
 
         // Event loop has exited — stop the watchdog immediately (before
         // pipeline drain which may take time). The guard's Drop signals the
         // thread and resets tick_ms to 0.
         drop(watchdog_guard);
+
+        // Stop the dedicated flood consumer (maxtps iter 6) — covers every
+        // loop-exit path, not just the shutdown-signal arm.
+        flood_consumer_task.abort();
 
         // Clean up pending catchup on shutdown
         if let Some(pending) = pending_catchup.take() {
@@ -1754,6 +1774,14 @@ impl App {
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
         }));
+        // In-flight SCP dedup in the peer tasks (maxtps iter 7): share the
+        // scheduled cache with the overlay so duplicate flood copies are
+        // dropped before they transit the dedicated SCP channel. Parity:
+        // stellar-core `checkScheduledAndCache` runs in the peer thread.
+        {
+            let scheduled = Arc::clone(&self.scp_scheduled);
+            overlay.set_scp_inbound_filter(Arc::new(move |hash| scheduled.check_and_insert(*hash)));
+        }
         match self.banned_peers().await {
             Ok(peers) => {
                 for peer_id in peers {
@@ -2039,8 +2067,116 @@ impl App {
         }
     }
 
+    /// Dedicated consumer for the overlay broadcast channel (inbound flood:
+    /// Transaction / FloodAdvert / FloodDemand / peer chatter). See the spawn
+    /// site in [`Self::run_event_loop`] for the rationale (maxtps iter 6 —
+    /// bulk flood work off the consensus event loop). SCP messages and fetch
+    /// responses are filtered out here exactly as the old select arm did:
+    /// they arrive via their dedicated channels and are handled on the loop.
+    ///
+    /// Holds only a `Weak<App>`; exits when the channel closes or the app is
+    /// dropped. Processing stays strictly serial (one message at a time),
+    /// preserving the old arm's ordering semantics — it just no longer
+    /// competes with SCP/close work for the main loop.
+    async fn run_flood_consumer(
+        weak: std::sync::Weak<Self>,
+        mut rx: tokio::sync::broadcast::Receiver<OverlayMessage>,
+    ) {
+        loop {
+            match rx.recv().await {
+                Ok(overlay_msg) => {
+                    // Skip SCP messages — handled via the dedicated SCP channel.
+                    if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                        continue;
+                    }
+                    // Skip fetch response/request messages — handled via the
+                    // dedicated fetch channel.
+                    if matches!(
+                        overlay_msg.message,
+                        StellarMessage::GeneralizedTxSet(_)
+                            | StellarMessage::TxSet(_)
+                            | StellarMessage::DontHave(_)
+                            | StellarMessage::ScpQuorumset(_)
+                            | StellarMessage::GetScpState(_)
+                            | StellarMessage::GetScpQuorumset(_)
+                            | StellarMessage::GetTxSet(_)
+                    ) {
+                        continue;
+                    }
+                    let Some(app) = weak.upgrade() else {
+                        tracing::info!("Flood consumer exiting: app dropped");
+                        return;
+                    };
+                    let delivery_latency = overlay_msg.received_at.elapsed();
+                    tracing::debug!(
+                        latency_ms = delivery_latency.as_millis(),
+                        "Received overlay message (flood consumer)"
+                    );
+                    app.handle_overlay_message(overlay_msg).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Only non-critical messages (TX floods) flow through the
+                    // broadcast channel now, so lag is expected under load.
+                    // [maxtps_diag] Count dropped flood messages — under load
+                    // these are demanded txs the node never receives, forcing
+                    // re-demands (stellar_overlay_demand_timeout_total) and
+                    // leaving the agreed set short. Core never drops flooded
+                    // txs (flow-controlled per-peer queues).
+                    metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total")
+                        .increment(n);
+                    tracing::debug!(
+                        skipped = n,
+                        "Overlay broadcast receiver lagged (non-critical messages only)"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::info!("Overlay broadcast channel closed; flood consumer exiting");
+                    return;
+                }
+            }
+        }
+    }
+
     /// Log current stats.
     async fn log_stats(&self) {
+        // [maxtps_loop] drain + dump per-phase event-loop busy time since the
+        // last stats tick; one line listing phases with >50 ms accumulated.
+        {
+            let mut parts: Vec<String> = Vec::new();
+            let mut total_ms = 0u64;
+            for ph in 0..self.phase_time_us.len() {
+                let us = self.phase_time_us[ph].swap(0, Ordering::Relaxed);
+                let n = self.phase_count[ph].swap(0, Ordering::Relaxed);
+                let ms = us / 1000;
+                total_ms += ms;
+                if ms > 50 {
+                    parts.push(format!(
+                        "{}={}ms/{}",
+                        super::event_loop_phase_name(ph as u64),
+                        ms,
+                        n
+                    ));
+                }
+            }
+            if !parts.is_empty() {
+                parts.sort_by_key(|p| {
+                    std::cmp::Reverse(
+                        p.split('=')
+                            .nth(1)
+                            .and_then(|v| v.split("ms").next())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0),
+                    )
+                });
+                tracing::info!(
+                    target: "maxtps_loop",
+                    total_busy_ms = total_ms,
+                    breakdown = parts.join(" "),
+                    "loop_busy"
+                );
+            }
+        }
+
         let stats = self.herder.stats();
         let ledger = self.current_ledger_seq();
 
@@ -2466,10 +2602,15 @@ impl App {
         self.scp_verify_output_backlog
             .store(verified_rx.len() as u64, Ordering::Relaxed);
 
-        // Compute the FloodGate message hash BEFORE destructuring — the hash
-        // covers the full StellarMessage XDR, which is lost once we extract
-        // the inner ScpEnvelope.
-        let flood_msg_hash = henyey_overlay::compute_message_hash(&scp_msg.message);
+        // Reuse the hash + in-flight token claimed by the overlay peer task's
+        // dedup filter (maxtps iter 7) when present; compute/claim locally
+        // otherwise (locally-sourced envelopes, overlay without the filter,
+        // tests). The hash covers the full StellarMessage XDR, so it must be
+        // taken BEFORE destructuring.
+        let peer_task_token = scp_msg.scp_inflight_token.take();
+        let flood_msg_hash = scp_msg
+            .message_hash
+            .unwrap_or_else(|| henyey_overlay::compute_message_hash(&scp_msg.message));
 
         // Capture overlay arrival time before destructuring — used for
         // receive-to-relay latency histogram (#2648).
@@ -2491,9 +2632,15 @@ impl App {
         // checkScheduledAndCache (Peer.cpp:1113-1117, OverlayManagerImpl.cpp:1190-1212).
         // The returned Arc<()> token keeps the cache entry alive; dropping it
         // (on pre-filter reject, channel close, or end of processing) auto-expires
-        // the entry.
-        let Some(inflight_token) = self.scp_scheduled.check_and_insert(flood_msg_hash) else {
-            return;
+        // the entry. When the overlay peer task already claimed the token via
+        // the inbound filter (maxtps iter 7), reuse it instead of re-checking
+        // — re-checking would see our own live entry and self-reject.
+        let inflight_token = match peer_task_token {
+            Some(token) => token,
+            None => match self.scp_scheduled.check_and_insert(flood_msg_hash) {
+                Some(token) => token,
+                None => return,
+            },
         };
 
         let mut drained: usize = 0;
@@ -2608,6 +2755,24 @@ impl App {
             .fetch_add(verify_latency_us, Ordering::Relaxed);
         self.scp_verify_latency_count
             .fetch_add(1, Ordering::Relaxed);
+
+        // [maxtps_scp] full-pipeline latency for one SCP envelope: overlay
+        // recv → dedicated channel → intake → verify worker → this dispatch.
+        // Only slow envelopes are logged (bounds volume); used to attribute
+        // the nomination-convergence tail (slow slots) to pipeline queueing
+        // vs fetch service time. Parity-irrelevant logging.
+        if let Some(recv_at) = ve.intake.received_at() {
+            let total_ms = recv_at.elapsed().as_millis() as u64;
+            if total_ms > 50 {
+                tracing::info!(
+                    target: "maxtps_scp",
+                    slot,
+                    total_ms,
+                    verify_us = verify_latency_us,
+                    "slow_pipeline"
+                );
+            }
+        }
 
         // SCP latency bookkeeping.
         //

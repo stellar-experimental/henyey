@@ -843,6 +843,20 @@ impl App {
             "Processing GeneralizedTxSet"
         );
 
+        // [maxtps_fetch] tx-set fetch service latency: first GetTxSet request
+        // sent → GeneralizedTxSet received. Logged once per fetched set.
+        {
+            let map = self.tx_set_last_request.read().await;
+            if let Some(state) = map.get(&hash) {
+                tracing::info!(
+                    target: "maxtps_fetch",
+                    elapsed_ms = state.first_requested.elapsed().as_millis() as u64,
+                    tx_count = internal_tx_set.len(),
+                    "got"
+                );
+            }
+        }
+
         // Time-wrapped (#1759 diagnostics): acquires
         // `Herder::scp_driver.needs_tx_set`'s internal
         // parking_lot::RwLock on every inbound GeneralizedTxSet.
@@ -1357,13 +1371,33 @@ fn collect_adverts_for_peers(
         "collect_adverts_for_peers: every peer_id must have an entry in adverts_by_peer"
     );
 
-    let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
+    // Phase 1 (maxtps iter 8 — SHORT tx-queue store-lock hold): destructively
+    // drain every budget-fitting candidate under the lock, deferring the
+    // per-peer advert-history checks to phase 2. The old single-pass visitor
+    // ran candidate × 22-peer `seen_advert` lookups INSIDE
+    // `broadcast_with_visitor`'s `store.write()` guard — ~100 ms per 200 ms
+    // flood period at the max-TPS ceiling, i.e. the tx queue was write-locked
+    // ~50% of the time, stalling loadgen submits, flooded-tx admission, and
+    // the nomination tx-set build.
+    //
+    // Budget-accounting delta: candidates already advertised to every peer
+    // were previously `Skipped` (budget-neutral); now they consume budget.
+    // Visited entries are erased either way (`visit_top_txs`), the measured
+    // budget headroom is ~2.6× at the ceiling (ops_used 271 vs budget 716),
+    // and unused budget carries over — flood pacing is divergeable overlay
+    // internals, not parity surface.
+    let mut candidates: Vec<henyey_herder::BroadcastCandidate> = Vec::new();
     queue.broadcast_with_visitor(budget, |candidate| {
-        let mut new_to_any_peer = false;
+        candidates.push(candidate.clone());
+        BroadcastVisitResult::Processed
+    });
+
+    // Phase 2 (no store lock): per-peer dedup against the advert history.
+    let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
+    for candidate in &candidates {
         for peer_id in peer_ids {
             if let Some(adverts) = adverts_by_peer.get(peer_id) {
                 if !adverts.seen_advert(&candidate.hash) {
-                    new_to_any_peer = true;
                     per_peer
                         .entry(peer_id.clone())
                         .or_default()
@@ -1371,12 +1405,7 @@ fn collect_adverts_for_peers(
                 }
             }
         }
-        if new_to_any_peer {
-            BroadcastVisitResult::Processed
-        } else {
-            BroadcastVisitResult::Skipped
-        }
-    });
+    }
     per_peer
 }
 
@@ -1776,9 +1805,13 @@ mod tests {
         let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
 
         assert!(per_peer.is_empty(), "no peer should receive a known tx");
+        // maxtps iter 8: the drain phase consumes budget for every candidate
+        // (including all-peers-seen ones) so the per-peer advert-history
+        // checks can run OUTSIDE the tx-queue store lock. See
+        // collect_adverts_for_peers for the rationale + headroom analysis.
         assert_eq!(
-            budget.ops_remaining, 10,
-            "budget must be unchanged (skip is budget-neutral)"
+            budget.ops_remaining, 9,
+            "drained candidate consumes budget even when all peers know it"
         );
     }
 
@@ -1855,8 +1888,13 @@ mod tests {
 
         let _per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
 
-        // tx_known was Skipped (budget-neutral), tx_new was Processed (1 op consumed).
-        assert_eq!(budget.ops_remaining, 9, "only tx_new should consume budget");
+        // maxtps iter 8: both drained candidates consume budget (the per-peer
+        // seen-check moved outside the store lock, so the drain can no longer
+        // distinguish known-to-all txs). Carryover absorbs the difference.
+        assert_eq!(
+            budget.ops_remaining, 8,
+            "both drained candidates consume budget"
+        );
     }
 
     #[test]
@@ -1884,8 +1922,17 @@ mod tests {
         let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
 
         assert!(per_peer.is_empty(), "known DEX tx should not be advertised");
-        assert_eq!(budget.ops_remaining, 10, "generic budget untouched");
-        assert_eq!(budget.dex_ops_remaining, Some(5), "DEX budget untouched");
+        // maxtps iter 8: the drain consumes budget for the known DEX tx too
+        // (seen-checks moved outside the store lock).
+        assert_eq!(
+            budget.ops_remaining, 9,
+            "drained DEX tx consumes generic budget"
+        );
+        assert_eq!(
+            budget.dex_ops_remaining,
+            Some(4),
+            "drained DEX tx consumes DEX budget"
+        );
     }
 
     #[test]

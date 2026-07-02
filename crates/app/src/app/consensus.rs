@@ -432,6 +432,16 @@ impl App {
 
         // Compute the trigger instant exactly as `try_trigger_consensus` does
         // (kept in lock-step so the timer and the safety-net agree on timing).
+        //
+        // NOTE (maxtps iteration 2, 2026-07-02, REJECTED experiment): arming
+        // this trigger EARLY by the measured nomination overhead (EWMA of
+        // trigger→ballot-start) does work mechanically — loaded cadence drops
+        // from ~5.5 s to ~4.95 s (+17% ledger rate) — but does NOT raise the
+        // max-TPS ceiling: ledgers arrive proportionally emptier and the
+        // loadgen's per-account inclusion-latency guillotine does not relax
+        // (measured max 1460-1470 vs 1487 baseline). Do not re-attempt without
+        // a mechanism that raises per-WALL-SECOND drain, not ledger rate.
+        // See docs/maxtps-optimization/2026-07-02-target2000.md iteration 2.
         let expected_close = self.herder.ledger_close_duration();
         let last_slot = current_ledger as u64;
         let now_instant = std::time::Instant::now();
@@ -463,6 +473,26 @@ impl App {
             ct_offset_secs,
             "Armed event-driven consensus trigger timer (setupTriggerNextLedger)"
         );
+
+        // Prebuild the nomination value ~300 ms ahead of the trigger (maxtps
+        // iter 9): the ~150-200 ms tx-set build otherwise runs between the
+        // trigger firing and `scp.nominate`, on the network's nomination-
+        // convergence critical path. A plain sleep task (not a managed timer)
+        // suffices: `prebuild_nomination_value` self-gates on slot/LCL/
+        // nomination state, so a stale or duplicate firing is a cheap no-op.
+        const PREBUILD_LEAD: std::time::Duration = std::time::Duration::from_millis(300);
+        if self.is_validator && delay > PREBUILD_LEAD + std::time::Duration::from_millis(100) {
+            let herder = std::sync::Arc::clone(&self.herder);
+            let lead_delay = delay - PREBUILD_LEAD;
+            tokio::spawn(async move {
+                tokio::time::sleep(lead_delay).await;
+                let _ =
+                    henyey_common::spawn_blocking_logged("prebuild_nomination_value", move || {
+                        herder.prebuild_nomination_value(next_slot as u32)
+                    })
+                    .await;
+            });
+        }
     }
 
     /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().

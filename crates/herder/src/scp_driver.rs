@@ -1169,6 +1169,10 @@ impl ScpDriver {
     pub fn record_ballot_start(&self, slot: SlotIndex) {
         let mut map = self.slot_timing.write();
         let state = map.entry(slot).or_default();
+        if state.ballot_start.is_none() {
+            // [maxtps_cad] nomination converged → ballot protocol begins.
+            tracing::info!(target: "maxtps_cad", slot, "ballot");
+        }
         state
             .ballot_start
             .get_or_insert_with(std::time::Instant::now);
@@ -3972,6 +3976,8 @@ impl SCPDriver for HerderScpCallback {
     }
 
     fn value_externalized(&self, slot_index: u64, value: &Value) {
+        // [maxtps_cad] slot externalized (before apply/close).
+        tracing::info!(target: "maxtps_cad", slot = slot_index, "ext");
         // Record first-externalize baseline BEFORE processing.
         // Mirrors stellar-core line 915: recordSCPExternalizeEvent(self, false)
         let now = self.driver.record_self_externalize_event(slot_index);

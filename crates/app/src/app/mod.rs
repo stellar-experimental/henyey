@@ -717,7 +717,9 @@ pub struct App {
     scp_verify_latency_us_sum: AtomicU64,
     scp_verify_latency_count: AtomicU64,
     /// In-flight SCP envelope dedup cache. See [`scp_dedup::ScpScheduledCache`].
-    scp_scheduled: scp_dedup::ScpScheduledCache,
+    /// `Arc` so the overlay peer tasks share it via the inbound SCP dedup
+    /// filter (maxtps iter 7, `set_scp_inbound_filter`).
+    scp_scheduled: Arc<scp_dedup::ScpScheduledCache>,
     /// Sampled depth of the verified-output channel (verified_rx.len()).
     /// Updated by the event loop each time it touches `verified_rx`, so
     /// `/metrics` reflects the true output-side backlog.
@@ -1042,6 +1044,18 @@ pub struct App {
     ///        32=scp_verified (draining verified envelopes),
     ///        33=tx_set_gc (purge unreferenced persisted tx sets)
     event_loop_phase: Arc<AtomicU64>,
+    /// [maxtps_loop] cumulative busy time (µs) and dispatch count per
+    /// event-loop phase (indexed by the coarse phase code, see
+    /// `WATCHDOG_PHASE_LEGEND`). Accumulated after every select-arm dispatch;
+    /// drained and logged by the stats tick. Diagnostic only.
+    phase_time_us: Arc<[AtomicU64; 40]>,
+    phase_count: Arc<[AtomicU64; 40]>,
+    /// [maxtps_loop] nanoseconds since `start_instant` when the current
+    /// event-loop arm stamped its phase (written by `set_phase`). Lets the
+    /// loop-bottom accounting measure the arm BODY only, excluding the
+    /// select-wait (the first accounting version attributed idle waits to
+    /// whichever arm fired next, which misattributed up to 60% of a window).
+    phase_entered_ns: Arc<AtomicU64>,
 
     /// Fine-grained sub-phase code for pinpointing a stall inside a
     /// coarse phase. See [`phase`](super::phase) for the `PHASE_6_*`
@@ -1522,7 +1536,7 @@ impl App {
             scp_pv_counters: henyey_herder::scp_verify::PostVerifyCounters::default(),
             scp_verify_latency_us_sum: AtomicU64::new(0),
             scp_verify_latency_count: AtomicU64::new(0),
-            scp_scheduled: scp_dedup::ScpScheduledCache::new(),
+            scp_scheduled: Arc::new(scp_dedup::ScpScheduledCache::new()),
             scp_verify_output_backlog: AtomicU64::new(0),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
@@ -1617,6 +1631,9 @@ impl App {
             watchdog_shutdown: Arc::new(AtomicBool::new(false)),
             watchdog_condvar: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             event_loop_phase: Arc::new(AtomicU64::new(0)),
+            phase_time_us: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            phase_count: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            phase_entered_ns: Arc::new(AtomicU64::new(0)),
             event_loop_phase_sub: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -3525,6 +3542,11 @@ impl App {
     fn set_phase(&self, phase: u64) {
         self.event_loop_phase.store(phase, Ordering::Relaxed);
         self.event_loop_phase_sub.store(0, Ordering::Relaxed);
+        // [maxtps_loop] stamp arm-body start for body-only accounting.
+        self.phase_entered_ns.store(
+            self.start_instant.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Stamp the fine-grained sub-phase. Read alongside

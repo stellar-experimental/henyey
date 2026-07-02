@@ -2892,6 +2892,66 @@ impl Herder {
     ///
     /// This is entirely synchronous (parking_lot locks + CPU). It was
     /// previously declared `async` but had no `.await` points.
+    /// Pre-build and cache the nomination value for `ledger_seq` ahead of the
+    /// consensus trigger (maxtps iter 9). The tx-set build costs ~150-200 ms
+    /// and normally runs INSIDE `trigger_next_ledger`, serialized between the
+    /// trigger timer firing and `scp.nominate` — i.e. on the network's
+    /// nomination-convergence critical path. The app arms this ~300 ms before
+    /// the trigger so the trigger finds the value already cached and starts
+    /// nominating within ~1 ms.
+    ///
+    /// The value snapshot is ≤300 ms staler than a trigger-time build: txs
+    /// arriving in that window ride the next ledger (bounded extra latency
+    /// for a small fraction of txs). `close_time` has whole-second
+    /// granularity, so the prebuilt value almost always carries the same
+    /// close time a trigger-time build would.
+    ///
+    /// Self-gating: no-ops (returns false) unless tracking, a validator, LCL
+    /// still matches, nomination hasn't started, and no value is already
+    /// cached for the slot. All the trigger-time gates re-run in
+    /// `trigger_next_ledger`, so a stale prebuild is harmless.
+    pub fn prebuild_nomination_value(&self, ledger_seq: u32) -> bool {
+        if !self.is_tracking() || !self.is_validator() {
+            return false;
+        }
+        let slot = ledger_seq as u64;
+        if let Some(state) = self.scp.get_slot_state(slot) {
+            if state.is_nominating {
+                return false;
+            }
+        }
+        if !self.lcl_matches_slot(slot) {
+            return false;
+        }
+        if self
+            .cached_nomination_value
+            .read()
+            .as_ref()
+            .is_some_and(|(s, _)| *s == slot)
+        {
+            return false;
+        }
+        let now_secs = self.scp_driver.now_seconds();
+        let lcl_close_time = self.lcl_close_time();
+        let next_close_time = now_secs.max(lcl_close_time.saturating_add(1));
+        if next_close_time > now_secs.saturating_add(MAX_TIME_SLIP_SECONDS) {
+            return false;
+        }
+        let Some(value) = self.build_nomination_value(next_close_time) else {
+            return false;
+        };
+        // Publish any envelopes that were waiting on the just-cached tx set,
+        // mirroring the trigger path's post-build drain.
+        self.process_ready_fetching_envelopes();
+        // Discard if the world moved while building.
+        if !self.lcl_matches_slot(slot) || self.is_applying() {
+            return false;
+        }
+        *self.cached_nomination_value.write() = Some((slot, value));
+        tracing::debug!(slot, "prebuilt nomination value cached");
+        true
+    }
+
     pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<TriggerOutcome> {
         if !self.is_tracking() {
             return Err(HerderError::NotValidating);
@@ -2956,6 +3016,11 @@ impl Herder {
         // Record when we first started processing this slot (for timing metrics).
         self.scp_driver.record_slot_activity(slot);
 
+        // [maxtps_cad] per-slot cadence decomposition stamp: trigger accepted →
+        // tx-set build begins. Joined offline (by slot) with the nominate /
+        // ballot / externalize / close stamps. Parity-irrelevant logging.
+        tracing::info!(target: "maxtps_cad", slot, "trig");
+
         let t0 = std::time::Instant::now();
 
         if !is_validator {
@@ -3005,7 +3070,21 @@ impl Herder {
         }
 
         // --- Validator path ---
-        let value = match self.build_nomination_value(next_close_time) {
+        // Reuse a prebuilt nomination value when the prebuild timer already
+        // cached one for this slot (maxtps iter 9) — skips the ~150-200 ms
+        // tx-set build on the nomination-convergence critical path. The
+        // prebuild ran the same gates and cached the tx set for fetchers.
+        let prebuilt = {
+            let cached = self.cached_nomination_value.read();
+            cached
+                .as_ref()
+                .filter(|(cached_slot, _)| *cached_slot == slot)
+                .map(|(_, v)| v.clone())
+        };
+        if prebuilt.is_some() {
+            tracing::debug!(slot, "trigger using prebuilt nomination value");
+        }
+        let value = match prebuilt.or_else(|| self.build_nomination_value(next_close_time)) {
             Some(v) => v,
             None => {
                 // build_nomination_value returns None when LCL advanced
@@ -6648,6 +6727,72 @@ mod tests {
         assert!(
             slot_state.map_or(true, |s| !s.is_nominating),
             "stale slot must not be in nominating state"
+        );
+    }
+
+    /// maxtps iter 9: `prebuild_nomination_value` caches the nomination value
+    /// ahead of the trigger; a second prebuild for the same slot is a no-op;
+    /// a stale slot is refused; and the trigger consumes the cached value.
+    #[test]
+    fn test_prebuild_nomination_value_caches_and_trigger_reuses() {
+        let seed = [43u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_lm_at_seq_for_stale_test(1),
+            TimerManagerHandle::no_op(),
+        );
+        herder.bootstrap(1);
+        let next = 2u32;
+
+        // Stale slot refused (LCL+1 == 2, so 3 is stale-ahead).
+        assert!(
+            !herder.prebuild_nomination_value(next + 1),
+            "prebuild must refuse a slot != LCL+1"
+        );
+        assert!(herder.cached_nomination_value.read().is_none());
+
+        // Prebuild for the correct slot caches a value.
+        assert!(
+            herder.prebuild_nomination_value(next),
+            "prebuild must cache for LCL+1"
+        );
+        let cached = herder.cached_nomination_value.read().clone();
+        assert!(
+            matches!(cached, Some((slot, _)) if slot == next as u64),
+            "cached value must be keyed by the prebuilt slot"
+        );
+
+        // A duplicate prebuild is a no-op.
+        assert!(
+            !herder.prebuild_nomination_value(next),
+            "second prebuild for the same slot must be a no-op"
+        );
+
+        // The trigger consumes the cached value and starts nomination
+        // (solo 1-of-1 quorum: nomination self-externalizes synchronously).
+        let outcome = herder
+            .trigger_next_ledger(next)
+            .expect("trigger must succeed with a prebuilt value");
+        assert!(
+            !matches!(outcome, TriggerOutcome::SkippedStale),
+            "trigger must not skip a fresh prebuilt slot, got {outcome:?}"
         );
     }
 
