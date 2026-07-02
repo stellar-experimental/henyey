@@ -717,7 +717,9 @@ pub struct App {
     scp_verify_latency_us_sum: AtomicU64,
     scp_verify_latency_count: AtomicU64,
     /// In-flight SCP envelope dedup cache. See [`scp_dedup::ScpScheduledCache`].
-    scp_scheduled: scp_dedup::ScpScheduledCache,
+    /// `Arc` so the overlay peer tasks share it via the inbound SCP dedup
+    /// filter (maxtps iter 7, `set_scp_inbound_filter`).
+    scp_scheduled: Arc<scp_dedup::ScpScheduledCache>,
     /// Sampled depth of the verified-output channel (verified_rx.len()).
     /// Updated by the event loop each time it touches `verified_rx`, so
     /// `/metrics` reflects the true output-side backlog.
@@ -1528,7 +1530,7 @@ impl App {
             scp_pv_counters: henyey_herder::scp_verify::PostVerifyCounters::default(),
             scp_verify_latency_us_sum: AtomicU64::new(0),
             scp_verify_latency_count: AtomicU64::new(0),
-            scp_scheduled: scp_dedup::ScpScheduledCache::new(),
+            scp_scheduled: Arc::new(scp_dedup::ScpScheduledCache::new()),
             scp_verify_output_backlog: AtomicU64::new(0),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),

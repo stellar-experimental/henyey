@@ -1768,6 +1768,14 @@ impl App {
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
         }));
+        // In-flight SCP dedup in the peer tasks (maxtps iter 7): share the
+        // scheduled cache with the overlay so duplicate flood copies are
+        // dropped before they transit the dedicated SCP channel. Parity:
+        // stellar-core `checkScheduledAndCache` runs in the peer thread.
+        {
+            let scheduled = Arc::clone(&self.scp_scheduled);
+            overlay.set_scp_inbound_filter(Arc::new(move |hash| scheduled.check_and_insert(*hash)));
+        }
         match self.banned_peers().await {
             Ok(peers) => {
                 for peer_id in peers {
@@ -2588,10 +2596,15 @@ impl App {
         self.scp_verify_output_backlog
             .store(verified_rx.len() as u64, Ordering::Relaxed);
 
-        // Compute the FloodGate message hash BEFORE destructuring — the hash
-        // covers the full StellarMessage XDR, which is lost once we extract
-        // the inner ScpEnvelope.
-        let flood_msg_hash = henyey_overlay::compute_message_hash(&scp_msg.message);
+        // Reuse the hash + in-flight token claimed by the overlay peer task's
+        // dedup filter (maxtps iter 7) when present; compute/claim locally
+        // otherwise (locally-sourced envelopes, overlay without the filter,
+        // tests). The hash covers the full StellarMessage XDR, so it must be
+        // taken BEFORE destructuring.
+        let peer_task_token = scp_msg.scp_inflight_token.take();
+        let flood_msg_hash = scp_msg
+            .message_hash
+            .unwrap_or_else(|| henyey_overlay::compute_message_hash(&scp_msg.message));
 
         // Capture overlay arrival time before destructuring — used for
         // receive-to-relay latency histogram (#2648).
@@ -2613,9 +2626,15 @@ impl App {
         // checkScheduledAndCache (Peer.cpp:1113-1117, OverlayManagerImpl.cpp:1190-1212).
         // The returned Arc<()> token keeps the cache entry alive; dropping it
         // (on pre-filter reject, channel close, or end of processing) auto-expires
-        // the entry.
-        let Some(inflight_token) = self.scp_scheduled.check_and_insert(flood_msg_hash) else {
-            return;
+        // the entry. When the overlay peer task already claimed the token via
+        // the inbound filter (maxtps iter 7), reuse it instead of re-checking
+        // — re-checking would see our own live entry and self-reject.
+        let inflight_token = match peer_task_token {
+            Some(token) => token,
+            None => match self.scp_scheduled.check_and_insert(flood_msg_hash) {
+                Some(token) => token,
+                None => return,
+            },
         };
 
         let mut drained: usize = 0;

@@ -2599,6 +2599,7 @@ mod tests {
             SharedPeerState {
                 peers: Arc::new(DashMap::new()),
                 flood_gate: Arc::new(crate::flood::FloodGate::new()),
+                scp_inbound_filter: Arc::new(RwLock::new(None)),
                 running: Arc::new(AtomicBool::new(true)),
                 message_tx,
                 scp_message_tx,

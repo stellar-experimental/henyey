@@ -104,6 +104,15 @@ const BROADCAST_CHANNEL_SIZE: usize = 4096;
 /// credit-based byte bound is the follow-up tracked in #3625.
 pub const SCP_CHANNEL_CAPACITY: usize = 8192;
 
+/// In-flight dedup filter for inbound SCP envelopes, provided by the app and
+/// run in the overlay peer tasks (maxtps iter 7; parity: stellar-core
+/// `checkScheduledAndCache`, Peer.cpp:1113-1117). Input is the full-message
+/// hash. Returns `Some(token)` when the envelope is new (the token must ride
+/// the message and be dropped when processing completes, expiring the cache
+/// entry) or `None` when a copy is already in flight (drop the message).
+pub type ScpInboundFilter =
+    dyn Fn(&henyey_common::Hash256) -> Option<std::sync::Arc<()>> + Send + Sync;
+
 /// Bound on the dedicated **fetch-response/-request** intake channel
 /// (`fetch_response_tx` → event-loop `fetch_response_rx`).
 ///
@@ -580,6 +589,15 @@ pub struct OverlayMessage {
     /// the single SCP-routed copy that reaches the app consumer; released when
     /// that consumer drains the envelope. Never cloned (see the `Clone` impl).
     pub(crate) flow_release: Option<FlowControlRelease>,
+    /// In-flight scheduled-cache token claimed by the peer task's SCP dedup
+    /// filter (maxtps iter 7; parity: core `checkScheduledAndCache`). Rides
+    /// only the SCP-routed copy; the app consumer moves it into the intake so
+    /// the cache entry expires when processing completes. Never cloned.
+    pub scp_inflight_token: Option<std::sync::Arc<()>>,
+    /// Full-message hash precomputed by the peer task's flood-gate path for
+    /// flood-tracked messages (currently attached for SCP envelopes only).
+    /// Lets the app consumer skip recomputing the SHA-256.
+    pub message_hash: Option<henyey_common::Hash256>,
 }
 
 impl Clone for OverlayMessage {
@@ -590,6 +608,9 @@ impl Clone for OverlayMessage {
             received_at: self.received_at,
             // The release obligation is never duplicated.
             flow_release: None,
+            // The in-flight marker rides only the SCP-routed original.
+            scp_inflight_token: None,
+            message_hash: self.message_hash,
         }
     }
 }
@@ -611,6 +632,8 @@ impl OverlayMessage {
             message,
             received_at,
             flow_release: None,
+            scp_inflight_token: None,
+            message_hash: None,
         }
     }
 
@@ -860,6 +883,12 @@ pub(super) struct SharedPeerState {
     pub(super) running: Arc<AtomicBool>,
     pub(super) message_tx: broadcast::Sender<OverlayMessage>,
     pub(super) scp_message_tx: mpsc::Sender<OverlayMessage>,
+    /// App-provided in-flight dedup filter for inbound SCP envelopes, run in
+    /// the peer task (maxtps iter 7; parity: core `checkScheduledAndCache` in
+    /// `Peer::recvAuthenticatedMessage`). `None` (e.g. overlay-only tests)
+    /// falls back to the app-side dedup in `pump_scp_intake`. Shared with
+    /// [`OverlayManager::scp_inbound_filter`].
+    pub(super) scp_inbound_filter: Arc<RwLock<Option<Arc<ScpInboundFilter>>>>,
     /// Bounded ([`FETCH_CHANNEL_CAPACITY`]) so a wedged event loop cannot grow
     /// RSS unbounded via accumulated multi-MB tx-sets (#3661). Drops on full.
     pub(super) fetch_response_tx: mpsc::Sender<OverlayMessage>,
@@ -1112,8 +1141,13 @@ impl SharedPeerState {
             let from_peer = msg.from_peer.clone();
             match self.scp_message_tx.try_send(msg) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::error::TrySendError::Full(_dropped)) => {
                     self.metrics.messages_dropped.add(1);
+                    // `_dropped` carries the in-flight scheduled-cache token
+                    // (maxtps iter 7); dropping it here expires the cache
+                    // entry, so a later duplicate copy from another peer is
+                    // treated as new and re-forwarded — the retry path a full
+                    // channel relies on.
                     debug!(
                         "SCP channel full (cap {}); dropping envelope from peer {} (recoverable: peers re-flood)",
                         SCP_CHANNEL_CAPACITY, from_peer
@@ -1232,6 +1266,10 @@ pub struct OverlayManager {
     pub(super) fetch_response_tx: mpsc::Sender<OverlayMessage>,
     /// Receiver end of the fetch response channel. Taken once via `subscribe_fetch_responses()`.
     fetch_response_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
+    /// App-provided in-flight SCP dedup filter (see [`ScpInboundFilter`]).
+    /// Shared with every [`SharedPeerState`] snapshot; settable before or
+    /// after start via [`Self::set_scp_inbound_filter`].
+    scp_inbound_filter: Arc<RwLock<Option<Arc<ScpInboundFilter>>>>,
     /// Dynamic extra subscribers for catchup-critical messages (SCP + TxSet).
     /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
     /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
@@ -1380,6 +1418,7 @@ impl OverlayManager {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             is_tracking: Arc::new(AtomicBool::new(false)),
             is_synced: Arc::new(AtomicBool::new(false)),
             connection_factory,
@@ -1405,6 +1444,7 @@ impl OverlayManager {
             running: Arc::clone(&self.running),
             message_tx: self.message_tx.clone(),
             scp_message_tx: self.scp_message_tx.clone(),
+            scp_inbound_filter: Arc::clone(&self.scp_inbound_filter),
             fetch_response_tx: self.fetch_response_tx.clone(),
             peer_handles: Arc::clone(&self.peer_handles),
             advertised_outbound_peers: Arc::clone(&self.advertised_outbound_peers),
@@ -1975,6 +2015,15 @@ impl OverlayManager {
     /// eviction and nomination/ballot replacement).
     pub fn set_scp_callback(&mut self, callback: Arc<dyn ScpQueueCallback>) {
         self.scp_callback = Some(callback);
+    }
+
+    /// Install the app's in-flight SCP dedup filter, run by the peer tasks on
+    /// every inbound SCP envelope (see [`ScpInboundFilter`]). Duplicate
+    /// copies of an envelope whose first copy is still queued/processing are
+    /// dropped in the peer task instead of transiting the dedicated SCP
+    /// channel (maxtps iter 7; parity: core `checkScheduledAndCache`).
+    pub fn set_scp_inbound_filter(&self, filter: Arc<ScpInboundFilter>) {
+        *self.scp_inbound_filter.write() = Some(filter);
     }
 
     /// Update the tracking-consensus flag.
@@ -3049,6 +3098,7 @@ pub(crate) mod tests {
         SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(true)),
             message_tx,
             scp_message_tx,
@@ -3576,6 +3626,7 @@ pub(crate) mod tests {
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(true)),
             message_tx,
             scp_message_tx,
@@ -3670,6 +3721,7 @@ pub(crate) mod tests {
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(true)),
             message_tx,
             scp_message_tx,
@@ -4374,6 +4426,7 @@ pub(crate) mod tests {
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::with_ttl(std::time::Duration::from_secs(30))),
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(true)),
             message_tx,
             scp_message_tx: scp_tx,
@@ -4449,6 +4502,7 @@ pub(crate) mod tests {
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::with_ttl(std::time::Duration::from_secs(30))),
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(true)),
             message_tx,
             scp_message_tx: scp_tx,
@@ -4554,6 +4608,7 @@ pub(crate) mod tests {
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
+            scp_inbound_filter: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(true)),
             message_tx,
             scp_message_tx,
@@ -4687,6 +4742,40 @@ pub(crate) mod tests {
             "expected >= {} dropped SCP envelopes, got {}",
             OVERFLOW,
             metrics.messages_dropped
+        );
+    }
+
+    /// Regression test for the maxtps-iter-7 duplicate-drop safety invariant:
+    /// an SCP envelope dropped on a FULL SCP channel must release its
+    /// in-flight scheduled-cache token (by dropping the message, which owns
+    /// it), so a later duplicate copy from another peer re-enters the peer
+    /// task's dedup filter as new and is re-forwarded. Without the release,
+    /// the peer-task dedup would suppress every retry copy of a lost
+    /// envelope.
+    #[tokio::test]
+    async fn test_scp_channel_full_drop_releases_inflight_token() {
+        let (shared, _rx) = shared_state_with_scp_receiver();
+
+        // Fill the channel to capacity with filler envelopes.
+        for slot in 0..SCP_CHANNEL_CAPACITY as u64 {
+            shared.route_to_subscribers(make_scp_msg(slot));
+        }
+
+        // The target envelope carries an in-flight token, exactly as the
+        // peer task attaches it after a successful dedup-filter claim.
+        let token = std::sync::Arc::new(());
+        let watch = std::sync::Arc::downgrade(&token);
+        let mut target = make_scp_msg(999_999);
+        target.scp_inflight_token = Some(token);
+
+        // Route it — the channel is full, so the message (and its token) is
+        // dropped.
+        shared.route_to_subscribers(target);
+
+        assert!(
+            watch.upgrade().is_none(),
+            "a full-channel drop must release the in-flight token so a later \
+             duplicate copy passes the peer-task dedup filter"
         );
     }
 

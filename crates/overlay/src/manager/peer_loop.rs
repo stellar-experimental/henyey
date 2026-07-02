@@ -930,6 +930,13 @@ impl OverlayManager {
 
         let msg_type = helpers::message_type_name(message);
 
+        // Set inside the flood-gate-tracked block for SCP envelopes; threaded
+        // onto the routed `OverlayMessage` so the app consumer reuses the
+        // already-computed hash and the already-claimed in-flight token
+        // (maxtps iter 7).
+        let mut scp_msg_hash: Option<henyey_common::Hash256> = None;
+        let mut scp_inflight_token: Option<std::sync::Arc<()>> = None;
+
         // Parity: Peer.cpp:1164-1171 — drop flood messages when not synced.
         // During catchup, tx are rejected by herder and flood-pull responses
         // reference messages the node can't use. Early shedding avoids
@@ -1056,20 +1063,42 @@ impl OverlayManager {
                         }
                     },
                 );
-                // FloodGate-tracked messages (SCP and Transaction) are NEVER
-                // dropped at the overlay/FloodGate layer.
+                // FloodGate-tracked messages are NEVER dropped based on the
+                // FloodGate record (issues #2317, #2327 — see the self-echo
+                // regression): relay accounting above runs for every copy so
+                // the gate knows which peers already have the message.
                 //
-                // `record_inbound_relay` returns () — there is no relay status
-                // value to branch on, preventing the c6118f2c bug class.
-                // Actual dedup happens downstream:
-                // - SCP: `scp_scheduled_envelopes` in `pump_scp_intake`
-                // - Tx: herder `receive_transaction` / tx queue dedup
-                //
-                // stellar-core parity:
-                // - SCP: Peer.cpp:1667-1673 — unconditional recvSCPEnvelope
-                // - Tx:  OverlayManagerImpl.cpp:1215-1248 — unconditional
-                //   recvTransaction (Peer.cpp:1524-1533)
-                // See issues #2317, #2327.
+                // In-flight dedup for SCP envelopes DOES happen here, in the
+                // peer task, via the app-provided scheduled-cache filter
+                // (maxtps iter 7; parity: stellar-core drops already-scheduled
+                // messages in the peer thread via `checkScheduledAndCache`,
+                // Peer.cpp:1113-1117 → OverlayManagerImpl.cpp:1190-1212).
+                // The filter is the SAME `ScpScheduledCache` the app's
+                // `pump_scp_intake` used to consult on the main event loop —
+                // token-lifetime semantics are unchanged (a duplicate is only
+                // dropped while its first copy is still queued/processing;
+                // after the token drops, a re-delivery is forwarded again, so
+                // the #2317 self-echo and post-processing retries survive).
+                // Moving the check upstream keeps the ~22-peer duplicate storm
+                // (~3000 channel messages per slot per node at the max-TPS
+                // ceiling) out of the dedicated SCP channel, whose slot-start
+                // burst previously took the event loop 80-110 ms (median) to
+                // drain — the dominant component of the slow-nomination tail.
+                if matches!(message, StellarMessage::ScpMessage(_)) {
+                    scp_msg_hash = Some(hash);
+                    if let Some(filter) = state.scp_inbound_filter.read().as_ref() {
+                        match filter(&hash) {
+                            Some(token) => scp_inflight_token = Some(token),
+                            None => {
+                                // In-flight duplicate: drop in the peer task.
+                                // `flow_release` (if any) drops here, releasing
+                                // the held capacity immediately — same as the
+                                // other early-drop paths.
+                                return Some(true);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Pull-control messages (FloodAdvert/FloodDemand) use flow-control
                 // capacity but are NOT globally deduplicated or tracked in FloodGate.
@@ -1094,6 +1123,8 @@ impl OverlayManager {
             message: message.clone(),
             received_at: Instant::now(),
             flow_release: flow_release.take(),
+            scp_inflight_token,
+            message_hash: scp_msg_hash,
         };
         let is_scp = state.route_to_subscribers(overlay_msg);
         Some(is_scp)
