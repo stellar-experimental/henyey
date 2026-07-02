@@ -490,6 +490,13 @@ impl App {
         // tick if a prior round is still running) and is aborted on shutdown.
         let mut peer_maintenance_task: Option<tokio::task::JoinHandle<()>> = None;
 
+        // In-flight guard for the offloaded batched tx-advert flush (maxtps
+        // iter 6). Same coalesced serial pattern as peer maintenance above:
+        // one flush at a time, skipped ticks re-run next period, aborted on
+        // shutdown (the flush is periodic + idempotent-enough: an aborted
+        // flush leaves un-adverted hashes queued for the next period).
+        let mut tx_advert_flush_task: Option<tokio::task::JoinHandle<()>> = None;
+
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
 
@@ -1273,11 +1280,27 @@ impl App {
                     self.log_stats().await;
                 }
 
-                // Batched tx advert flush (parity: ignoreIfOutOfSync)
+                // Batched tx advert flush (parity: ignoreIfOutOfSync).
+                // Offloaded off the event loop (maxtps iter 6): at the ~1470
+                // tx/s ceiling one flush costs ~100 ms inline (22-peer ×
+                // per-hash advert bookkeeping under the tx-queue store lock),
+                // occupying up to 60% of the loop and starving SCP intake
+                // (measured via maxtps_loop: tx_advert_flush up to 18.3 s per
+                // 30 s window). Same coalesced fire-and-not-awaited pattern as
+                // dispatch_peer_maintenance: strictly serial via the in-flight
+                // guard, skipped tick re-runs next period, abort on shutdown.
                 _ = tx_advert_interval.tick() => {
                     if self.herder.is_tracking() {
                         self.set_phase(21); // 21 = tx_advert_flush
-                        self.flush_tx_adverts().await;
+                        // Upgrade the self Weak into an owned Arc for the
+                        // detached task (same mechanism as peer maintenance).
+                        let app = self.self_arc.read().await.upgrade();
+                        if let Some(app) = app {
+                            dispatch_peer_maintenance(
+                                async move { app.flush_tx_adverts().await },
+                                &mut tx_advert_flush_task,
+                            );
+                        }
                     }
                 }
 
@@ -1415,6 +1438,11 @@ impl App {
                     // and best-effort reconnects, so an abort mid-flight is
                     // harmless — a skipped round simply re-runs on next startup.
                     if let Some(h) = peer_maintenance_task.take() {
+                        h.abort();
+                    }
+                    // Abort any in-flight advert flush (maxtps iter 6) — the
+                    // process is exiting; un-flushed adverts are moot.
+                    if let Some(h) = tx_advert_flush_task.take() {
                         h.abort();
                     }
                     break;
