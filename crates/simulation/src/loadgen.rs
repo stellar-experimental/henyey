@@ -949,6 +949,43 @@ impl TxGenerator {
         self.accounts.clear();
     }
 
+    /// [maxtps_ban] Forensic dump of up to `limit` unsynced accounts
+    /// (expected vs on-ledger sequence) when a run fails the completion wait.
+    /// `delta = expected - on_ledger`: `1` means exactly one tx never
+    /// applied; larger deltas mean a chain wedged earlier; `None` on-ledger
+    /// means the account is unloadable.
+    pub fn log_unsynced_sample(&self, limit: usize) {
+        let mut shown = 0usize;
+        let mut total = 0usize;
+        for account in self.accounts.values() {
+            let on_ledger = self
+                .app
+                .load_account_sequence(&account.account_id)
+                .ok()
+                .flatten();
+            if on_ledger == Some(account.sequence_number) {
+                continue;
+            }
+            total += 1;
+            if shown < limit {
+                tracing::warn!(
+                    target: "maxtps_ban",
+                    account = %account.account_id,
+                    expected_seq = account.sequence_number,
+                    on_ledger_seq = ?on_ledger,
+                    delta = on_ledger.map(|s| account.sequence_number - s),
+                    "unsynced account at completion-wait failure"
+                );
+                shown += 1;
+            }
+        }
+        tracing::warn!(
+            target: "maxtps_ban",
+            total_unsynced = total,
+            "completion-wait failure: unsynced account total"
+        );
+    }
+
     /// Build CreateAccount operations for a range of accounts.
     ///
     /// Matches stellar-core `TxGenerator::createAccounts()`.
@@ -2003,6 +2040,14 @@ impl LoadGenerator {
                     // past the real one (a 23-node single-VM run "passed" 2753
                     // tx/s with >90% empty ledgers while core honestly failed at
                     // ~1531). (#3631)
+                    //
+                    // [maxtps_ban] the third (previously silent) run-fatal
+                    // path: submission finished but accounts never synced
+                    // within the ledger budget. Log a forensic sample of the
+                    // unsynced accounts (expected vs on-ledger seq) so the
+                    // sustained-load investigation can see WHERE the
+                    // unapplied txs are stuck.
+                    self.tx_generator.log_unsynced_sample(8);
                     self.failed = true;
                     return;
                 }
