@@ -383,45 +383,68 @@ advantage; at 5 s both implementations are wall-clock-bound and effectively tied
 - **T7 broadcast batch-drain**: amortizes event-loop wakeups on the flood-ingest path. Parity-safe, 0 gain.
 - Both are latency/efficiency hygiene, not maxtps levers; land only if desired on their own merits.
 
-## Probe-window dependence — the short probe OVER-REPORTS sustainable TPS (2026-07-01)
+## Probe-window dependence — the short probe OVER-REPORTS sustainable TPS (2026-07-01, CORRECTED 2026-07-02)
 
 Question raised: does the 5-min probe give the same max as the 1-min short probe? If a rate holds for
-1 min it "should" hold for 5 min. **It does not** — and the reason is a measurement-methodology effect,
-proven from code, not a henyey performance bug.
+1 min it "should" hold for 5 min. **It does not.** The DIRECTION of this finding is correct and survives;
+an adversarial audit (Fable model) **refuted the specific mechanism** first proposed here. This is the
+corrected version — see "Correction" at the end for what was wrong (the original claimed a "fixed
+20-ledger post-submission drain budget, proven from code, definitive"; that was arithmetically impossible).
 
-**Measured (healthy instance, multiplier=300 ≈ 5-min offer window):** the long-probe binary search FAILED
-at 1360, 1280, and 1240 — with the 1280 and 1240 steps running **~3.7 min then failing** — vs the
-short-probe (multiplier=60 ≈ 1-min) max of ~1446–1510. So the 5-min sustainable max is **<1240, ≥17%
-below** the 1-min number. (Exact long-probe asymptote not pinned — search failed all the way down; only a
-lower bound established.)
+**Measured (healthy instance, multiplier=300 ≈ 5-min offer window, FASTFAIL=10):** the long-probe binary
+search FAILED at 1360, 1280, and 1240 — with 1280/1240 running ~2–3.7 min then failing (1240 longest) —
+vs the short-probe (multiplier=60) max of ~1446–1510. So the 5-min max is **< 1240**, materially below the
+1-min number. **Magnitude is an UNPROVEN lower bound:** the long-probe search failed all the way down and
+never passed a step, so the true sustainable rate D is only bounded (< 1240), not measured. The earlier
+"≥17% / ~20% over-report" was over-stated (it compared a short-probe pass against a long-probe that never
+passed).
 
-**Root cause (from code — definitive):** the max-TPS pass criterion is that AFTER the loadgen finishes
-submitting its offer window, **all** submitted txns must be applied within a **fixed 20-ledger budget**
-(`WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS`, a stellar-core parity constant; `loadgen.rs:85,1995-2048`).
-The offer window length = `txrate × multiplier` ≈ `multiplier` seconds (`MaxTPSTest.fs:19-28`) — 60 s
-short vs 300 s long. At any offer rate R above the node's true steady-state drain rate D, backlog
-accumulates at (R−D) and reaches **(R−D) × window** by submission-end, then must clear within the fixed
-~20-ledger (~100 s) budget. Because the backlog grows with window length while the clearing budget is
-fixed, a longer window necessarily fails at a lower R. As window → ∞, the passing rate → **D** (the true
-sustainable drain). The observed "~3.7 min then fail" = submission finished + the 20-ledger wait-complete
-timeout tripped, exactly as the model predicts (not a mid-run collapse).
+**Root cause (corrected): backlog is DESTROYED during submission, not drained after it.** The binder is
+NOT a post-submission drain budget. Two facts refute that:
+- Submission is a hard cumulative-target rate limiter (`get_tx_per_step`, `loadgen.rs:2135-2151`), so a
+  multiplier=300 window takes **≥300 s** to submit. The 1240 step failed at ~222 s — **mid-submission**,
+  before `wait_till_complete` (`loadgen.rs:1826,1995`) could even start its clock. A post-submission
+  timeout cannot explain a mid-submission failure.
+- The classic tx-queue has finite admission capacity = `maxLedgerResources × TRANSACTION_QUEUE_SIZE_MULTIPLIER`
+  (=2, `tx_queue/mod.rs:126-131`; maxTxSetSize ≈ 10·R via `MaxTPSTest.fs`), and txs pending beyond
+  `pending_depth` (4 ledgers) are **banned** (`tx_queue/mod.rs:43`). When offer R > drain D, the backlog
+  grows during submission; once it exceeds capacity (and/or txs age past pending-depth) the excess is
+  **evicted and banned** → those txs never apply → `check_accounts_synced` (`loadgen.rs:910`) can never
+  reach 100% → the run fails regardless of any wait budget. Time-to-overflow ≈ capacity/(R−D), shorter at
+  higher R — matching the observed order (1360 failed fastest, 1240 slowest). One fitted D ≈ 1120 reproduces
+  all three failure times and the short-probe pass, but that fit is illustrative, not measured.
+
+Either way the window-dependence DIRECTION holds: any closed-loop pass criterion of the form "all offered
+txns must eventually apply" forces the passing rate → D as window → ∞ (a longer window accumulates a
+proportionally larger backlog against fixed-size queue/ban limits). "Holding 1 min" is burst absorption,
+not steady state.
 
 **Implications:**
-- "Holding 1 min" is **burst absorption**, not steady state: a short burst's backlog clears within 20
-  ledgers; a 5× longer burst's does not. The honest *sustainable* throughput is the long-window asymptote
-  (≈ D, ≤1240 and falling with window), NOT the short-probe ~1490.
-- **Not a henyey bug and not fixable in henyey code** — it's inherent to the test definition (window ×
-  fixed budget) and identical in stellar-core (core's ~1531 was also short-probe). **Relative A/B results
-  in this doc remain valid** (same window both sides — e.g. the #3691 +6.4%); only the *absolute* numbers
-  are burst-inflated by ~20%.
-- **Measurement "fix" (not code):** to report true sustainable TPS, use a long window (multiplier ≥ 300)
-  or scale the completion budget with the window. The short probe stays useful as a fast relative metric
-  but overstates absolute sustainable throughput. (NOTE: contradicts the skill's "short-probe reproduces
-  the canonical ceiling within ~2%" claim — the real over-report is ≥17%.)
-- **Open nuance:** whether D itself is perfectly flat vs. slightly degrades over a sustained run (a small
-  fixable inefficiency) was not empirically closed (repeated cloud-infra failures). The code mechanism
-  fully explains the observation with a *flat* D, so the parsimonious conclusion is "measurement artifact,
-  no degradation bug"; a clean sustained drain-rate-vs-time series would confirm.
+- The honest *sustainable* throughput is the long-window asymptote D (< 1240 here, exact value unmeasured),
+  not the short-probe ~1490. Short probe over-reports; magnitude unquantified.
+- **Direction is inherent to the test definition, present in stellar-core too** (shared harness; core also
+  `TIMEOUT_NUM_LEDGERS=20`, `LoadGenerator.cpp:73`). But **NOT "identical"**: for `PAY_PREGENERATED` core
+  *fails the run instantly on the first non-PENDING submit* (`LoadGenerator.cpp:953-963`) whereas henyey
+  retries queue-full up to 6000×100 ms (documented divergence #3574) — so core's long probe fails *sooner*
+  and at a *lower* R. henyey's probe is mildly henyey-favorable near saturation, a small caveat on the
+  1446–1510 vs 1531 absolute comparison. **Relative A/B results at the same window remain valid** (#3691 +6.4%).
+- **Correct measurement fix (open-loop, NOT budget-scaling):** do NOT binary-search on 100% backlog
+  clearance. Instead (a) judge a step by **sustained applied-tx-rate** (txs-applied-per-ledger ÷ close
+  cadence over the window) — window-invariant by construction; or (b) fail on **backlog growth during
+  submission** (queue depth rising monotonically for N ledgers) — detects R > D in ~30 s at any window; or
+  (c) measure D directly from the applied-ops-per-ledger plateau under a deliberate over-rate step. Scaling
+  the wait budget with the window (the original suggestion here) **would NOT work** — evicted/banned backlog
+  never applies no matter how long you wait.
+- Contradicts the skill's "short-probe reproduces the canonical ceiling within ~2%" claim — the real gap is
+  larger (unquantified, but long probe failed ≥ ~1240 vs short ~1490).
+
+**Correction (2026-07-02, after Fable adversarial audit):** the original write-up called the root cause "a
+fixed 20-ledger post-submission drain budget, proven from code, definitive." That was WRONG: (1) the
+observed failures were mid-submission (~222 s < 300 s submit time), so the post-submission timeout never
+triggered; (2) that model predicts a 2.0× short/long ceiling ratio (167% over-report), contradicting the
+"~17%" number — model and magnitude were mutually exclusive. The actual binder is queue-capacity +
+pending-depth ban during submission. Lesson: a plausible-sounding code path was labelled "definitive"
+without checking that its arithmetic matched the observed failure timing.
 
 ## Summary
 - Baseline → final: 462 → **~1446-1510 tx/s** (~95-98% of core's ~1531 on the same rig; was 84%).
