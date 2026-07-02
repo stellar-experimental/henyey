@@ -1200,8 +1200,14 @@ impl ScpDriver {
                 if overhead_ms < OUTLIER_MS {
                     use std::sync::atomic::Ordering;
                     let prev = self.nom_overhead_ewma_ms.load(Ordering::Relaxed);
-                    // EWMA alpha = 1/4; seed with the first observation.
-                    let next = if prev == 0 {
+                    // Asymmetric tracker: jump UP to a larger observation
+                    // immediately (load onset must be compensated within one
+                    // slot — a slow ramp leaves several ledgers running at the
+                    // uncompensated ~5.5 s cadence), decay DOWN with alpha=1/4
+                    // (a few idle slots after a burst briefly over-compensate,
+                    // which only closes ledgers marginally faster than the
+                    // declared target until the estimate settles).
+                    let next = if prev == 0 || overhead_ms > prev {
                         overhead_ms
                     } else {
                         (3 * prev + overhead_ms) / 4

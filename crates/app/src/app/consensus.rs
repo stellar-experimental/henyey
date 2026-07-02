@@ -419,12 +419,14 @@ impl App {
         self.setup_trigger_next_ledger().await;
     }
 
-    /// Early-trigger compensation: the EWMA of the per-slot nomination
-    /// overhead (tx-set build + SCP convergence), clamped to
-    /// `expected_close / 2`. Subtracted from the trigger instant by BOTH
-    /// trigger sites (`setup_trigger_next_ledger` and the
-    /// `try_trigger_consensus` gate) so the timer and the safety-net always
-    /// agree on timing. Returns 0 until the first slot completes nomination.
+    /// Early-trigger compensation: the tracked per-slot nomination overhead
+    /// (tx-set build + SCP convergence), clamped to `expected_close / 5`
+    /// (1 s at the 5 s target — the round-1 nomination timeout) so a single
+    /// outlier observation can never pull the trigger drastically early.
+    /// Subtracted from the trigger instant by BOTH trigger sites
+    /// (`setup_trigger_next_ledger` and the `try_trigger_consensus` gate) so
+    /// the timer and the safety-net always agree on timing. Returns 0 until
+    /// the first slot completes nomination.
     fn trigger_overhead_compensation(
         &self,
         expected_close: std::time::Duration,
@@ -432,7 +434,7 @@ impl App {
         self.herder
             .nomination_overhead_estimate()
             .unwrap_or_default()
-            .min(expected_close / 2)
+            .min(expected_close / 5)
     }
 
     pub(super) async fn setup_trigger_next_ledger(&self) {
