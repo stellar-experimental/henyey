@@ -3937,6 +3937,17 @@ impl Herder {
             tx_count = tx_set.len(),
             "Proposing transaction set"
         );
+        // [maxtps_ban] queue-vs-selected accounting per candidate build: under
+        // sustained load, per-ledger fills track ARRIVALS while a multi-ledger
+        // backlog sits somewhere for ~10 ledgers — this line splits
+        // "queue doesn't hold it" from "selection drops it".
+        tracing::info!(
+            target: "maxtps_ban",
+            queue_len = self.tx_queue.len(),
+            selected = tx_set.len(),
+            max_txs,
+            "proposed_set"
+        );
 
         // 3.5. Self-validation roundtrip + cache. Aborts nomination on
         // self-validation failure rather than caching a known-bad set
