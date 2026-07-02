@@ -603,20 +603,7 @@ impl App {
             // WARNs below.
             let phase_dispatch_start = std::time::Instant::now();
             tokio::select! {
-                // `biased;` (maxtps iteration 4): poll arms in written order so
-                // SCP envelopes, consensus timer events, and interval ticks
-                // preempt bulk flood processing. Under ~1450 tx/s flood load the
-                // unbiased select gave the dedicated SCP channel ~1/N of
-                // pickups, adding a measured median 92 ms / p99 273 ms of queue
-                // wait per envelope hop (target maxtps_scp) — 3-4 sequential
-                // hops of that is the entire slow-nomination tail. The flood
-                // arm (message_rx) now sits at the BOTTOM of the select; every
-                // other arm is rate-bounded (SCP ~hundreds/slot, ticks ≤10/s),
-                // so flood intake cannot be starved, it just yields priority.
-                // (An earlier un-ordered `biased;` was removed because it
-                // starved timers — the cure is ordering ticks ABOVE the flood
-                // arm, not removing bias.)
-                biased;
+                // NOTE: Removed biased; to ensure timers get fair polling
 
                 // Await pending ledger close or persist completion.
                 // The pipeline is a state machine: at most one operation is
@@ -1006,6 +993,69 @@ impl App {
                 // SCP, fetch-response, and fetch-request messages no longer arrive here —
                 // they are routed exclusively to dedicated channels at the overlay layer.
                 // The skip guards below are kept as defensive fallbacks.
+                msg = message_rx.recv() => {
+                    self.set_phase(3); // 3 = broadcast
+                    match msg {
+                        Ok(overlay_msg) => {
+                            // Skip SCP messages from broadcast channel — they are already
+                            // handled via the dedicated SCP channel above.
+                            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                continue;
+                            }
+                            // Skip fetch response and request messages from broadcast channel —
+                            // they are handled via the dedicated fetch channel above.
+                            if matches!(
+                                overlay_msg.message,
+                                StellarMessage::GeneralizedTxSet(_)
+                                    | StellarMessage::TxSet(_)
+                                    | StellarMessage::DontHave(_)
+                                    | StellarMessage::ScpQuorumset(_)
+                                    | StellarMessage::GetScpState(_)
+                                    | StellarMessage::GetScpQuorumset(_)
+                                    | StellarMessage::GetTxSet(_)
+                            ) {
+                                continue;
+                            }
+                            let delivery_latency = overlay_msg.received_at.elapsed();
+                            let msg_type = match &overlay_msg.message {
+                                StellarMessage::ScpMessage(_) => "SCP",
+                                StellarMessage::Transaction(_) => "TX",
+                                StellarMessage::TxSet(_) => "TxSet",
+                                StellarMessage::GeneralizedTxSet(_) => {
+                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
+                                    "GeneralizedTxSet"
+                                },
+                                StellarMessage::ScpQuorumset(_) => {
+                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
+                                    "ScpQuorumset"
+                                },
+                                StellarMessage::GetTxSet(_) => "GetTxSet",
+                                StellarMessage::Hello(_) => "Hello",
+                                StellarMessage::Peers(_) => "Peers",
+                                _ => "Other",
+                            };
+                            tracing::debug!(msg_type, latency_ms = delivery_latency.as_millis(), "Received overlay message");
+                            self.handle_overlay_message(overlay_msg).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Only non-critical messages (TX floods) flow through the
+                            // broadcast channel now, so lag is expected under load.
+                            // [maxtps_diag] Count dropped flood messages — under load
+                            // these are demanded txs the node never receives, forcing
+                            // re-demands (stellar_overlay_demand_timeout_total) and
+                            // leaving the agreed set short. Core never drops flooded
+                            // txs (flow-controlled per-peer queues).
+                            metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total")
+                                .increment(n);
+                            tracing::debug!(skipped = n, "Overlay broadcast receiver lagged (non-critical messages only)");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!("Overlay broadcast channel closed");
+                            break;
+                        }
+                    }
+                }
+
                 // Broadcast outbound SCP envelopes
                 envelope = scp_rx.recv() => {
                     self.set_phase(4); // 4 = scp_broadcast
@@ -1496,72 +1546,6 @@ impl App {
                                 tracking_slot,
                                 "Out-of-sync recovery: purged old slots"
                             );
-                        }
-                    }
-                }
-
-                // Flood/broadcast intake (tx floods, adverts, demands). Lowest
-                // priority under `biased;`: SCP envelopes, consensus timers, and
-                // ticks preempt bulk flood processing (see note at the select head).
-                msg = message_rx.recv() => {
-                    self.set_phase(3); // 3 = broadcast
-                    match msg {
-                        Ok(overlay_msg) => {
-                            // Skip SCP messages from broadcast channel — they are already
-                            // handled via the dedicated SCP channel above.
-                            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
-                                continue;
-                            }
-                            // Skip fetch response and request messages from broadcast channel —
-                            // they are handled via the dedicated fetch channel above.
-                            if matches!(
-                                overlay_msg.message,
-                                StellarMessage::GeneralizedTxSet(_)
-                                    | StellarMessage::TxSet(_)
-                                    | StellarMessage::DontHave(_)
-                                    | StellarMessage::ScpQuorumset(_)
-                                    | StellarMessage::GetScpState(_)
-                                    | StellarMessage::GetScpQuorumset(_)
-                                    | StellarMessage::GetTxSet(_)
-                            ) {
-                                continue;
-                            }
-                            let delivery_latency = overlay_msg.received_at.elapsed();
-                            let msg_type = match &overlay_msg.message {
-                                StellarMessage::ScpMessage(_) => "SCP",
-                                StellarMessage::Transaction(_) => "TX",
-                                StellarMessage::TxSet(_) => "TxSet",
-                                StellarMessage::GeneralizedTxSet(_) => {
-                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
-                                    "GeneralizedTxSet"
-                                },
-                                StellarMessage::ScpQuorumset(_) => {
-                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
-                                    "ScpQuorumset"
-                                },
-                                StellarMessage::GetTxSet(_) => "GetTxSet",
-                                StellarMessage::Hello(_) => "Hello",
-                                StellarMessage::Peers(_) => "Peers",
-                                _ => "Other",
-                            };
-                            tracing::debug!(msg_type, latency_ms = delivery_latency.as_millis(), "Received overlay message");
-                            self.handle_overlay_message(overlay_msg).await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // Only non-critical messages (TX floods) flow through the
-                            // broadcast channel now, so lag is expected under load.
-                            // [maxtps_diag] Count dropped flood messages — under load
-                            // these are demanded txs the node never receives, forcing
-                            // re-demands (stellar_overlay_demand_timeout_total) and
-                            // leaving the agreed set short. Core never drops flooded
-                            // txs (flow-controlled per-peer queues).
-                            metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total")
-                                .increment(n);
-                            tracing::debug!(skipped = n, "Overlay broadcast receiver lagged (non-critical messages only)");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            tracing::info!("Overlay broadcast channel closed");
-                            break;
                         }
                     }
                 }
