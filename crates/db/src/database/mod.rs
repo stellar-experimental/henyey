@@ -24,18 +24,19 @@ const CACHE_SIZE_KIB: i32 = -64_000;
 
 /// WAL auto-checkpoint threshold in pages.
 ///
-/// Parity with `stellar-core/src/database/Database.cpp:169` (`PRAGMA
-/// wal_autocheckpoint = 10000`). The SQLite default is 1000; henyey left it
-/// unset (= default 1000) until #3640. A smaller threshold fires in-line WAL
-/// checkpoints more often, and a checkpoint's `fsync` can stall for seconds on
-/// a co-tenant-saturated nvme, contributing to ledger-close commit latency and
-/// transient `SQLITE_BUSY`. Raising it to 10000 reduces checkpoint frequency to
-/// match stellar-core.
+/// 0 = inline auto-checkpoints DISABLED; checkpointing is done exclusively by
+/// the app's background checkpointer via [`Database::wal_checkpoint_passive`].
 ///
-/// Only this pragma is matched to stellar-core here; the other core/henyey
-/// pragma differences (`cache_size`, `mmap_size`, `temp_store`, `foreign_keys`)
-/// are pre-existing and deliberately left divergent (#3640).
-const WAL_AUTOCHECKPOINT_PAGES: u32 = 10_000;
+/// History: stellar-core sets `wal_autocheckpoint = 10000`
+/// (`Database.cpp:169`) and henyey matched it in #3640. But henyey's
+/// ledger-close persist writes 10-30 MB of WAL per ledger (per-tx rows with
+/// meta XDR; core writes ~0.1 MB), so the 10000-page threshold fired every
+/// couple of closes INSIDE the persist commit — the committing writer copied
+/// and fsynced tens of MB while holding the WAL write lock, stalling closes
+/// 4-16 s under sustained load (maxtps forensics 2026-07-03). Moving the
+/// checkpoint to a background task keeps the close path free; PASSIVE
+/// checkpoints do not block concurrent writers.
+const WAL_AUTOCHECKPOINT_PAGES: u32 = 0;
 
 /// Applies the per-connection SQLite PRAGMAs shared by the file-backed and
 /// in-memory open paths.

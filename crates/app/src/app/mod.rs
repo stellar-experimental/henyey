@@ -3521,6 +3521,76 @@ impl App {
         Some(handle)
     }
 
+    /// Start the background WAL checkpointer.
+    ///
+    /// Inline SQLite auto-checkpoints are disabled (`wal_autocheckpoint = 0`
+    /// in henyey_db): henyey's ledger-close persist writes 10-30 MB of WAL
+    /// per ledger, so threshold-triggered checkpoints used to run INSIDE the
+    /// close-persist commit, holding the WAL write lock for 4-16 s under
+    /// sustained load and stalling the apply pipeline (which in turn delayed
+    /// the LCL-gated consensus trigger and broke nomination round-1 quorum
+    /// assembly — the burst-vs-sustained TPS gap).
+    ///
+    /// This task runs `PRAGMA wal_checkpoint(PASSIVE)` every 2 s on a
+    /// blocking-pool thread. PASSIVE never blocks concurrent readers or
+    /// writers, so a close that starts mid-checkpoint proceeds unimpeded.
+    ///
+    /// Returns the JoinHandle so callers can abort it on shutdown; the task
+    /// also exits when the app's shutdown broadcast fires.
+    pub fn start_wal_checkpointer(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+        const SLOW_CHECKPOINT_MS: u64 = 1_000;
+
+        let db = self.db.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CHECKPOINT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.recv() => break,
+                }
+                let db = db.clone();
+                let started = std::time::Instant::now();
+                let res = tokio::task::spawn_blocking(move || {
+                    let _ctx = henyey_common::WriteCtxGuard::new("wal-checkpoint-passive");
+                    db.wal_checkpoint_passive()
+                })
+                .await;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                match res {
+                    Ok(Ok((busy, wal_pages, checkpointed))) => {
+                        if elapsed_ms >= SLOW_CHECKPOINT_MS || busy != 0 {
+                            tracing::info!(
+                                elapsed_ms,
+                                busy,
+                                wal_pages,
+                                checkpointed,
+                                "WAL passive checkpoint (slow or busy)"
+                            );
+                        } else {
+                            tracing::trace!(
+                                elapsed_ms,
+                                wal_pages,
+                                checkpointed,
+                                "WAL passive checkpoint"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "WAL passive checkpoint failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "WAL checkpointer join error");
+                        break;
+                    }
+                }
+            }
+            tracing::info!("WAL checkpointer stopped");
+        })
+    }
+
     /// Send a heartbeat to the sync recovery manager.
     ///
     /// Currently called by the app layer after each ledger close.

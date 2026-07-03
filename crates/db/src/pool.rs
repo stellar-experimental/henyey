@@ -72,6 +72,26 @@ impl Database {
         self.pool.get().map_err(DbError::from)
     }
 
+    /// Runs a PASSIVE WAL checkpoint on a pooled connection.
+    ///
+    /// PASSIVE transfers as much WAL content into the main database file as
+    /// possible without blocking concurrent readers or writers, then returns.
+    /// Inline auto-checkpoints are disabled (`wal_autocheckpoint = 0`), so the
+    /// app's background checkpointer calls this off the ledger-close critical
+    /// path — the close-persist commit never pays checkpoint I/O itself.
+    ///
+    /// Returns `(busy, wal_pages, checkpointed_pages)` from
+    /// `PRAGMA wal_checkpoint(PASSIVE)`: `busy` is 1 if the checkpoint could
+    /// not complete (e.g. a long-running reader pins the WAL), `wal_pages` is
+    /// the WAL size in pages, `checkpointed_pages` how many were transferred.
+    pub fn wal_checkpoint_passive(&self) -> Result<(i64, i64, i64), DbError> {
+        let conn = self.connection()?;
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(DbError::from)
+    }
+
     /// Executes a closure within a database transaction.
     ///
     /// If the closure returns `Ok`, the transaction is committed.
