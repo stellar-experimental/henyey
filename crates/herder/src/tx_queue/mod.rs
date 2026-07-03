@@ -3272,6 +3272,81 @@ impl TransactionQueue {
         Some((tx.hash, envelope_sequence_number(&tx.envelope), state.age))
     }
 
+    /// Drop the account's pending transaction if it is stale: its sequence
+    /// number is `<= on_ledger_seq`, i.e. the ledger has already consumed
+    /// that sequence slot, so the pending entry can never apply again.
+    ///
+    /// Self-heal for #3719: ledger state (account seq) advances at apply,
+    /// but `remove_applied`/`shift` run in a later `spawn_blocking` — a
+    /// submission landing in that window (or racing a duplicate that applied
+    /// via another node) sees a just-consumed pending entry and gets
+    /// `TryAgainLater`. stellar-core cannot observe this state (its queue
+    /// cleanup is synchronous with close on the main thread), so dropping the
+    /// stale entry and re-admitting matches core-observable behavior.
+    ///
+    /// The staleness condition is re-checked under the store/account locks so
+    /// a concurrent `remove_applied` cannot double-release fees. The hash is
+    /// NOT banned here — if the tx applied, `remove_applied` bans it on its
+    /// own schedule. Returns `true` if a stale entry was dropped.
+    pub fn drop_stale_pending(&self, account_id: &AccountId, on_ledger_seq: i64) -> bool {
+        let key = account_key_from_account_id(account_id);
+
+        // Lock order: store → account_states (canonical; see remove_applied).
+        let mut store = self.store.write();
+        let mut account_states = self.account_states.write();
+        let ledger_version = self.validation_context.read().protocol_version;
+
+        let Some(state) = account_states.get_mut(&key) else {
+            return false;
+        };
+        let Some(ref queued_tx) = state.transaction else {
+            return false;
+        };
+        if queued_tx.sequence_number() > on_ledger_seq {
+            return false;
+        }
+
+        let removed_hash = queued_tx.hash;
+        let tx_fee = queued_tx.total_fee as i64;
+        let tx_fee_source_key = self::fee_source_key(&queued_tx.envelope);
+        let tx_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&queued_tx.envelope);
+
+        store.remove(&removed_hash, ledger_version);
+        state.transaction = None;
+        state.age = 0;
+        if state.is_empty() {
+            account_states.remove(&key);
+        }
+
+        // Release the reserved fee on the fee-source account (mirrors
+        // remove_applied's fee-release bookkeeping).
+        if let Some(fee_state) = account_states.get_mut(&tx_fee_source_key) {
+            fee_state.total_fees = fee_state.total_fees.saturating_sub(tx_fee);
+            if tx_is_soroban {
+                fee_state.soroban_fee_tx_count = fee_state.soroban_fee_tx_count.saturating_sub(1);
+            } else {
+                fee_state.classic_fee_tx_count = fee_state.classic_fee_tx_count.saturating_sub(1);
+            }
+            if fee_state.is_empty() {
+                account_states.remove(&tx_fee_source_key);
+            }
+        }
+
+        drop(account_states);
+        drop(store);
+
+        self.seen.write().remove(&removed_hash);
+        self.eviction_thresholds.reset_all();
+
+        tracing::info!(
+            target: "maxtps_tail",
+            hash8 = %&removed_hash.to_hex()[..16],
+            on_ledger_seq,
+            "dropped stale pending tx (seq already consumed on-ledger, #3719)"
+        );
+        true
+    }
+
     pub fn banned_count(&self) -> usize {
         let banned = self.banned_transactions.read();
         banned.iter().map(|s| s.len()).sum()
@@ -5536,6 +5611,81 @@ mod tests {
         assert!(
             !queue.contains(&queued_hash),
             "queued tx with seq=1 should be removed when applied tx has seq=7"
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// #3719 self-heal: a pending tx whose sequence the ledger has already
+    /// consumed is dropped by drop_stale_pending, and the account can then
+    /// admit its next tx (previously TryAgainLater until remove_applied /
+    /// revalidation caught up).
+    #[test]
+    fn test_drop_stale_pending_unblocks_account() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut stale = make_test_envelope(200, 1);
+        set_source(&mut stale, 44);
+        if let TransactionEnvelope::Tx(ref mut env) = stale {
+            env.tx.seq_num = SequenceNumber(7);
+        }
+        assert_eq!(queue.try_add(stale.clone()), TxQueueResult::Added);
+        let account = account_id_from_envelope(&stale);
+        let stale_hash = full_hash(&stale);
+
+        // The bug scenario: account already at seq 7 on-ledger; the next
+        // submission (seq 8) is rejected because of the stale pending.
+        let mut next = make_test_envelope(200, 1);
+        set_source(&mut next, 44);
+        if let TransactionEnvelope::Tx(ref mut env) = next {
+            env.tx.seq_num = SequenceNumber(8);
+        }
+        assert_eq!(queue.try_add(next.clone()), TxQueueResult::TryAgainLater);
+
+        // Self-heal: drop the stale entry, then the next tx admits.
+        assert!(queue.drop_stale_pending(&account, 7));
+        assert!(!queue.contains(&stale_hash), "stale entry must be removed");
+        assert_eq!(queue.try_add(next), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// drop_stale_pending must NOT touch a genuinely-pending tx (seq above
+    /// the account's on-ledger seq).
+    #[test]
+    fn test_drop_stale_pending_keeps_live_pending() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut pending = make_test_envelope(200, 1);
+        set_source(&mut pending, 45);
+        if let TransactionEnvelope::Tx(ref mut env) = pending {
+            env.tx.seq_num = SequenceNumber(8);
+        }
+        assert_eq!(queue.try_add(pending.clone()), TxQueueResult::Added);
+        let account = account_id_from_envelope(&pending);
+        let hash = full_hash(&pending);
+
+        // Account at seq 7: the seq-8 pending is live.
+        assert!(!queue.drop_stale_pending(&account, 7));
+        assert!(queue.contains(&hash), "live pending must be kept");
+    }
+
+    /// drop_stale_pending releases the reserved fee so subsequent
+    /// fee-accounting starts clean (mirrors remove_applied bookkeeping).
+    #[test]
+    fn test_drop_stale_pending_releases_fee_state() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut stale = make_test_envelope(200, 1);
+        set_source(&mut stale, 46);
+        assert_eq!(queue.try_add(stale.clone()), TxQueueResult::Added);
+        let account = account_id_from_envelope(&stale);
+
+        assert!(queue.drop_stale_pending(&account, 1));
+        assert!(
+            !queue
+                .account_states
+                .read()
+                .contains_key(&account_key(&stale)),
+            "account state must be fully cleaned up after the stale drop"
         );
         assert_eq!(queue.len(), 0);
     }

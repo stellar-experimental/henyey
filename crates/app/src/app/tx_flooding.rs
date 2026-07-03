@@ -333,7 +333,25 @@ impl App {
         }
 
         // Phase 2: Send adverts and mark successfully sent hashes.
+        let advert_watch = {
+            let w = self.tail_watch.read().await;
+            if w.is_empty() {
+                None
+            } else {
+                Some(w.clone())
+            }
+        };
         for (peer_id, hashes) in &per_peer {
+            if let Some(w) = advert_watch.as_ref() {
+                for hash in hashes.iter().filter(|h| w.contains(h)) {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        hash8 = %&hash.to_hex()[..16],
+                        peer = %peer_id,
+                        "watched hash RE-ADVERTED"
+                    );
+                }
+            }
             for chunk in hashes.chunks(max_chunk_size) {
                 let tx_hashes = match TxAdvertVector::try_from(
                     chunk
@@ -394,10 +412,17 @@ impl App {
         let aged = self
             .herder
             .tx_queue()
-            .sample_aged_txs(Duration::from_secs(8), 3);
+            .sample_aged_txs(Duration::from_secs(3), 3);
         if !aged.is_empty() {
+            const TAIL_WATCH_CAP: usize = 32;
             let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+            let mut watch = self.tail_watch.write().await;
             for (hash, age_ms) in aged {
+                // Arm wire tracing for this stranded hash (#3719 part 1):
+                // the demand/response paths below log every event touching it.
+                if watch.len() < TAIL_WATCH_CAP {
+                    watch.insert(hash);
+                }
                 let sent_to = peer_ids
                     .iter()
                     .filter(|pid| {
@@ -557,6 +582,18 @@ impl App {
             // Parity: stellar-core mTxPullLatency (OverlayMetrics.h:115).
             metrics::histogram!("stellar_overlay_tx_pull_latency_seconds")
                 .record(delta.as_secs_f64());
+            // [maxtps_tail] #3719 part-1: a pull that took 3+ s means the tx
+            // eventually arrived after stranding — log so the demander side of
+            // a strand's timeline is reconstructable at info level.
+            if delta.as_secs() >= 3 {
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    latency_ms = delta.as_millis() as u64,
+                    peers = entry.peers.len(),
+                    "slow tx pull completed"
+                );
+            }
             tracing::debug!(
                 hash = %hash.to_hex(),
                 latency_ms = delta.as_millis(),
@@ -775,7 +812,7 @@ impl App {
 
         for (peer_id, hashes) in to_send {
             let tx_hashes = match TxDemandVector::try_from(
-                hashes.into_iter().map(Hash::from).collect::<Vec<_>>(),
+                hashes.iter().copied().map(Hash::from).collect::<Vec<_>>(),
             ) {
                 Ok(vec) => vec,
                 Err(_) => {
@@ -786,6 +823,26 @@ impl App {
             let demand = FloodDemand { tx_hashes };
             if let Err(e) = overlay.try_send_to(&peer_id, StellarMessage::FloodDemand(demand)) {
                 tracing::warn!(peer = %peer_id, error = %e, "Failed to send flood demand");
+                // The demand never left this node — undo its bookkeeping so
+                // the next round retries instead of believing these hashes
+                // were demanded (#3719: for a sole-advertiser tx, a phantom
+                // demand record blocked the only pull path). Two parts:
+                // unmark the per-peer demand records, and re-queue the hashes
+                // onto the peer's retry queue (they were destructively popped
+                // during selection, so without this nothing would ever pop
+                // them again).
+                {
+                    let mut history = self.tx_demand_history.write().await;
+                    for hash in &hashes {
+                        if let Some(entry) = history.get_mut(hash) {
+                            entry.peers.remove(&peer_id);
+                        }
+                    }
+                }
+                let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
+                if let Some(adverts) = adverts_by_peer.get_mut(&peer_id) {
+                    adverts.retry_incoming(hashes, max_queue_size);
+                }
             }
         }
     }
@@ -848,6 +905,14 @@ impl App {
         // Match stellar-core: only send Transaction messages for found hashes.
         // Do NOT send DontHave for unfulfilled demands — stellar-core just
         // logs/meters misses without any outbound response.
+        let watch = {
+            let w = self.tail_watch.read().await;
+            if w.is_empty() {
+                None
+            } else {
+                Some(w.clone())
+            }
+        };
         let mut sent = 0u32;
         let mut deferred = 0u32;
         let mut banned = 0u32;
@@ -856,28 +921,71 @@ impl App {
         let mut to_defer: Vec<Hash256> = Vec::new();
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
+            let watched = watch.as_ref().is_some_and(|w| w.contains(&hash256));
             if channel_full {
                 if self.herder.tx_queue().get(&hash256).is_some() {
                     to_defer.push(hash256);
                     deferred += 1;
+                    if watched {
+                        tracing::info!(
+                            target: "maxtps_tail",
+                            hash8 = %&hash256.to_hex()[..16],
+                            peer = %peer_id,
+                            "watched demand DEFERRED (channel full)"
+                        );
+                    }
                 }
                 continue;
             }
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
                 match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.into_envelope()))
                 {
-                    Ok(()) => sent += 1,
+                    Ok(()) => {
+                        sent += 1;
+                        if watched {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                hash8 = %&hash256.to_hex()[..16],
+                                peer = %peer_id,
+                                "watched demand SERVED"
+                            );
+                        }
+                    }
                     Err(_) => {
                         // Channel full — defer this and the rest of the batch.
                         channel_full = true;
                         to_defer.push(hash256);
                         deferred += 1;
+                        if watched {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                hash8 = %&hash256.to_hex()[..16],
+                                peer = %peer_id,
+                                "watched demand DEFERRED (channel full)"
+                            );
+                        }
                     }
                 }
             } else if self.herder.tx_queue().is_banned(&hash256) {
                 banned += 1;
+                if watched {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        hash8 = %&hash256.to_hex()[..16],
+                        peer = %peer_id,
+                        "watched demand BANNED-here"
+                    );
+                }
             } else {
                 unknown += 1;
+                if watched {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        hash8 = %&hash256.to_hex()[..16],
+                        peer = %peer_id,
+                        "watched demand UNKNOWN-here"
+                    );
+                }
             }
         }
         if !to_defer.is_empty() {
@@ -934,6 +1042,14 @@ impl App {
             .collect();
         deferred_map.retain(|peer, _| connected.contains(peer));
 
+        let watch = {
+            let w = self.tail_watch.read().await;
+            if w.is_empty() {
+                None
+            } else {
+                Some(w.clone())
+            }
+        };
         let mut sent_total = 0u32;
         for (peer_id, queue) in deferred_map.iter_mut() {
             while let Some(hash) = queue.front().copied() {
@@ -946,6 +1062,14 @@ impl App {
                     Ok(()) => {
                         queue.pop_front();
                         sent_total += 1;
+                        if watch.as_ref().is_some_and(|w| w.contains(&hash)) {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                hash8 = %&hash.to_hex()[..16],
+                                peer = %peer_id,
+                                "watched deferred response FLUSHED"
+                            );
+                        }
                     }
                     Err(_) => break, // still full — try next tick
                 }
@@ -2794,5 +2918,72 @@ mod tests {
             app.demand_status(hash, &peer, late, &history),
             DemandStatus::Demand
         ));
+    }
+
+    /// #3719: a demand whose SEND fails (peer channel full) must not leave a
+    /// phantom per-peer demand record — the bookkeeping is undone and the
+    /// hashes re-queued, so the next round retries instead of believing the
+    /// demand was made (fatal for sole-advertiser txs).
+    #[tokio::test]
+    async fn test_failed_demand_send_is_unmarked_and_requeued() {
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        // Capacity-1 channel, pre-filled so the demand send fails.
+        let peer_id = make_peer_id(47);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 1);
+        overlay
+            .try_send_to(
+                &peer_id,
+                StellarMessage::DontHave(stellar_xdr::DontHave {
+                    type_: stellar_xdr::MessageType::TxSet,
+                    req_hash: stellar_xdr::Uint256([0u8; 32]),
+                }),
+            )
+            .expect("pre-fill message fits");
+
+        // Advertise a hash from that peer so the demand loop selects it.
+        let hash = Hash256::from_bytes([0xEE; 32]);
+        let advert = FloodAdvert {
+            tx_hashes: TxAdvertVector(vec![Hash(*hash.as_bytes())].try_into().unwrap()),
+        };
+        app.handle_flood_advert(&peer_id, advert).await;
+
+        app.run_tx_demands().await;
+
+        // Send failed: no phantom demand record for this peer...
+        {
+            let history = app.tx_demand_history.read().await;
+            let marked = history
+                .get(&hash)
+                .is_some_and(|e| e.peers.contains_key(&peer_id));
+            assert!(!marked, "failed demand send must not mark the peer");
+        }
+        // ...and the hash is back in the peer's queue for the next round.
+        {
+            let adverts = app.tx_adverts_by_peer.read().await;
+            let requeued = adverts
+                .get(&peer_id)
+                .is_some_and(|a| a.retry.contains(&hash) || a.incoming.contains(&hash));
+            assert!(requeued, "failed demand hashes must be re-queued");
+        }
+
+        // Drain the channel; the next round must actually send the demand.
+        let _ = receiver.try_recv();
+        app.run_tx_demands().await;
+        let mut saw_demand = false;
+        while let Some(msg) = receiver.try_recv() {
+            if matches!(msg, StellarMessage::FloodDemand(_)) {
+                saw_demand = true;
+            }
+        }
+        assert!(saw_demand, "retry round must send the demand");
+        let history = app.tx_demand_history.read().await;
+        assert!(
+            history
+                .get(&hash)
+                .is_some_and(|e| e.peers.contains_key(&peer_id)),
+            "successful demand must be marked"
+        );
     }
 }
