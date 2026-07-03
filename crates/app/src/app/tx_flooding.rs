@@ -608,8 +608,23 @@ impl App {
             return DemandStatus::Demand;
         };
 
-        if entry.peers.contains_key(peer) {
-            return DemandStatus::Discard;
+        if let Some(demanded_at) = entry.peers.get(peer) {
+            // stellar-core never re-demands from the same peer — safe there
+            // because its demand responses are never lost. Henyey divergence
+            // (overlay-internal, wire-compatible): when a tx has a SOLE
+            // advertiser (warmup, or an account's first tx), a single lost
+            // response permanently strands it under core's rule — no other
+            // peer will ever advert it. Allow re-demanding from the same
+            // peer after a generous expiry so sole-holder strands self-heal
+            // within ~2 s instead of wedging the account (2026-07-03
+            // maxtps_tail forensics: unfulfilled demands stuck at
+            // peers_demanded=1 for 14+ s).
+            const SAME_PEER_REDEMAND_DELAY: Duration = Duration::from_millis(2_000);
+            if now.duration_since(*demanded_at) < SAME_PEER_REDEMAND_DELAY {
+                return DemandStatus::Discard;
+            }
+            // Fall through: eligible for re-demand from this peer; the
+            // retry-count and backoff checks below still apply.
         }
 
         let num_demanded = entry.peers.len();
@@ -2738,6 +2753,45 @@ mod tests {
         let unknown = Hash256::from_bytes([0xCC; 32]);
         assert!(matches!(
             app.demand_status(unknown, &peer, now, &history),
+            DemandStatus::Demand
+        ));
+    }
+
+    /// Sole-advertiser strand self-heal: after SAME_PEER_REDEMAND_DELAY, a
+    /// hash may be re-demanded from a peer we already demanded from (henyey
+    /// divergence from stellar-core, which never re-demands per peer — safe
+    /// only when responses are never lost).
+    #[tokio::test]
+    async fn test_demand_status_allows_same_peer_redemand_after_expiry() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let peer = make_peer_id(46);
+        let hash = Hash256::from_bytes([0xDD; 32]);
+        let now = Instant::now();
+
+        let mut history: HashMap<Hash256, TxDemandHistory> = HashMap::new();
+        let demanded_at = now - Duration::from_millis(500);
+        history.insert(
+            hash,
+            TxDemandHistory {
+                first_demanded: demanded_at,
+                last_demanded: demanded_at,
+                peers: [(peer.clone(), demanded_at)].into_iter().collect(),
+                latency_recorded: false,
+            },
+        );
+
+        // Within the expiry window: still discarded.
+        assert!(matches!(
+            app.demand_status(hash, &peer, now, &history),
+            DemandStatus::Discard
+        ));
+
+        // Past the expiry window (and past the retry backoff): re-demand.
+        let late = now + Duration::from_millis(2_500);
+        assert!(matches!(
+            app.demand_status(hash, &peer, late, &history),
             DemandStatus::Demand
         ));
     }
