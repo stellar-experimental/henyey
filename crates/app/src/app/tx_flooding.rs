@@ -558,6 +558,18 @@ impl App {
     ) -> DemandStatus {
         const MAX_RETRY_COUNT: usize = 15;
 
+        // stellar-core parity (TxDemandsManager::demandStatus:71-74): never
+        // demand a tx we already have queued or banned. Without this check a
+        // fulfilled hash keeps cycling as RetryLater through every other
+        // peer's advert/retry queue until the 60 s retention prune — at
+        // ~1500 tx/s that permanently saturates the per-peer demand queues
+        // (observed full at max_ops with 100-240 drops per advert batch),
+        // starving demands for genuinely-new txs and stranding accounts
+        // (maxtps_tail forensics, 2026-07-03).
+        if self.herder.tx_queue().contains(&hash) || self.herder.tx_queue().is_banned(&hash) {
+            return DemandStatus::Discard;
+        }
+
         if self.herder.tx_queue().contains(&hash) {
             return DemandStatus::Discard;
         }
@@ -2656,5 +2668,47 @@ mod tests {
             app.tx_deferred_demand_responses.read().await.is_empty(),
             "stale entries must be pruned"
         );
+    }
+
+    /// stellar-core parity (TxDemandsManager::demandStatus:71-74): a tx we
+    /// already have queued — or have banned — must never be demanded.
+    /// Regression: without this, fulfilled hashes cycled as RetryLater
+    /// through every peer's queue for the 60 s retention window, saturating
+    /// the demand queues under load.
+    #[tokio::test]
+    async fn test_demand_status_discards_owned_and_banned_txs() {
+        use std::collections::HashMap;
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let peer = make_peer_id(45);
+        let history: HashMap<Hash256, TxDemandHistory> = HashMap::new();
+        let now = std::time::Instant::now();
+
+        // Owned: in the tx queue.
+        let mut env = make_envelope(100, 1);
+        set_source(&mut env, 7);
+        let owned_hash = Hash256::hash_xdr(&env);
+        assert!(app.herder.tx_queue().insert_for_test(env));
+        assert!(matches!(
+            app.demand_status(owned_hash, &peer, now, &history),
+            DemandStatus::Discard
+        ));
+
+        // Banned.
+        let mut env_b = make_envelope(200, 1);
+        set_source(&mut env_b, 8);
+        let banned_hash = Hash256::hash_xdr(&env_b);
+        assert!(app.herder.tx_queue().insert_for_test(env_b));
+        app.herder.tx_queue().ban(&[banned_hash]);
+        assert!(matches!(
+            app.demand_status(banned_hash, &peer, now, &history),
+            DemandStatus::Discard
+        ));
+
+        // Unknown: still demanded.
+        let unknown = Hash256::from_bytes([0xCC; 32]);
+        assert!(matches!(
+            app.demand_status(unknown, &peer, now, &history),
+            DemandStatus::Demand
+        ));
     }
 }
