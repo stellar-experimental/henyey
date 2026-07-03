@@ -909,13 +909,15 @@ pub struct DatabaseConfig {
     #[serde(skip)]
     pub in_memory: bool,
 
-    /// Whether to store per-transaction RPC-serving rows in SQLite: the
-    /// `transactions` table (per-tx body/result/meta XDR) and the `events`
-    /// table (contract events). These tables serve only the JSON-RPC
-    /// endpoints (`getTransaction`, `getTransactions`, `getEvents`); ledger
-    /// close, history publish, and catchup never read them (publish reads the
-    /// whole-ledger `tx_history_entry`/`tx_result_entry` blobs, which are
-    /// always written).
+    /// Whether to store RPC-serving data in SQLite: the `transactions` table
+    /// (per-tx body/result/meta XDR), the `events` table (contract events),
+    /// and the `ledger_close_meta` table (full LedgerCloseMeta XDR per
+    /// ledger — the single largest write stream under load). These tables
+    /// serve only the JSON-RPC endpoints (`getTransaction`,
+    /// `getTransactions`, `getEvents`, `getLedgers`); ledger close, history
+    /// publish, and catchup never read them (publish reads the whole-ledger
+    /// `tx_history_entry`/`tx_result_entry` blobs, which are always
+    /// written).
     ///
     /// Default (unset): automatic — disabled on validators that do not serve
     /// JSON-RPC (`node.is_validator = true` and `rpc.enabled = false`),
