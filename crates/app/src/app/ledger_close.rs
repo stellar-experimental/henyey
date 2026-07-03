@@ -2513,10 +2513,21 @@ impl App {
             &result.tx_results,
             tx_metas.as_deref(),
         );
-        let meta_xdr = result
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.to_xdr(stellar_xdr::Limits::none()).ok());
+        // The full LedgerCloseMeta XDR blob serves only the JSON-RPC
+        // getLedgers path (`ledger_close_meta` table). Skip both the
+        // serialization (multi-MB per ledger on the event loop under load)
+        // and the SQLite write when this node stores no RPC data — it is the
+        // single largest write stream at high tx rates (~70% of DB bytes,
+        // 2026-07-03 frontier run), and without an RPC retention window the
+        // table is never pruned.
+        let meta_xdr = if self.config.store_rpc_data() {
+            result
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.to_xdr(stellar_xdr::Limits::none()).ok())
+        } else {
+            None
+        };
 
         // Build (envelope, seq_num) pairs for all txs (applied + failed) so
         // sequence-based removal drops superseded queued txs for the same account.
