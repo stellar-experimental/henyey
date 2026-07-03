@@ -367,6 +367,12 @@ pub trait ScpStatePersistenceQueries {
     /// so its tx-sets may be deleted as orphans). Matches stellar-core
     /// `HerderImpl::purgeOldPersistedTxSets()` (HerderImpl.cpp:2456-2478).
     fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError>;
+
+    /// One bounded purge chunk: delete at most `max_deletes` unreferenced
+    /// tx sets, re-deriving the orphan set from current state (so the #2770
+    /// atomicity guarantee holds per chunk when run inside a transaction).
+    /// Returns the number of orphans still remaining after this chunk.
+    fn purge_unreferenced_tx_sets_chunk(&self, max_deletes: usize) -> Result<usize, DbError>;
 }
 
 impl ScpStatePersistenceQueries for Connection {
@@ -518,12 +524,22 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError> {
-        // Step 1: read all stored tx-set hashes.
+        // Delegates to the chunk worker with no cap: single-transaction
+        // callers (tests, small tables) keep the historical all-at-once
+        // semantics. The live GC path calls purge_unreferenced_tx_sets_chunk
+        // repeatedly with a bounded cap instead — see
+        // `SqliteScpPersistence::purge_unreferenced_tx_sets_atomic`.
+        self.purge_unreferenced_tx_sets_chunk(usize::MAX)
+            .map(|_| ())
+    }
+
+    fn purge_unreferenced_tx_sets_chunk(&self, max_deletes: usize) -> Result<usize, DbError> {
+        // Step 1: read all stored tx-set hashes (hashes only — cheap).
         let all_hashes_vec = self.get_all_tx_set_hashes()?;
         if all_hashes_vec.is_empty() {
             // Nothing to do; avoid a needless write lock when caller wraps
             // this in a transaction.
-            return Ok(());
+            return Ok(0);
         }
         let all_hashes: std::collections::HashSet<Hash> = all_hashes_vec.into_iter().collect();
 
@@ -543,16 +559,23 @@ impl ScpStatePersistenceQueries for Connection {
             }
         }
 
-        // Step 3: delete orphans (stored but not referenced).
-        let unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
+        // Step 3: delete up to `max_deletes` orphans (stored but not
+        // referenced). Steps 1-3 run inside the caller's transaction, so the
+        // #2770 read-then-delete atomicity holds for THIS chunk; the caller
+        // loops with fresh transactions (re-deriving the orphan set each
+        // time) until no orphans remain, bounding each WAL write-lock hold.
+        let mut unreferenced: Vec<Hash> = all_hashes.difference(&referenced).cloned().collect();
+        let remaining_after = unreferenced.len().saturating_sub(max_deletes);
+        unreferenced.truncate(max_deletes);
         if !unreferenced.is_empty() {
             tracing::debug!(
                 count = unreferenced.len(),
-                "Purging unreferenced persisted tx sets (atomic)"
+                remaining_after,
+                "Purging unreferenced persisted tx sets (chunk)"
             );
             self.delete_tx_sets_by_hashes(&unreferenced)?;
         }
-        Ok(())
+        Ok(remaining_after)
     }
 }
 
@@ -863,6 +886,43 @@ mod tests {
 
         assert!(conn.has_tx_set_data(&referenced).unwrap());
         assert!(!conn.has_tx_set_data(&orphan).unwrap());
+    }
+
+    /// #3719: the chunked purge must fully drain a large orphan set across
+    /// multiple bounded chunks while preserving referenced tx sets.
+    #[test]
+    fn test_purge_unreferenced_tx_sets_chunked_drains_many_orphans() {
+        let conn = setup_db();
+
+        let referenced = Hash([0xAA; 32]);
+        conn.save_tx_set_data(&referenced, &[1, 2, 3]).unwrap();
+        let state_json = persisted_state_json_referencing(&referenced);
+        conn.save_scp_slot_state(100, &state_json).unwrap();
+
+        // 20 orphans: more than 2 chunks at the live chunk size (8).
+        for i in 0..20u8 {
+            conn.save_tx_set_data(&Hash([i; 32]), &[i]).unwrap();
+        }
+
+        // Drive the chunk API the way the live wrapper does.
+        let mut rounds = 0;
+        loop {
+            let remaining = conn.purge_unreferenced_tx_sets_chunk(8).unwrap();
+            rounds += 1;
+            if remaining == 0 {
+                break;
+            }
+            assert!(rounds < 10, "chunk loop must converge");
+        }
+        assert!(rounds >= 3, "20 orphans at chunk=8 need at least 3 rounds");
+
+        assert!(conn.has_tx_set_data(&referenced).unwrap());
+        for i in 0..20u8 {
+            assert!(
+                !conn.has_tx_set_data(&Hash([i; 32])).unwrap(),
+                "orphan {i} must be purged"
+            );
+        }
     }
 
     #[test]

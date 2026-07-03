@@ -114,19 +114,36 @@ impl SqliteScpPersistence {
     /// (e.g. `persist_scp_state`) cannot have its freshly-inserted tx-set
     /// deleted as an orphan between steps. See `#2770` for context.
     pub fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), String> {
-        // BEGIN IMMEDIATE so the purge holds a RESERVED write lock for the
-        // entire read-then-delete sequence — blocks concurrent `save_tx_set`
-        // / `save_scp_state` on other pool connections so we cannot delete a
-        // tx-set that a writer is in the middle of registering. See #2770.
-        //
-        // Instrument the hold: this BEGIN IMMEDIATE spans full-table reads of
-        // `storestate`, so a long hold here is a prime `database is locked`
-        // suspect during near-tip back-fill (#3702). Instrumentation only —
-        // no change to the txn scope acquired above.
-        let _write_ctx = henyey_common::WriteCtxGuard::new("scp-persist-purge");
-        self.db
-            .transaction_immediate(|tx| tx.purge_unreferenced_tx_sets_atomic())
-            .map_err(Self::map_error)
+        // Chunked purge (#3719 full-length forensics): the historical
+        // single-transaction purge held the WAL write lock for the whole
+        // read-then-delete pass — 21-34 s observed once hundreds of MB of
+        // orphaned tx sets had accumulated under sustained load, starving
+        // the ledger-close persist and collapsing cadence. Each iteration
+        // below is its own BEGIN IMMEDIATE transaction that RE-DERIVES the
+        // orphan set and deletes a bounded slice, so the #2770 atomicity
+        // guarantee (a concurrent `save_tx_set`/`save_scp_state` cannot
+        // have a freshly-referenced tx-set deleted) holds per chunk while
+        // every lock hold stays short. A brief pause between chunks lets
+        // the persist path interleave.
+        const PURGE_CHUNK_TX_SETS: usize = 8;
+        const PURGE_CHUNK_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+        loop {
+            let remaining = {
+                // Per-chunk WAL write-lock instrumentation (#3702): the
+                // guard wraps a single bounded transaction, so a reported
+                // long hold is a real single-transaction hold.
+                let _write_ctx = henyey_common::WriteCtxGuard::new("scp-persist-purge");
+                self.db
+                    .transaction_immediate(|tx| {
+                        tx.purge_unreferenced_tx_sets_chunk(PURGE_CHUNK_TX_SETS)
+                    })
+                    .map_err(Self::map_error)?
+            };
+            if remaining == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(PURGE_CHUNK_PAUSE);
+        }
     }
 }
 
