@@ -45,9 +45,18 @@ const WAL_AUTOCHECKPOINT_PAGES: u32 = 10_000;
 /// database-level (persistent) and is therefore set once in [`Database::initialize`]
 /// rather than here.
 fn init_connection_pragmas(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    // `synchronous = NORMAL` is parity with stellar-core (`Database.cpp:166`,
+    // `PRAGMA synchronous = NORMAL`). In WAL mode FULL fsyncs the WAL on every
+    // commit — the ledger-close persist writes thousands of tx rows per
+    // ledger, and the resulting multi-MB fsync per close stalled commits for
+    // 4-16 s on saturated NVMe under sustained load (WAL write-lock holder
+    // forensics, maxtps 2026-07-03). NORMAL defers durability to the
+    // out-of-line checkpoint like stellar-core: a power loss can drop the
+    // last commits but cannot corrupt the DB, and startup recovery/catchup
+    // handles the gap.
     conn.execute_batch(&format!(
         "PRAGMA busy_timeout = {};\
-         PRAGMA synchronous = FULL;\
+         PRAGMA synchronous = NORMAL;\
          PRAGMA foreign_keys = ON;\
          PRAGMA cache_size = {};\
          PRAGMA wal_autocheckpoint = {};\
