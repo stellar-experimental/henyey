@@ -1989,6 +1989,7 @@ fn local_config() -> AppConfig {
             path: data_dir.join("stellar.db"),
             pool_size: 10,
             in_memory: false,
+            store_rpc_data: None,
         },
         buckets: BucketConfig {
             directory: data_dir.join("buckets"),

@@ -908,6 +908,22 @@ pub struct DatabaseConfig {
     /// Runtime-only flag, never serialized.
     #[serde(skip)]
     pub in_memory: bool,
+
+    /// Whether to store per-transaction RPC-serving rows in SQLite: the
+    /// `transactions` table (per-tx body/result/meta XDR) and the `events`
+    /// table (contract events). These tables serve only the JSON-RPC
+    /// endpoints (`getTransaction`, `getTransactions`, `getEvents`); ledger
+    /// close, history publish, and catchup never read them (publish reads the
+    /// whole-ledger `tx_history_entry`/`tx_result_entry` blobs, which are
+    /// always written).
+    ///
+    /// Default (unset): automatic — disabled on validators that do not serve
+    /// JSON-RPC (`node.is_validator = true` and `rpc.enabled = false`),
+    /// enabled otherwise. stellar-core dropped per-transaction SQL storage
+    /// entirely in v21, so skipping these writes on a pure validator matches
+    /// core's persistence footprint.
+    #[serde(default)]
+    pub store_rpc_data: Option<bool>,
 }
 
 impl Default for DatabaseConfig {
@@ -916,6 +932,7 @@ impl Default for DatabaseConfig {
             path: default_db_path(),
             pool_size: default_pool_size(),
             in_memory: false,
+            store_rpc_data: None,
         }
     }
 }
@@ -2153,8 +2170,27 @@ impl AppConfig {
         self.node.is_validator && !self.testing.run_standalone
     }
 
+    /// Whether per-transaction RPC-serving rows (`transactions` + `events`
+    /// tables) are written at ledger close. See
+    /// [`DatabaseConfig::store_rpc_data`] for the resolution rule.
+    pub fn store_rpc_data(&self) -> bool {
+        self.database
+            .store_rpc_data
+            .unwrap_or(!self.node.is_validator || self.rpc.enabled)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // The JSON-RPC tx/event endpoints serve from the per-tx tables;
+        // explicitly disabling those writes while serving RPC would silently
+        // return empty results.
+        if self.rpc.enabled && self.database.store_rpc_data == Some(false) {
+            anyhow::bail!(
+                "rpc.enabled = true requires per-transaction storage; remove \
+                 database.store_rpc_data = false (getTransaction/getTransactions/\
+                 getEvents serve from the transactions and events tables)"
+            );
+        }
         // Validators must have a node seed
         if self.node.is_validator && self.node.node_seed.is_none() {
             anyhow::bail!("Validators must have a node_seed configured");
@@ -2714,6 +2750,63 @@ mod tests {
         assert_eq!(config.database.path, PathBuf::from("/tmp/stellar.db"));
         assert_eq!(config.overlay.peer_port, 11626);
         assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_store_rpc_data_default_watcher_enabled() {
+        let config = AppConfig::default();
+        assert!(!config.node.is_validator);
+        assert!(
+            config.store_rpc_data(),
+            "watcher default must store RPC data"
+        );
+    }
+
+    #[test]
+    fn test_store_rpc_data_default_validator_without_rpc_disabled() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.rpc.enabled = false;
+        assert!(
+            !config.store_rpc_data(),
+            "validator without JSON-RPC must skip per-tx RPC rows by default"
+        );
+    }
+
+    #[test]
+    fn test_store_rpc_data_default_validator_with_rpc_enabled() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.rpc.enabled = true;
+        assert!(
+            config.store_rpc_data(),
+            "RPC-serving validator must store RPC data by default"
+        );
+    }
+
+    #[test]
+    fn test_store_rpc_data_explicit_overrides_beat_default() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.rpc.enabled = false;
+        config.database.store_rpc_data = Some(true);
+        assert!(config.store_rpc_data(), "explicit true must win");
+
+        let mut config = AppConfig::default();
+        config.database.store_rpc_data = Some(false);
+        assert!(!config.store_rpc_data(), "explicit false must win");
+    }
+
+    #[test]
+    fn test_validation_rejects_rpc_enabled_with_store_rpc_data_false() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = true;
+        config.database.store_rpc_data = Some(false);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("store_rpc_data"),
+            "validation must reject rpc.enabled with store_rpc_data = false, got: {err}"
+        );
     }
 
     #[test]
