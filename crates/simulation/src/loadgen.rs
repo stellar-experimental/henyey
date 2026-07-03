@@ -2324,7 +2324,25 @@ impl LoadGenerator {
             // consumed, for the fatal-reject diagnostic below.
             let diag_seq = envelope_seq_num(&envelope);
             let diag_account = envelope_source_account_id(&envelope);
+            // [maxtps_tail] account-0 submit timeline: the recurring run-fatal
+            // wedge is always this account; log every submission (hash, seq)
+            // so the failing interleaving (admission vs close vs removal) is
+            // reconstructable from one run.
+            let diag_hash = if source_account_id == 0 {
+                Some(henyey_common::Hash256::hash_xdr(&envelope))
+            } else {
+                None
+            };
             let result = self.tx_generator.app.submit_transaction(envelope).await;
+            if let Some(hash) = diag_hash {
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    tx_seq = ?diag_seq,
+                    result = ?result,
+                    "account0 submit"
+                );
+            }
 
             // PayPregenerated does not re-submit on failure: each tx is read
             // once from the file, so a retry would consume the *next* tx
