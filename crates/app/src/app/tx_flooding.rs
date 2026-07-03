@@ -395,27 +395,57 @@ impl App {
             .herder
             .tx_queue()
             .sample_aged_txs(Duration::from_secs(8), 3);
-        if aged.is_empty() {
-            return;
+        if !aged.is_empty() {
+            let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+            for (hash, age_ms) in aged {
+                let sent_to = peer_ids
+                    .iter()
+                    .filter(|pid| {
+                        adverts_by_peer
+                            .get(*pid)
+                            .is_some_and(|a| a.seen_advert(&hash))
+                    })
+                    .count();
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    age_ms,
+                    sent_to,
+                    peers = peer_ids.len(),
+                    "stranded queued tx"
+                );
+            }
         }
-        let adverts_by_peer = self.tx_adverts_by_peer.read().await;
-        for (hash, age_ms) in aged {
-            let sent_to = peer_ids
-                .iter()
-                .filter(|pid| {
-                    adverts_by_peer
-                        .get(*pid)
-                        .is_some_and(|a| a.seen_advert(&hash))
-                })
-                .count();
-            tracing::info!(
-                target: "maxtps_tail",
-                hash8 = %&hash.to_hex()[..16],
-                age_ms,
-                sent_to,
-                peers = peer_ids.len(),
-                "stranded queued tx"
-            );
+
+        // Demander-side companion: demands we issued that stayed unfulfilled
+        // for 5+ s. `peers_demanded` = how many peers we demanded from and
+        // got no usable response; a hash stranded on its origin but ABSENT
+        // from every other node's unfulfilled list was never demanded at all
+        // (advert admission problem, not response loss).
+        {
+            let now = self.clock.now();
+            let history = self.tx_demand_history.read().await;
+            let mut logged = 0;
+            for (hash, entry) in history.iter() {
+                if entry.latency_recorded {
+                    continue;
+                }
+                let age = now.saturating_duration_since(entry.first_demanded);
+                if age < Duration::from_secs(5) {
+                    continue;
+                }
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    age_ms = age.as_millis() as u64,
+                    peers_demanded = entry.peers.len(),
+                    "unfulfilled demand"
+                );
+                logged += 1;
+                if logged >= 3 {
+                    break;
+                }
+            }
         }
     }
 
