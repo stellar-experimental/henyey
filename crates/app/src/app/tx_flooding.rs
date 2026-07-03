@@ -775,7 +775,7 @@ impl App {
 
         for (peer_id, hashes) in to_send {
             let tx_hashes = match TxDemandVector::try_from(
-                hashes.into_iter().map(Hash::from).collect::<Vec<_>>(),
+                hashes.iter().copied().map(Hash::from).collect::<Vec<_>>(),
             ) {
                 Ok(vec) => vec,
                 Err(_) => {
@@ -786,6 +786,26 @@ impl App {
             let demand = FloodDemand { tx_hashes };
             if let Err(e) = overlay.try_send_to(&peer_id, StellarMessage::FloodDemand(demand)) {
                 tracing::warn!(peer = %peer_id, error = %e, "Failed to send flood demand");
+                // The demand never left this node — undo its bookkeeping so
+                // the next round retries instead of believing these hashes
+                // were demanded (#3719: for a sole-advertiser tx, a phantom
+                // demand record blocked the only pull path). Two parts:
+                // unmark the per-peer demand records, and re-queue the hashes
+                // onto the peer's retry queue (they were destructively popped
+                // during selection, so without this nothing would ever pop
+                // them again).
+                {
+                    let mut history = self.tx_demand_history.write().await;
+                    for hash in &hashes {
+                        if let Some(entry) = history.get_mut(hash) {
+                            entry.peers.remove(&peer_id);
+                        }
+                    }
+                }
+                let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
+                if let Some(adverts) = adverts_by_peer.get_mut(&peer_id) {
+                    adverts.retry_incoming(hashes, max_queue_size);
+                }
             }
         }
     }
@@ -2794,5 +2814,72 @@ mod tests {
             app.demand_status(hash, &peer, late, &history),
             DemandStatus::Demand
         ));
+    }
+
+    /// #3719: a demand whose SEND fails (peer channel full) must not leave a
+    /// phantom per-peer demand record — the bookkeeping is undone and the
+    /// hashes re-queued, so the next round retries instead of believing the
+    /// demand was made (fatal for sole-advertiser txs).
+    #[tokio::test]
+    async fn test_failed_demand_send_is_unmarked_and_requeued() {
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        // Capacity-1 channel, pre-filled so the demand send fails.
+        let peer_id = make_peer_id(47);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 1);
+        overlay
+            .try_send_to(
+                &peer_id,
+                StellarMessage::DontHave(stellar_xdr::DontHave {
+                    type_: stellar_xdr::MessageType::TxSet,
+                    req_hash: stellar_xdr::Uint256([0u8; 32]),
+                }),
+            )
+            .expect("pre-fill message fits");
+
+        // Advertise a hash from that peer so the demand loop selects it.
+        let hash = Hash256::from_bytes([0xEE; 32]);
+        let advert = FloodAdvert {
+            tx_hashes: TxAdvertVector(vec![Hash(*hash.as_bytes())].try_into().unwrap()),
+        };
+        app.handle_flood_advert(&peer_id, advert).await;
+
+        app.run_tx_demands().await;
+
+        // Send failed: no phantom demand record for this peer...
+        {
+            let history = app.tx_demand_history.read().await;
+            let marked = history
+                .get(&hash)
+                .is_some_and(|e| e.peers.contains_key(&peer_id));
+            assert!(!marked, "failed demand send must not mark the peer");
+        }
+        // ...and the hash is back in the peer's queue for the next round.
+        {
+            let adverts = app.tx_adverts_by_peer.read().await;
+            let requeued = adverts
+                .get(&peer_id)
+                .is_some_and(|a| a.retry.contains(&hash) || a.incoming.contains(&hash));
+            assert!(requeued, "failed demand hashes must be re-queued");
+        }
+
+        // Drain the channel; the next round must actually send the demand.
+        let _ = receiver.try_recv();
+        app.run_tx_demands().await;
+        let mut saw_demand = false;
+        while let Some(msg) = receiver.try_recv() {
+            if matches!(msg, StellarMessage::FloodDemand(_)) {
+                saw_demand = true;
+            }
+        }
+        assert!(saw_demand, "retry round must send the demand");
+        let history = app.tx_demand_history.read().await;
+        assert!(
+            history
+                .get(&hash)
+                .is_some_and(|e| e.peers.contains_key(&peer_id)),
+            "successful demand must be marked"
+        );
     }
 }

@@ -2736,6 +2736,39 @@ impl App {
         }
 
         let result = self.herder.receive_transaction(tx.clone());
+
+        // Stale-pending self-heal (#3719). Ledger state (account seq)
+        // advances at apply, but the queue's remove_applied/shift run in a
+        // later spawn_blocking — a submission landing in that window sees a
+        // pending entry whose sequence the ledger just consumed and gets
+        // TryAgainLater. stellar-core cannot observe this state (its queue
+        // cleanup is synchronous with close), and PayPregenerated load runs
+        // treat any reject as fatal (#3638 parity), so the transient window
+        // was run-fatal under sustained load. If the reject was caused by a
+        // pending tx whose seq is already consumed on-ledger, drop the stale
+        // entry and re-admit once.
+        if matches!(result, henyey_herder::TxQueueResult::TryAgainLater) {
+            let network_id =
+                henyey_common::NetworkId::from_passphrase(&self.config.network.passphrase);
+            let frame =
+                henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), network_id);
+            let account_id = frame.inner_source_account_id();
+            if let Some((_, pending_seq, _)) =
+                self.herder.tx_queue().account_pending_info(&account_id)
+            {
+                if let Ok(Some(on_ledger_seq)) = self.load_account_sequence(&account_id) {
+                    if pending_seq <= on_ledger_seq
+                        && self
+                            .herder
+                            .tx_queue()
+                            .drop_stale_pending(&account_id, on_ledger_seq)
+                    {
+                        return self.herder.receive_transaction(tx);
+                    }
+                }
+            }
+        }
+
         // No explicit advert enqueue needed — flush_tx_adverts() reads
         // the herder's queue in priority order each flood period.
         result
