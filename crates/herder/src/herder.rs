@@ -1224,7 +1224,23 @@ impl Herder {
         let Some(manager) = self.scp_persistence.get() else {
             return;
         };
-        if let Err(e) = manager.purge_unreferenced_tx_sets() {
+        // Trim persisted slot STATES below the remember horizon before
+        // purging tx sets. Without this, every slot state since boot stays
+        // persisted, its tx-set references never expire, and the purge can
+        // never delete them — storestate grows without bound and the purge
+        // scan itself becomes a multi-second WAL hold (the full-window
+        // sustained binder, issue #3719). stellar-core bounds this
+        // structurally: slot states live in a MAX_SLOTS_TO_REMEMBER+1 row
+        // ring (`slot % (N+1)`, PersistentState::setSCPStateForSlot), so old
+        // references vanish by overwrite. Trimming to the same horizon keeps
+        // restore-on-restart semantics equivalent to core's ring.
+        let min_slot = u64::from(self.tracking_consensus_ledger_index().as_u32())
+            .saturating_sub(MAX_SLOTS_TO_REMEMBER);
+        if min_slot > 0 {
+            if let Err(e) = manager.cleanup(min_slot) {
+                error!(error = %e, min_slot, "Failed to clean up persisted SCP state");
+            }
+        } else if let Err(e) = manager.purge_unreferenced_tx_sets() {
             error!(error = %e, "Failed to purge unreferenced persisted tx sets");
         }
     }
@@ -9922,6 +9938,53 @@ mod tests {
         assert!(
             !manager.has_tx_set(&orphan_hash).unwrap(),
             "orphan tx set must be purged"
+        );
+    }
+
+    /// #3719 storestate-growth regression: the live GC entry point must trim
+    /// persisted slot STATES below the remember horizon (tracking − 12,
+    /// mirroring core's MAX_SLOTS_TO_REMEMBER ring) so old tx-set references
+    /// expire and their tx sets become purgeable. Pre-fix, slot states
+    /// accumulated forever and storestate grew without bound.
+    #[test]
+    fn test_purge_persisted_tx_sets_trims_old_slot_states() {
+        let herder = make_test_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let old_hash = stellar_xdr::Hash([3u8; 32]);
+        let recent_hash = stellar_xdr::Hash([4u8; 32]);
+
+        let old_env = make_persist_envelope_with_tx_set_hash(100, old_hash.clone());
+        manager
+            .persist_scp_state(100, &[old_env], &[(old_hash.clone(), vec![1])], &[])
+            .expect("persist old slot");
+        let recent_env = make_persist_envelope_with_tx_set_hash(119, recent_hash.clone());
+        manager
+            .persist_scp_state(119, &[recent_env], &[(recent_hash.clone(), vec![2])], &[])
+            .expect("persist recent slot");
+
+        // Tracking at 120 → remember horizon = 108: slot 100 is stale,
+        // slot 119 is live.
+        herder.bootstrap(120);
+        herder.purge_persisted_tx_sets();
+
+        assert!(
+            !manager.has_tx_set(&old_hash).unwrap(),
+            "tx set referenced only by a below-horizon slot state must be purged"
+        );
+        assert!(
+            manager.has_tx_set(&recent_hash).unwrap(),
+            "tx set referenced by a live slot state must be retained"
+        );
+        let restored = manager.restore_scp_state().expect("restore");
+        assert!(
+            restored.envelopes.iter().all(|(slot, _)| *slot >= 108),
+            "restore must not resurrect below-horizon slot states"
+        );
+        assert!(
+            restored.envelopes.iter().any(|(slot, _)| *slot == 119),
+            "live slot state must survive the trim"
         );
     }
 
