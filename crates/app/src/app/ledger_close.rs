@@ -111,6 +111,12 @@ struct LedgerPersistInputs {
     /// Whether checkpoint publishing is enabled (validator with writable archives).
     /// Controls whether checkpoints are enqueued to the publish queue.
     publish_enabled: bool,
+    /// Whether to write the per-tx RPC-serving rows (`transactions` table)
+    /// and contract events (`events` table). False on validators that do not
+    /// serve JSON-RPC (see `AppConfig::store_rpc_data`); the whole-ledger
+    /// `tx_history_entry`/`tx_result_entry` blobs and SCP history are always
+    /// written — history publish reads those.
+    store_rpc_data: bool,
 }
 
 impl LedgerPersistInputs {
@@ -213,58 +219,60 @@ impl LedgerPersistInputs {
                     }
                 }
             }
-            for index in 0..self.tx_count {
-                let tx = &self.ordered_txs[index];
-                let tx_result = &self.tx_results[index];
-                let tx_meta = self.tx_metas.as_ref().and_then(|metas| metas.get(index));
+            if self.store_rpc_data {
+                for index in 0..self.tx_count {
+                    let tx = &self.ordered_txs[index];
+                    let tx_result = &self.tx_results[index];
+                    let tx_meta = self.tx_metas.as_ref().and_then(|metas| metas.get(index));
 
-                let frame = TransactionFrame::with_network(tx.clone(), self.network_id);
-                let tx_hash = frame
-                    .hash(&self.network_id)
+                    let frame = TransactionFrame::with_network(tx.clone(), self.network_id);
+                    let tx_hash = frame
+                        .hash(&self.network_id)
+                        .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
+                    let tx_id = tx_hash.to_hex();
+
+                    let tx_body = tx.to_xdr(stellar_xdr::Limits::none())?;
+                    let tx_result_xdr = tx_result.to_xdr(stellar_xdr::Limits::none())?;
+                    let tx_meta_xdr = match tx_meta {
+                        Some(meta) => Some(meta.to_xdr(stellar_xdr::Limits::none())?),
+                        None => None,
+                    };
+
+                    let status = {
+                        use stellar_xdr::TransactionResultCode;
+                        let code = tx_result.result.result.discriminant();
+                        if code == TransactionResultCode::TxSuccess
+                            || code == TransactionResultCode::TxFeeBumpInnerSuccess
+                        {
+                            henyey_db::TxStatus::Success
+                        } else {
+                            henyey_db::TxStatus::Failed
+                        }
+                    };
+
+                    conn.store_transaction(&henyey_db::StoreTxParams {
+                        ledger_seq: self.header.ledger_seq,
+                        tx_index: index as u32,
+                        tx_id: &tx_id,
+                        body: &tx_body,
+                        result: &tx_result_xdr,
+                        meta: tx_meta_xdr.as_deref(),
+                        status,
+                    })?;
+                }
+
+                if let Some(ref metas) = self.tx_metas {
+                    let events = App::extract_contract_events(
+                        self.header.ledger_seq,
+                        &self.ordered_txs,
+                        &self.tx_results,
+                        metas,
+                        self.network_id,
+                    )
                     .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
-                let tx_id = tx_hash.to_hex();
-
-                let tx_body = tx.to_xdr(stellar_xdr::Limits::none())?;
-                let tx_result_xdr = tx_result.to_xdr(stellar_xdr::Limits::none())?;
-                let tx_meta_xdr = match tx_meta {
-                    Some(meta) => Some(meta.to_xdr(stellar_xdr::Limits::none())?),
-                    None => None,
-                };
-
-                let status = {
-                    use stellar_xdr::TransactionResultCode;
-                    let code = tx_result.result.result.discriminant();
-                    if code == TransactionResultCode::TxSuccess
-                        || code == TransactionResultCode::TxFeeBumpInnerSuccess
-                    {
-                        henyey_db::TxStatus::Success
-                    } else {
-                        henyey_db::TxStatus::Failed
+                    if !events.is_empty() {
+                        conn.store_events(&events)?;
                     }
-                };
-
-                conn.store_transaction(&henyey_db::StoreTxParams {
-                    ledger_seq: self.header.ledger_seq,
-                    tx_index: index as u32,
-                    tx_id: &tx_id,
-                    body: &tx_body,
-                    result: &tx_result_xdr,
-                    meta: tx_meta_xdr.as_deref(),
-                    status,
-                })?;
-            }
-
-            if let Some(ref metas) = self.tx_metas {
-                let events = App::extract_contract_events(
-                    self.header.ledger_seq,
-                    &self.ordered_txs,
-                    &self.tx_results,
-                    metas,
-                    self.network_id,
-                )
-                .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
-                if !events.is_empty() {
-                    conn.store_events(&events)?;
                 }
             }
 
@@ -553,19 +561,28 @@ impl App {
             None
         };
 
+        let store_rpc_data = self.config.store_rpc_data();
         Ok(LedgerPersistInputs {
             header: header.clone(),
             tx_history_entry,
             tx_result_entry,
             ordered_txs,
             tx_results: tx_results.to_vec(),
-            tx_metas: tx_metas.map(|m| m.to_vec()),
+            // The metas are captured only for the per-tx RPC rows and event
+            // extraction; skip the (large) clone entirely when those writes
+            // are disabled.
+            tx_metas: if store_rpc_data {
+                tx_metas.map(|m| m.to_vec())
+            } else {
+                None
+            },
             tx_count,
             network_id,
             scp_history_batches,
             has,
             bucket_list_levels,
             publish_enabled: self.is_validator && self.config.history.publish_enabled(),
+            store_rpc_data,
         })
     }
 
@@ -4303,7 +4320,7 @@ mod scp_history_persistence_ordering_tests {
     /// `serialize_and_write_to_db()` production code path. The SCP history
     /// batches come from `build_scp_history_batches()` — the same function
     /// that `App::build_persist_inputs()` delegates to.
-    fn make_persist_inputs(
+    pub(super) fn make_persist_inputs(
         scp_history_batches: Vec<super::ScpHistoryBatch>,
         ledger_seq: u32,
     ) -> super::LedgerPersistInputs {
@@ -4360,6 +4377,7 @@ mod scp_history_persistence_ordering_tests {
             scp_history_batches,
             has,
             bucket_list_levels: None,
+            store_rpc_data: true,
             publish_enabled: false,
         }
     }
@@ -4650,5 +4668,148 @@ mod scp_history_persistence_ordering_tests {
             .with_connection(|c| c.load_scp_quorum_set(&qset_curr_hash))
             .unwrap();
         assert!(curr_qs.is_some(), "current slot qset must be in DB");
+    }
+}
+
+#[cfg(test)]
+mod store_rpc_data_gate_tests {
+    //! Verify the `store_rpc_data` gate in `serialize_and_write_to_db`:
+    //! when disabled, the per-tx RPC rows (`transactions` table) and contract
+    //! events (`events` table) are skipped while the always-written surface
+    //! (header, whole-ledger txhistory/txresults blobs, LCL) is unaffected.
+
+    use super::scp_history_persistence_ordering_tests::make_persist_inputs;
+    use henyey_db::queries::{EventQueries, HistoryQueries, LedgerQueries};
+    use henyey_db::Database;
+    use henyey_db::StateQueries;
+    use std::sync::Arc;
+    use stellar_xdr::{
+        ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ExtensionPoint, Memo,
+        MuxedAccount, Preconditions, ScVal, SequenceNumber, SorobanTransactionMeta,
+        SorobanTransactionMetaExt, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionMeta, TransactionMetaV3, TransactionResult, TransactionResultExt,
+        TransactionResultPair, TransactionResultResult, TransactionV1Envelope, Uint256,
+    };
+
+    fn test_tx() -> Arc<TransactionEnvelope> {
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([7u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        Arc::new(TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        }))
+    }
+
+    fn test_result() -> TransactionResultPair {
+        TransactionResultPair {
+            transaction_hash: stellar_xdr::Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged: 100,
+                result: TransactionResultResult::TxSuccess(Default::default()),
+                ext: TransactionResultExt::V0,
+            },
+        }
+    }
+
+    fn test_meta_with_event() -> TransactionMeta {
+        let event = ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![ScVal::U32(1)].try_into().unwrap(),
+                data: ScVal::U32(42),
+            }),
+        };
+        TransactionMeta::V3(TransactionMetaV3 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: Default::default(),
+            operations: Default::default(),
+            tx_changes_after: Default::default(),
+            soroban_meta: Some(SorobanTransactionMeta {
+                ext: SorobanTransactionMetaExt::V0,
+                events: vec![event].try_into().unwrap(),
+                return_value: ScVal::Void,
+                diagnostic_events: Default::default(),
+            }),
+        })
+    }
+
+    fn make_inputs_with_tx(ledger_seq: u32, store_rpc_data: bool) -> super::LedgerPersistInputs {
+        let mut inputs = make_persist_inputs(vec![], ledger_seq);
+        inputs.ordered_txs = vec![test_tx()];
+        inputs.tx_results = vec![test_result()];
+        inputs.tx_metas = if store_rpc_data {
+            Some(vec![test_meta_with_event()])
+        } else {
+            None
+        };
+        inputs.tx_count = 1;
+        inputs.store_rpc_data = store_rpc_data;
+        inputs
+    }
+
+    fn count_txs(db: &Database, ledger_seq: u32) -> usize {
+        db.with_connection(|c| {
+            c.load_transactions_in_range(ledger_seq, None, ledger_seq + 1, 100, None, usize::MAX, 0)
+        })
+        .unwrap()
+        .len()
+    }
+
+    fn count_events(db: &Database, ledger_seq: u32) -> usize {
+        db.with_connection(|c| {
+            c.query_events(&henyey_db::EventQueryParams {
+                start_ledger: ledger_seq,
+                end_ledger: Some(ledger_seq + 1),
+                event_type: None,
+                contract_ids: &[],
+                topics: &[],
+                cursor: None,
+                limit: 100,
+                max_total_bytes: usize::MAX,
+                max_query_ops: 0,
+            })
+        })
+        .unwrap()
+        .len()
+    }
+
+    #[test]
+    fn test_store_rpc_data_disabled_skips_per_tx_rows_and_events() {
+        let db = Database::open_in_memory().unwrap();
+        let inputs = make_inputs_with_tx(11, false);
+        inputs.serialize_and_write_to_db(&db).unwrap();
+
+        assert_eq!(count_txs(&db, 11), 0, "transactions table must be empty");
+        assert_eq!(count_events(&db, 11), 0, "events table must be empty");
+
+        // The always-written surface is unaffected: header, whole-ledger
+        // txhistory/txresults blobs, and LCL pointer.
+        let header = db.with_connection(|c| c.load_ledger_header(11)).unwrap();
+        assert!(header.is_some(), "header must be persisted");
+        let hist = db.with_connection(|c| c.load_tx_history_entry(11)).unwrap();
+        assert!(hist.is_some(), "tx_history_entry blob must be persisted");
+        let res = db.with_connection(|c| c.load_tx_result_entry(11)).unwrap();
+        assert!(res.is_some(), "tx_result_entry blob must be persisted");
+        let lcl = db.with_connection(|c| c.get_last_closed_ledger()).unwrap();
+        assert_eq!(lcl, Some(11), "LCL must advance");
+    }
+
+    #[test]
+    fn test_store_rpc_data_enabled_writes_per_tx_rows_and_events() {
+        let db = Database::open_in_memory().unwrap();
+        let inputs = make_inputs_with_tx(12, true);
+        inputs.serialize_and_write_to_db(&db).unwrap();
+
+        assert_eq!(count_txs(&db, 12), 1, "transactions row must be written");
+        assert_eq!(count_events(&db, 12), 1, "event row must be written");
     }
 }
