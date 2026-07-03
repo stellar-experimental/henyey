@@ -3535,11 +3535,25 @@ impl App {
     /// blocking-pool thread. PASSIVE never blocks concurrent readers or
     /// writers, so a close that starts mid-checkpoint proceeds unimpeded.
     ///
+    /// Failure containment (review of #3712): the loop never exits on
+    /// checkpoint or join errors — a validator whose WAL is not being drained
+    /// eventually dies of disk exhaustion, so the checkpointer must outlive
+    /// transient failures. If PASSIVE passes cannot keep the WAL below
+    /// `WAL_TRUNCATE_BACKSTOP_PAGES` (e.g. a long-lived reader pins the WAL),
+    /// it escalates to a blocking `wal_checkpoint(TRUNCATE)` — a stall, but a
+    /// bounded one, preferred over unbounded growth. Behind all of this,
+    /// henyey_db keeps a very high inline `wal_autocheckpoint` floor (~1 GiB)
+    /// so even a fully wedged task degrades to bounded inline checkpoints.
+    ///
     /// Returns the JoinHandle so callers can abort it on shutdown; the task
     /// also exits when the app's shutdown broadcast fires.
     pub fn start_wal_checkpointer(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
         const SLOW_CHECKPOINT_MS: u64 = 1_000;
+        /// Escalate to TRUNCATE when the WAL exceeds this size (~512 MiB at
+        /// 4 KiB pages). Half the henyey_db inline floor, so escalation fires
+        /// well before inline auto-checkpoints ever could.
+        const WAL_TRUNCATE_BACKSTOP_PAGES: i64 = 131_072;
 
         let db = self.db.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -3551,15 +3565,15 @@ impl App {
                     _ = ticker.tick() => {}
                     _ = shutdown_rx.recv() => break,
                 }
-                let db = db.clone();
+                let db_pass = db.clone();
                 let started = std::time::Instant::now();
                 let res = tokio::task::spawn_blocking(move || {
                     let _ctx = henyey_common::WriteCtxGuard::new("wal-checkpoint-passive");
-                    db.wal_checkpoint_passive()
+                    db_pass.wal_checkpoint_passive()
                 })
                 .await;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
-                match res {
+                let wal_pages_after = match res {
                     Ok(Ok((busy, wal_pages, checkpointed))) => {
                         if elapsed_ms >= SLOW_CHECKPOINT_MS || busy != 0 {
                             tracing::info!(
@@ -3577,13 +3591,46 @@ impl App {
                                 "WAL passive checkpoint"
                             );
                         }
+                        // Pages still in the WAL that PASSIVE could not drain.
+                        wal_pages.saturating_sub(checkpointed)
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "WAL passive checkpoint failed");
+                        0
                     }
                     Err(e) => {
+                        // Never exit: an undrained WAL kills the node via
+                        // disk exhaustion long after this transient error.
                         tracing::warn!(error = %e, "WAL checkpointer join error");
-                        break;
+                        0
+                    }
+                };
+
+                if wal_pages_after > WAL_TRUNCATE_BACKSTOP_PAGES {
+                    let db_trunc = db.clone();
+                    let trunc_started = std::time::Instant::now();
+                    let trunc = tokio::task::spawn_blocking(move || {
+                        let _ctx =
+                            henyey_common::WriteCtxGuard::new("wal-checkpoint-truncate-backstop");
+                        db_trunc.wal_checkpoint_truncate()
+                    })
+                    .await;
+                    match trunc {
+                        Ok(Ok((busy, wal_pages, checkpointed))) => {
+                            tracing::error!(
+                                elapsed_ms = trunc_started.elapsed().as_millis() as u64,
+                                busy,
+                                wal_pages,
+                                checkpointed,
+                                "WAL exceeded backstop threshold; forced TRUNCATE checkpoint                                  (investigate what pinned the WAL)"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "WAL TRUNCATE backstop failed");
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "WAL TRUNCATE backstop join error");
+                        }
                     }
                 }
             }

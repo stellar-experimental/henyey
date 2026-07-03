@@ -24,19 +24,30 @@ const CACHE_SIZE_KIB: i32 = -64_000;
 
 /// WAL auto-checkpoint threshold in pages.
 ///
-/// 0 = inline auto-checkpoints DISABLED; checkpointing is done exclusively by
-/// the app's background checkpointer via [`Database::wal_checkpoint_passive`].
+/// **Documented divergence from stellar-core** (per docs/PARITY.md this layer
+/// is divergeable): core keeps SQLite's inline auto-checkpoint at 10000 pages
+/// (`Database.cpp:169`) and has no background checkpointer. henyey instead
+/// checkpoints from a background app task ([`Database::wal_checkpoint_passive`]
+/// every ~2 s) and sets the inline threshold very high (~1 GiB) so it acts
+/// purely as a disaster floor.
 ///
-/// History: stellar-core sets `wal_autocheckpoint = 10000`
-/// (`Database.cpp:169`) and henyey matched it in #3640. But henyey's
-/// ledger-close persist writes 10-30 MB of WAL per ledger (per-tx rows with
-/// meta XDR; core writes ~0.1 MB), so the 10000-page threshold fired every
+/// Why not core's 10000: henyey's ledger-close persist writes 10-30 MB of WAL
+/// per ledger (per-tx rows with meta XDR; core writes ~0.1 MB since it dropped
+/// per-tx SQL storage in v21), so a 10000-page (~40 MB) threshold fired every
 /// couple of closes INSIDE the persist commit — the committing writer copied
 /// and fsynced tens of MB while holding the WAL write lock, stalling closes
-/// 4-16 s under sustained load (maxtps forensics 2026-07-03). Moving the
-/// checkpoint to a background task keeps the close path free; PASSIVE
-/// checkpoints do not block concurrent writers.
-const WAL_AUTOCHECKPOINT_PAGES: u32 = 0;
+/// 4-16 s under sustained load (maxtps forensics 2026-07-03). Under max load
+/// the WAL legitimately exceeds 40 MB even with the background task draining,
+/// so restoring 10000 would re-trigger inline stalls.
+///
+/// Why not 0: with inline checkpoints fully disabled, a dead or starved
+/// background checkpointer would let the WAL grow without bound → disk
+/// exhaustion → validator death (review of #3712; cf. the ENOSPC fatality
+/// history in #3478). At this floor, if the background task dies the node
+/// degrades to occasional large inline checkpoints (a stall, but bounded
+/// disk) instead of unbounded growth. The floor is never expected to fire
+/// while the background checkpointer (plus its TRUNCATE backstop) is healthy.
+const WAL_AUTOCHECKPOINT_PAGES: u32 = 262_144; // ~1 GiB at 4 KiB pages
 
 /// Applies the per-connection SQLite PRAGMAs shared by the file-backed and
 /// in-memory open paths.
@@ -46,15 +57,17 @@ const WAL_AUTOCHECKPOINT_PAGES: u32 = 0;
 /// database-level (persistent) and is therefore set once in [`Database::initialize`]
 /// rather than here.
 fn init_connection_pragmas(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
-    // `synchronous = NORMAL` is parity with stellar-core (`Database.cpp:166`,
-    // `PRAGMA synchronous = NORMAL`). In WAL mode FULL fsyncs the WAL on every
-    // commit — the ledger-close persist writes thousands of tx rows per
-    // ledger, and the resulting multi-MB fsync per close stalled commits for
-    // 4-16 s on saturated NVMe under sustained load (WAL write-lock holder
-    // forensics, maxtps 2026-07-03). NORMAL defers durability to the
-    // out-of-line checkpoint like stellar-core: a power loss can drop the
-    // last commits but cannot corrupt the DB, and startup recovery/catchup
-    // handles the gap.
+    // `synchronous = NORMAL` is a **documented divergence** from stellar-core,
+    // not parity: core leaves SQLite at its default FULL for validators —
+    // `Database.cpp:164-166` comments the NORMAL pragma out ("FULL is needed
+    // as to ensure durability / NORMAL is enough for non validating nodes").
+    // In WAL mode FULL fsyncs the WAL on every commit; henyey's ledger-close
+    // persist writes thousands of tx rows per ledger (core writes ~0.1 MB),
+    // and the resulting multi-MB fsync per close stalled commits for 4-16 s
+    // on saturated NVMe under sustained load (WAL write-lock holder
+    // forensics, maxtps 2026-07-03). NORMAL is determinism-safe: a power
+    // loss can drop the newest commits but cannot corrupt or fork the DB —
+    // restart recovers via catchup with no hash divergence vs peers.
     conn.execute_batch(&format!(
         "PRAGMA busy_timeout = {};\
          PRAGMA synchronous = NORMAL;\

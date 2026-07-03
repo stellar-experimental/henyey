@@ -76,9 +76,11 @@ impl Database {
     ///
     /// PASSIVE transfers as much WAL content into the main database file as
     /// possible without blocking concurrent readers or writers, then returns.
-    /// Inline auto-checkpoints are disabled (`wal_autocheckpoint = 0`), so the
-    /// app's background checkpointer calls this off the ledger-close critical
-    /// path — the close-persist commit never pays checkpoint I/O itself.
+    /// The inline auto-checkpoint threshold is set far above the normal
+    /// operating point (see `WAL_AUTOCHECKPOINT_PAGES`), so in a healthy node
+    /// the app's background checkpointer calling this is what drains the WAL
+    /// — off the ledger-close critical path, so the close-persist commit
+    /// never pays checkpoint I/O itself.
     ///
     /// Returns `(busy, wal_pages, checkpointed_pages)` from
     /// `PRAGMA wal_checkpoint(PASSIVE)`: `busy` is 1 if the checkpoint could
@@ -87,6 +89,23 @@ impl Database {
     pub fn wal_checkpoint_passive(&self) -> Result<(i64, i64, i64), DbError> {
         let conn = self.connection()?;
         conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(DbError::from)
+    }
+
+    /// Runs a TRUNCATE WAL checkpoint: blocks until all WAL content is
+    /// transferred into the main database file and the WAL is truncated to
+    /// zero length.
+    ///
+    /// Unlike PASSIVE this waits out concurrent readers and blocks writers,
+    /// so it is a **survival backstop only** — the background checkpointer
+    /// escalates to it when PASSIVE passes cannot keep the WAL below its
+    /// growth threshold (e.g. a long-lived reader pinning the WAL). Returns
+    /// the same `(busy, wal_pages, checkpointed_pages)` triple.
+    pub fn wal_checkpoint_truncate(&self) -> Result<(i64, i64, i64), DbError> {
+        let conn = self.connection()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .map_err(DbError::from)
@@ -166,5 +185,39 @@ impl Database {
     {
         let conn = self.connection()?;
         f(&conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    /// Both checkpoint flavors must succeed on a file-backed WAL database and
+    /// report a fully drained WAL afterwards. Regression cover for the #3712
+    /// background-checkpointer + TRUNCATE-backstop plumbing.
+    #[test]
+    fn test_wal_checkpoint_passive_and_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("wal_ckpt.db")).unwrap();
+
+        db.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO storestate (statename, state) VALUES ('k', 'v')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let (busy, wal_pages, checkpointed) = db.wal_checkpoint_passive().unwrap();
+        assert_eq!(busy, 0, "no concurrent readers — PASSIVE must complete");
+        assert_eq!(
+            wal_pages, checkpointed,
+            "PASSIVE with no readers must drain the whole WAL"
+        );
+
+        let (busy, wal_pages, _) = db.wal_checkpoint_truncate().unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(wal_pages, 0, "TRUNCATE must leave a zero-length WAL");
     }
 }
