@@ -330,6 +330,62 @@ fn build_maintenance_interval(period: Duration) -> tokio::time::Interval {
 ///   both checkpoint publishing (`txsets`, `txresults`, headers) and RPC queries
 ///   (`txhistory`, headers), so we keep data needed by both consumers.
 /// - **RPC-only** (events, close meta): pruned at `rpc_lmin` only when RPC is configured.
+/// Maximum distinct ledgers deleted per SQL statement during maintenance.
+///
+/// Each `delete_old_*` call bounded by this runs as its own short implicit
+/// transaction, so SQLite's single WAL write lock is released between chunks
+/// and the ledger-close persist path can interleave. Without this bound, the
+/// first maintenance pass after a checkpoint publish completes (which unlocks
+/// ~64 ledgers of txsets/txresults blobs for deletion on every node within
+/// the same tick) held the write lock for 21-28 s under MaxTPS load, stalling
+/// ledger closes globally (2026-07-03 frontier run, `maintenance-delete`
+/// write-ctx forensics).
+const MAINTENANCE_CHUNK_LEDGERS: u32 = 2;
+
+/// Pause between maintenance delete chunks. Gives the ledger-close persist
+/// transaction (and other writers) a window to acquire the WAL write lock
+/// between chunks.
+const MAINTENANCE_CHUNK_PAUSE: Duration = Duration::from_millis(25);
+
+/// Run one table's maintenance deletion in bounded chunks.
+///
+/// Calls `delete_chunk` with at most [`MAINTENANCE_CHUNK_LEDGERS`] ledgers per
+/// call until it reports no more rows deleted or `total_budget` ledgers have
+/// been requested, pausing [`MAINTENANCE_CHUNK_PAUSE`] between chunks. Errors
+/// are logged and stop the loop (matching the previous per-table
+/// warn-and-continue behavior). Returns total rows deleted.
+fn delete_in_chunks(
+    total_budget: u32,
+    label: &str,
+    mut delete_chunk: impl FnMut(u32) -> Result<u32, henyey_db::DbError>,
+) -> u64 {
+    let mut remaining = total_budget;
+    let mut total_rows = 0u64;
+    while remaining > 0 {
+        let chunk = remaining.min(MAINTENANCE_CHUNK_LEDGERS);
+        // Per-chunk WAL write-lock instrumentation (#3702): the guard must
+        // wrap a single bounded statement, not the whole pass, so a reported
+        // long hold is a real single-transaction hold.
+        let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
+        match delete_chunk(chunk) {
+            Ok(0) => break,
+            Ok(rows) => {
+                total_rows += rows as u64;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to delete old {} entries", label);
+                break;
+            }
+        }
+        drop(_write_ctx);
+        remaining = remaining.saturating_sub(chunk);
+        if remaining > 0 {
+            std::thread::sleep(MAINTENANCE_CHUNK_PAUSE);
+        }
+    }
+    total_rows
+}
+
 pub fn run_maintenance(
     db: &henyey_db::Database,
     lcl: u32,
@@ -337,11 +393,6 @@ pub fn run_maintenance(
     rpc_retention_window: Option<u32>,
     count: u32,
 ) {
-    // Instrument the WAL write-lock hold for the maintenance delete burst so a
-    // long hold is self-naming in the logs (#3702). Instrumentation only — the
-    // delete sequence and its transaction boundaries below are unchanged.
-    let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
-
     // Evict stale publish queue entries when publishing is enabled.
     // Fail closed: on any DB error, keep the original min_queued to avoid
     // over-pruning.
@@ -410,32 +461,36 @@ pub fn run_maintenance(
         "Running maintenance"
     );
 
+    // All deletions run in bounded chunks (MAINTENANCE_CHUNK_LEDGERS per
+    // statement) so no single transaction holds the WAL write lock for long;
+    // see delete_in_chunks.
+
     // --- Publish-only tables ---
-    if let Err(e) = db.delete_old_scp_entries(publish_safe_lmin, count) {
-        warn!(error = %e, "Failed to delete old SCP entries");
-    }
+    delete_in_chunks(count, "SCP", |chunk| {
+        db.delete_old_scp_entries(publish_safe_lmin, chunk)
+    });
 
     // --- Publish + RPC tables ---
     // These tables serve both checkpoint publishing (txsets, txresults, headers)
     // and RPC queries (txhistory, headers). Always pruned at the more conservative
     // of publish_safe_lmin and rpc_lmin so neither consumer loses required data.
-    if let Err(e) = db.delete_old_ledger_headers(publish_and_rpc_lmin, count) {
-        warn!(error = %e, "Failed to delete old ledger headers");
-    }
+    delete_in_chunks(count, "ledger header", |chunk| {
+        db.delete_old_ledger_headers(publish_and_rpc_lmin, chunk)
+    });
 
-    if let Err(e) = db.delete_old_tx_history(publish_and_rpc_lmin, count) {
-        warn!(error = %e, "Failed to delete old tx history");
-    }
+    delete_in_chunks(count, "tx history", |chunk| {
+        db.delete_old_tx_history(publish_and_rpc_lmin, chunk)
+    });
 
     // --- RPC-only tables (only when RPC retention is configured) ---
     if let Some(rpc_lmin) = rpc_lmin {
-        if let Err(e) = db.delete_old_events(rpc_lmin, count) {
-            warn!(error = %e, "Failed to delete old events");
-        }
+        delete_in_chunks(count, "event", |chunk| {
+            db.delete_old_events(rpc_lmin, chunk)
+        });
 
-        if let Err(e) = db.delete_old_ledger_close_meta(rpc_lmin, count) {
-            warn!(error = %e, "Failed to delete old ledger close meta");
-        }
+        delete_in_chunks(count, "ledger close meta", |chunk| {
+            db.delete_old_ledger_close_meta(rpc_lmin, chunk)
+        });
     }
 }
 
@@ -1368,5 +1423,54 @@ mod tests {
             min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
             Some(8017)
         );
+    }
+
+    #[test]
+    fn test_delete_in_chunks_bounds_each_call_and_exhausts() {
+        // Simulate a table holding 7 ledgers' worth of rows (3 rows/ledger).
+        let mut ledgers_left = 7u32;
+        let mut calls: Vec<u32> = Vec::new();
+        let total = delete_in_chunks(100, "test", |chunk| {
+            calls.push(chunk);
+            let deleted = chunk.min(ledgers_left);
+            ledgers_left -= deleted;
+            Ok(deleted * 3)
+        });
+
+        assert!(
+            calls.iter().all(|&c| c <= MAINTENANCE_CHUNK_LEDGERS),
+            "every chunk must be bounded by MAINTENANCE_CHUNK_LEDGERS, got {calls:?}"
+        );
+        assert_eq!(total, 21, "all 7 ledgers x 3 rows must be deleted");
+        assert_eq!(ledgers_left, 0, "table must be fully drained");
+        // 4 productive chunks (2+2+2+1 ledgers) + 1 terminating zero-row call.
+        assert_eq!(calls.len(), 5);
+    }
+
+    #[test]
+    fn test_delete_in_chunks_respects_total_budget() {
+        let mut ledgers_left = 100u32;
+        let total = delete_in_chunks(6, "test", |chunk| {
+            let deleted = chunk.min(ledgers_left);
+            ledgers_left -= deleted;
+            Ok(deleted)
+        });
+        assert_eq!(total, 6, "budget of 6 ledgers must cap the pass");
+        assert_eq!(ledgers_left, 94);
+    }
+
+    #[test]
+    fn test_delete_in_chunks_stops_on_error() {
+        let mut calls = 0u32;
+        let total = delete_in_chunks(100, "test", |chunk| {
+            calls += 1;
+            if calls == 2 {
+                Err(henyey_db::DbError::Integrity("boom".into()))
+            } else {
+                Ok(chunk)
+            }
+        });
+        assert_eq!(calls, 2, "loop must stop at the failing chunk");
+        assert_eq!(total, 2, "only the first chunk's rows are counted");
     }
 }
