@@ -396,8 +396,15 @@ impl App {
             .tx_queue()
             .sample_aged_txs(Duration::from_secs(8), 3);
         if !aged.is_empty() {
+            const TAIL_WATCH_CAP: usize = 32;
             let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+            let mut watch = self.tail_watch.write().await;
             for (hash, age_ms) in aged {
+                // Arm wire tracing for this stranded hash (#3719 part 1):
+                // the demand/response paths below log every event touching it.
+                if watch.len() < TAIL_WATCH_CAP {
+                    watch.insert(hash);
+                }
                 let sent_to = peer_ids
                     .iter()
                     .filter(|pid| {
@@ -557,6 +564,18 @@ impl App {
             // Parity: stellar-core mTxPullLatency (OverlayMetrics.h:115).
             metrics::histogram!("stellar_overlay_tx_pull_latency_seconds")
                 .record(delta.as_secs_f64());
+            // [maxtps_tail] #3719 part-1: a pull that took 3+ s means the tx
+            // eventually arrived after stranding — log so the demander side of
+            // a strand's timeline is reconstructable at info level.
+            if delta.as_secs() >= 3 {
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    latency_ms = delta.as_millis() as u64,
+                    peers = entry.peers.len(),
+                    "slow tx pull completed"
+                );
+            }
             tracing::debug!(
                 hash = %hash.to_hex(),
                 latency_ms = delta.as_millis(),
@@ -868,6 +887,14 @@ impl App {
         // Match stellar-core: only send Transaction messages for found hashes.
         // Do NOT send DontHave for unfulfilled demands — stellar-core just
         // logs/meters misses without any outbound response.
+        let watch = {
+            let w = self.tail_watch.read().await;
+            if w.is_empty() {
+                None
+            } else {
+                Some(w.clone())
+            }
+        };
         let mut sent = 0u32;
         let mut deferred = 0u32;
         let mut banned = 0u32;
@@ -876,28 +903,71 @@ impl App {
         let mut to_defer: Vec<Hash256> = Vec::new();
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
+            let watched = watch.as_ref().is_some_and(|w| w.contains(&hash256));
             if channel_full {
                 if self.herder.tx_queue().get(&hash256).is_some() {
                     to_defer.push(hash256);
                     deferred += 1;
+                    if watched {
+                        tracing::info!(
+                            target: "maxtps_tail",
+                            hash8 = %&hash256.to_hex()[..16],
+                            peer = %peer_id,
+                            "watched demand DEFERRED (channel full)"
+                        );
+                    }
                 }
                 continue;
             }
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
                 match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.into_envelope()))
                 {
-                    Ok(()) => sent += 1,
+                    Ok(()) => {
+                        sent += 1;
+                        if watched {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                hash8 = %&hash256.to_hex()[..16],
+                                peer = %peer_id,
+                                "watched demand SERVED"
+                            );
+                        }
+                    }
                     Err(_) => {
                         // Channel full — defer this and the rest of the batch.
                         channel_full = true;
                         to_defer.push(hash256);
                         deferred += 1;
+                        if watched {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                hash8 = %&hash256.to_hex()[..16],
+                                peer = %peer_id,
+                                "watched demand DEFERRED (channel full)"
+                            );
+                        }
                     }
                 }
             } else if self.herder.tx_queue().is_banned(&hash256) {
                 banned += 1;
+                if watched {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        hash8 = %&hash256.to_hex()[..16],
+                        peer = %peer_id,
+                        "watched demand BANNED-here"
+                    );
+                }
             } else {
                 unknown += 1;
+                if watched {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        hash8 = %&hash256.to_hex()[..16],
+                        peer = %peer_id,
+                        "watched demand UNKNOWN-here"
+                    );
+                }
             }
         }
         if !to_defer.is_empty() {
@@ -954,6 +1024,14 @@ impl App {
             .collect();
         deferred_map.retain(|peer, _| connected.contains(peer));
 
+        let watch = {
+            let w = self.tail_watch.read().await;
+            if w.is_empty() {
+                None
+            } else {
+                Some(w.clone())
+            }
+        };
         let mut sent_total = 0u32;
         for (peer_id, queue) in deferred_map.iter_mut() {
             while let Some(hash) = queue.front().copied() {
@@ -966,6 +1044,14 @@ impl App {
                     Ok(()) => {
                         queue.pop_front();
                         sent_total += 1;
+                        if watch.as_ref().is_some_and(|w| w.contains(&hash)) {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                hash8 = %&hash.to_hex()[..16],
+                                peer = %peer_id,
+                                "watched deferred response FLUSHED"
+                            );
+                        }
                     }
                     Err(_) => break, // still full — try next tick
                 }

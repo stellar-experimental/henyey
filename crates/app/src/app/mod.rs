@@ -794,6 +794,11 @@ pub struct App {
     /// was full. Drained each flood tick; stellar-core parity: core queues
     /// demand responses in its per-peer write queue and never drops them.
     tx_deferred_demand_responses: RwLock<HashMap<henyey_overlay::PeerId, VecDeque<Hash256>>>,
+    /// Watched stranded-tx hashes (#3719 part-1 wire tracing): populated by
+    /// the tail scanner for txs aged 8+ s in the local queue; the flood
+    /// demand/response paths log every event touching a watched hash.
+    /// Diagnostic only; bounded (see TAIL_WATCH_CAP).
+    tail_watch: RwLock<HashSet<Hash256>>,
     /// Demand history for transaction pulls.
     tx_demand_history: RwLock<HashMap<Hash256, TxDemandHistory>>,
     /// Pending demand hashes in FIFO order for retention.
@@ -1570,6 +1575,7 @@ impl App {
             broadcast_dex_op_carryover: AtomicUsize::new(0),
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
             tx_deferred_demand_responses: RwLock::new(HashMap::new()),
+            tail_watch: RwLock::new(HashSet::new()),
             tx_demand_history: RwLock::new(HashMap::new()),
             tx_pending_demands: RwLock::new(VecDeque::new()),
             tx_set_dont_have: RwLock::new(HashMap::new()),
