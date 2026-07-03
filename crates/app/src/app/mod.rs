@@ -790,6 +790,10 @@ pub struct App {
 
     /// Per-peer advert tracking and queues for demand scheduling.
     tx_adverts_by_peer: RwLock<HashMap<henyey_overlay::PeerId, PeerTxAdverts>>,
+    /// Per-peer demand responses deferred because the peer's outbound channel
+    /// was full. Drained each flood tick; stellar-core parity: core queues
+    /// demand responses in its per-peer write queue and never drops them.
+    tx_deferred_demand_responses: RwLock<HashMap<henyey_overlay::PeerId, VecDeque<Hash256>>>,
     /// Demand history for transaction pulls.
     tx_demand_history: RwLock<HashMap<Hash256, TxDemandHistory>>,
     /// Pending demand hashes in FIFO order for retention.
@@ -1565,6 +1569,7 @@ impl App {
             broadcast_op_carryover: AtomicUsize::new(0),
             broadcast_dex_op_carryover: AtomicUsize::new(0),
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
+            tx_deferred_demand_responses: RwLock::new(HashMap::new()),
             tx_demand_history: RwLock::new(HashMap::new()),
             tx_pending_demands: RwLock::new(VecDeque::new()),
             tx_set_dont_have: RwLock::new(HashMap::new()),
