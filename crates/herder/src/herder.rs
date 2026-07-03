@@ -2833,6 +2833,10 @@ impl Herder {
             return TxQueueResult::TryAgainLater;
         }
 
+        // Cheap identifier for the sampled rejection diagnostic below,
+        // captured before `tx` moves into try_add.
+        let diag_seq = henyey_tx::envelope_sequence_number(&tx);
+
         // Add to transaction queue
         let result = self.tx_queue.try_add(tx);
 
@@ -2860,6 +2864,27 @@ impl Herder {
             }
             TxQueueResult::TryAgainLater => {
                 debug!("Transaction rejected: account already has pending transaction");
+            }
+        }
+
+        // [maxtps_tail] #3719 part-1 attribution: a flooded/pulled tx that is
+        // rejected here dies silently — the demander has already recorded the
+        // pull as fulfilled, so nothing retries and a sole-advertiser tx
+        // strands. Sample the rare terminal outcomes (Duplicate and Added are
+        // the normal flood cases and stay quiet).
+        if matches!(
+            result,
+            TxQueueResult::Banned | TxQueueResult::Invalid(_) | TxQueueResult::TryAgainLater
+        ) {
+            use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            if LOGGED.fetch_add(1, AtomicOrdering::Relaxed) % 16 == 0 {
+                tracing::info!(
+                    target: "maxtps_tail",
+                    tx_seq = diag_seq,
+                    result = ?result,
+                    "tx admission rejected (sampled 1/16)"
+                );
             }
         }
 
