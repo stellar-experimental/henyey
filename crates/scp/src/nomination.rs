@@ -1092,6 +1092,27 @@ impl NominationProtocol {
             let old_size = self.round_leaders.len();
             self.round_leaders.extend(new_leaders);
             if self.round_leaders.len() != old_size {
+                // [maxtps_nom] Leader-set forensics: if leader sets diverge
+                // across nodes for the same (slot, round, prev), nomination
+                // round 1 stalls network-wide (nodes wait on a leader that
+                // doesn't know it is one). prev8 = first 8 bytes of the
+                // previous value (the prior slot's tx-set-hash prefix).
+                let leaders: Vec<String> = self
+                    .round_leaders
+                    .iter()
+                    .map(|n| {
+                        let stellar_xdr::PublicKey::PublicKeyTypeEd25519(k) = &n.0;
+                        hex::encode(&k.0[..4])
+                    })
+                    .collect();
+                tracing::info!(
+                    target: "maxtps_nom",
+                    slot = ctx.slot_index,
+                    round = self.round,
+                    prev8 = hex::encode(&prev_value.0[..8.min(prev_value.0.len())]),
+                    leaders = leaders.join(","),
+                    "round leaders"
+                );
                 return;
             }
 

@@ -531,6 +531,10 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // Start the background database maintainer
     let maintainer_handle = app.start_maintainer();
 
+    // Start the background WAL checkpointer (inline auto-checkpoints are
+    // disabled; see henyey_db WAL_AUTOCHECKPOINT_PAGES).
+    app.start_wal_checkpointer();
+
     // Start the main run loop in the background so we can optionally wait for sync.
     tracing::info!("Starting main run loop");
     let fallback_catchup = if options.mode == RunMode::Watcher {

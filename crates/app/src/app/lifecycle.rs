@@ -2868,6 +2868,30 @@ impl App {
             None
         };
 
+        // Tx-set hashes referenced by NOMINATE values. During nomination only
+        // the value's builder is guaranteed to already hold the set, so the
+        // round-robin fetcher in `request_pending_tx_sets` can burn its first
+        // asks on peers that don't have it yet and time out the whole
+        // nomination round. stellar-core's Tracker always asks peers that sent
+        // envelopes referencing the item first (Tracker::tryNextPeer via
+        // getPeersKnows); mirror that by asking the envelope sender directly
+        // when the herder reports Fetching (see the EnvelopeState::Fetching arm).
+        let nominate_tx_set_hashes: Vec<Hash256> = match &envelope.statement.pledges {
+            stellar_xdr::ScpStatementPledges::Nominate(nom) => {
+                let mut hashes: Vec<Hash256> = nom
+                    .votes
+                    .iter()
+                    .chain(nom.accepted.iter())
+                    .filter_map(|v| StellarValue::from_xdr(&v.0, stellar_xdr::Limits::none()).ok())
+                    .map(|sv| Hash256::from_bytes(sv.tx_set_hash.0))
+                    .collect();
+                hashes.sort_unstable();
+                hashes.dedup();
+                hashes
+            }
+            _ => Vec::new(),
+        };
+
         let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
         let hash256 = henyey_common::Hash256::from_bytes(hash.0);
         let sender_node_id = envelope.statement.node_id.clone();
@@ -3099,6 +3123,60 @@ impl App {
                                     error = %e,
                                     "Failed to request tx set for fetching envelope"
                                 );
+                            }
+                        }
+                    }
+                }
+                // Ask the nominate sender directly for any tx set we still
+                // need (advertiser-first fetch, core Tracker parity). Throttled
+                // through `tx_set_last_request` so the ~22 flood echoes of the
+                // same value don't multiply into parallel full-set downloads.
+                if !nominate_tx_set_hashes.is_empty() {
+                    if let Some(peer) = from_peer_opt.as_ref() {
+                        if let Some(overlay) = self.overlay().await {
+                            let now = self.clock.now();
+                            for h in &nominate_tx_set_hashes {
+                                if !self.herder.needs_tx_set(h) {
+                                    continue;
+                                }
+                                let should_send = {
+                                    let mut last_request = self.tx_set_last_request.write().await;
+                                    match last_request.get_mut(h) {
+                                        Some(st)
+                                            if now.duration_since(st.last_request)
+                                                < std::time::Duration::from_millis(500) =>
+                                        {
+                                            false
+                                        }
+                                        Some(st) => {
+                                            st.last_request = now;
+                                            true
+                                        }
+                                        None => {
+                                            last_request.insert(
+                                                *h,
+                                                super::types::TxSetRequestState {
+                                                    last_request: now,
+                                                    first_requested: now,
+                                                    next_peer_offset: 0,
+                                                },
+                                            );
+                                            true
+                                        }
+                                    }
+                                };
+                                if should_send {
+                                    let request =
+                                        StellarMessage::GetTxSet(stellar_xdr::Uint256(h.0));
+                                    if overlay.try_send_to(peer, request).is_ok() {
+                                        tracing::debug!(
+                                            target: "maxtps_fetch",
+                                            hash = %h,
+                                            peer = %peer,
+                                            "direct GetTxSet to nominate sender"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

@@ -1779,6 +1779,24 @@ impl LoadGenerator {
                 self.contract_instances.insert(account_id, instance);
             }
         }
+
+        // Re-anchor the pacing clock AFTER setup (sustained-load root fix).
+        // Opening the pregenerated tx file (~55 MB at 5-minute probe sizes)
+        // and preloading thousands of account sequences above can take many
+        // seconds. `start_time` was stamped at the TOP of this function, so
+        // `get_tx_per_step` saw a huge initial deficit and fired an onset
+        // burst of setup_delay × tx_rate transactions. The pregenerated file
+        // is strict round-robin over n_accounts (same-account gap =
+        // n_accounts txs ≈ 18-20 s at max-TPS rates); a burst larger than
+        // that gap submits an account's next tx while its previous one is
+        // still pending (age 0) → TryAgainLater → a PayPregenerated run
+        // insta-fails (#3638). This single artifact produced henyey's entire
+        // measured burst-vs-sustained gap (5-min probes died at ≥ ~1280 tx/s
+        // network-wide = the rate where the burst first spans the account
+        // gap, while stellar-core — whose setup happens before its clock
+        // matters — sustained 1522). The rate contract applies to the
+        // SUBMISSION period, not to setup.
+        self.start_time = Some(Instant::now());
     }
 
     /// Run load generation: submit transactions at the configured rate.
@@ -2305,6 +2323,7 @@ impl LoadGenerator {
             // [maxtps_ban] capture identifying details before the envelope is
             // consumed, for the fatal-reject diagnostic below.
             let diag_seq = envelope_seq_num(&envelope);
+            let diag_account = envelope_source_account_id(&envelope);
             let result = self.tx_generator.app.submit_transaction(envelope).await;
 
             // PayPregenerated does not re-submit on failure: each tx is read
@@ -2320,11 +2339,29 @@ impl LoadGenerator {
                     // sustained-load investigation runs died mid-submission
                     // with no visible cause — log the queue verdict that killed
                     // the run.
+                    // Forensic discriminator (sustained-load investigation):
+                    //  - queue pending seq == on-ledger seq  → bookkeeping
+                    //    LEAK (tx applied but account state never cleared);
+                    //  - pending age ≥3                      → genuinely
+                    //    wedged tx (dissemination hole);
+                    //  - no pending but still TryAgainLater  → cross-type /
+                    //    fee-source path.
+                    let on_ledger_seq = self
+                        .tx_generator
+                        .app
+                        .load_account_sequence(&diag_account)
+                        .ok()
+                        .flatten();
+                    let pending = self.tx_generator.app.debug_account_pending(&diag_account);
                     tracing::warn!(
                         target: "maxtps_ban",
                         result = ?result,
                         source_account_id,
                         tx_seq = diag_seq,
+                        ?on_ledger_seq,
+                        pending_hash = ?pending.as_ref().map(|(h, _, _)| *h),
+                        pending_seq = ?pending.as_ref().map(|(_, s, _)| *s),
+                        pending_age = ?pending.as_ref().map(|(_, _, a)| *a),
                         "pay_pregenerated fatal reject — failing the run"
                     );
                     app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
@@ -3046,6 +3083,21 @@ fn envelope_seq_num(env: &TransactionEnvelope) -> i64 {
             stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
         },
     }
+}
+
+/// [maxtps_ban] Sequence-source account id of an envelope, for the
+/// fatal-reject forensic dump.
+fn envelope_source_account_id(env: &TransactionEnvelope) -> stellar_xdr::AccountId {
+    let muxed = match env {
+        TransactionEnvelope::TxV0(e) => {
+            stellar_xdr::MuxedAccount::Ed25519(e.tx.source_account_ed25519.clone())
+        }
+        TransactionEnvelope::Tx(e) => e.tx.source_account.clone(),
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
+        },
+    };
+    henyey_tx::muxed_to_account_id(&muxed)
 }
 
 // ---------------------------------------------------------------------------

@@ -171,6 +171,12 @@ const TX_SET_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// preventing unbounded memory growth during long-gap catchup.
 const TX_SET_ACTIVE_WINDOW_BUDGET: usize = 24; // 2 * TX_SET_REQUEST_WINDOW
 
+/// Pause between rebuilds of an exhausted nomination-critical tx-set fetch
+/// (all peers marked DontHave). Mirrors stellar-core Tracker's rebuild pause
+/// on the same condition, scaled down because during nomination the set is
+/// typically mid-propagation and becomes available within a round trip.
+const CRITICAL_REBUILD_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Recovery timer for out-of-sync recovery attempts.
 /// Matches stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
@@ -2240,6 +2246,16 @@ impl App {
     /// Returns `Err(NotInitialized)` if the ledger manager has not been
     /// initialized yet (or was reset for catchup).
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
+    /// [maxtps_ban] Forensic passthrough: the tx queue's pending (hash, seq,
+    /// age) for an account, if any. See
+    /// `TransactionQueue::account_pending_info`.
+    pub fn debug_account_pending(
+        &self,
+        account_id: &stellar_xdr::AccountId,
+    ) -> Option<(henyey_common::Hash256, i64, u32)> {
+        self.herder.tx_queue().account_pending_info(account_id)
+    }
+
     pub fn load_account_sequence(
         &self,
         account_id: &stellar_xdr::AccountId,
@@ -3503,6 +3519,123 @@ impl App {
         );
 
         Some(handle)
+    }
+
+    /// Start the background WAL checkpointer.
+    ///
+    /// Inline SQLite auto-checkpoints are disabled (`wal_autocheckpoint = 0`
+    /// in henyey_db): henyey's ledger-close persist writes 10-30 MB of WAL
+    /// per ledger, so threshold-triggered checkpoints used to run INSIDE the
+    /// close-persist commit, holding the WAL write lock for 4-16 s under
+    /// sustained load and stalling the apply pipeline (which in turn delayed
+    /// the LCL-gated consensus trigger and broke nomination round-1 quorum
+    /// assembly — the burst-vs-sustained TPS gap).
+    ///
+    /// This task runs `PRAGMA wal_checkpoint(PASSIVE)` every 2 s on a
+    /// blocking-pool thread. PASSIVE never blocks concurrent readers or
+    /// writers, so a close that starts mid-checkpoint proceeds unimpeded.
+    ///
+    /// Failure containment (review of #3712): the loop never exits on
+    /// checkpoint or join errors — a validator whose WAL is not being drained
+    /// eventually dies of disk exhaustion, so the checkpointer must outlive
+    /// transient failures. If PASSIVE passes cannot keep the WAL below
+    /// `WAL_TRUNCATE_BACKSTOP_PAGES` (e.g. a long-lived reader pins the WAL),
+    /// it escalates to a blocking `wal_checkpoint(TRUNCATE)` — a stall, but a
+    /// bounded one, preferred over unbounded growth. Behind all of this,
+    /// henyey_db keeps a very high inline `wal_autocheckpoint` floor (~1 GiB)
+    /// so even a fully wedged task degrades to bounded inline checkpoints.
+    ///
+    /// Returns the JoinHandle so callers can abort it on shutdown; the task
+    /// also exits when the app's shutdown broadcast fires.
+    pub fn start_wal_checkpointer(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+        const SLOW_CHECKPOINT_MS: u64 = 1_000;
+        /// Escalate to TRUNCATE when the WAL exceeds this size (~512 MiB at
+        /// 4 KiB pages). Half the henyey_db inline floor, so escalation fires
+        /// well before inline auto-checkpoints ever could.
+        const WAL_TRUNCATE_BACKSTOP_PAGES: i64 = 131_072;
+
+        let db = self.db.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CHECKPOINT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.recv() => break,
+                }
+                let db_pass = db.clone();
+                let started = std::time::Instant::now();
+                let res = tokio::task::spawn_blocking(move || {
+                    let _ctx = henyey_common::WriteCtxGuard::new("wal-checkpoint-passive");
+                    db_pass.wal_checkpoint_passive()
+                })
+                .await;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let wal_pages_after = match res {
+                    Ok(Ok((busy, wal_pages, checkpointed))) => {
+                        if elapsed_ms >= SLOW_CHECKPOINT_MS || busy != 0 {
+                            tracing::info!(
+                                elapsed_ms,
+                                busy,
+                                wal_pages,
+                                checkpointed,
+                                "WAL passive checkpoint (slow or busy)"
+                            );
+                        } else {
+                            tracing::trace!(
+                                elapsed_ms,
+                                wal_pages,
+                                checkpointed,
+                                "WAL passive checkpoint"
+                            );
+                        }
+                        // Pages still in the WAL that PASSIVE could not drain.
+                        wal_pages.saturating_sub(checkpointed)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "WAL passive checkpoint failed");
+                        0
+                    }
+                    Err(e) => {
+                        // Never exit: an undrained WAL kills the node via
+                        // disk exhaustion long after this transient error.
+                        tracing::warn!(error = %e, "WAL checkpointer join error");
+                        0
+                    }
+                };
+
+                if wal_pages_after > WAL_TRUNCATE_BACKSTOP_PAGES {
+                    let db_trunc = db.clone();
+                    let trunc_started = std::time::Instant::now();
+                    let trunc = tokio::task::spawn_blocking(move || {
+                        let _ctx =
+                            henyey_common::WriteCtxGuard::new("wal-checkpoint-truncate-backstop");
+                        db_trunc.wal_checkpoint_truncate()
+                    })
+                    .await;
+                    match trunc {
+                        Ok(Ok((busy, wal_pages, checkpointed))) => {
+                            tracing::error!(
+                                elapsed_ms = trunc_started.elapsed().as_millis() as u64,
+                                busy,
+                                wal_pages,
+                                checkpointed,
+                                "WAL exceeded backstop threshold; forced TRUNCATE checkpoint                                  (investigate what pinned the WAL)"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "WAL TRUNCATE backstop failed");
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "WAL TRUNCATE backstop join error");
+                        }
+                    }
+                }
+            }
+            tracing::info!("WAL checkpointer stopped");
+        })
     }
 
     /// Send a heartbeat to the sync recovery manager.
@@ -11026,10 +11159,12 @@ mod tests {
         app.fetch_channel_depth
             .store(TX_SET_ACTIVE_WINDOW_BUDGET as i64, Ordering::Relaxed);
 
-        // Seed a few pending hashes in the active window (ledger 0: min_slot=1, window_end=12).
+        // Seed pending hashes beyond the nomination-critical range
+        // (ledger 0: min_slot=1, critical_end=2, window_end=12) — critical
+        // slots bypass the budget by design, so use slots 3+ here.
         for i in 0..4u8 {
             let hash = Hash256::from_bytes([i + 1; 32]);
-            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 3);
         }
 
         // With budget full, request_pending_tx_sets should send NO requests.
@@ -11045,6 +11180,88 @@ mod tests {
             last_request.is_empty(),
             "No requests should be recorded when budget is full, but got {} entries",
             last_request.len()
+        );
+    }
+
+    /// Nomination-critical tx sets (slots ≤ current_ledger + 2) must be
+    /// requested even when the active-window backlog budget is exhausted —
+    /// they gate SCP voting for the slot being nominated right now. Pre-fix,
+    /// a saturated fetch channel paused ALL GetTxSet sends and nomination
+    /// rounds timed out waiting for the candidate set (multi-round
+    /// nominations → 9s ledgers under sustained load).
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_critical_slot_bypasses_full_budget() {
+        let (app, _dir, mut receiver) = app_with_test_overlay().await;
+
+        app.fetch_channel_depth
+            .store(TX_SET_ACTIVE_WINDOW_BUDGET as i64, Ordering::Relaxed);
+
+        // Critical: slot 1 with current_ledger 0 (min_slot=1, critical_end=2).
+        let critical_hash = Hash256::from_bytes([0xC1; 32]);
+        app.herder.scp_driver().request_tx_set(critical_hash, 1);
+        // Non-critical: slot 5 — must stay paused.
+        let bulk_hash = Hash256::from_bytes([0xB5; 32]);
+        app.herder.scp_driver().request_tx_set(bulk_hash, 5);
+
+        app.request_pending_tx_sets().await;
+
+        let msg = receiver.try_recv();
+        match msg {
+            Some(StellarMessage::GetTxSet(h)) => {
+                assert_eq!(
+                    Hash256::from_bytes(h.0),
+                    critical_hash,
+                    "The critical-slot hash must be the one requested"
+                );
+            }
+            other => panic!("Expected GetTxSet for the critical hash, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_none(),
+            "Non-critical hash must remain paused while the budget is full"
+        );
+    }
+
+    /// An exhausted (all peers DontHave) nomination-critical fetch must be
+    /// rebuilt and re-requested rather than abandoned. Pre-fix, exhaustion
+    /// permanently stopped requests for the hash until catchup reset the
+    /// tracking, wedging nomination when the candidate set was demanded
+    /// before any peer had finished fetching it.
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_rebuilds_exhausted_critical_fetch() {
+        let (app, _dir, mut receiver) = app_with_test_overlay().await;
+
+        let critical_hash = Hash256::from_bytes([0xC2; 32]);
+        app.herder.scp_driver().request_tx_set(critical_hash, 1);
+
+        // Mark the injected peer as DontHave for this hash → exhausted.
+        {
+            let mut dont_have = app.tx_set_dont_have.write().await;
+            let overlay = app.overlay.read().await.clone().unwrap();
+            let peers: std::collections::HashSet<PeerId> = overlay
+                .peer_infos()
+                .into_iter()
+                .map(|info| info.peer_id)
+                .collect();
+            dont_have.insert(critical_hash, peers);
+        }
+
+        app.request_pending_tx_sets().await;
+
+        let msg = receiver.try_recv();
+        match msg {
+            Some(StellarMessage::GetTxSet(h)) => {
+                assert_eq!(Hash256::from_bytes(h.0), critical_hash);
+            }
+            other => {
+                panic!("Exhausted critical fetch must be rebuilt and re-requested, got {other:?}")
+            }
+        }
+        // The DontHave set must have been cleared by the rebuild.
+        let dont_have = app.tx_set_dont_have.read().await;
+        assert!(
+            dont_have.get(&critical_hash).map_or(true, |s| s.is_empty()),
+            "Rebuild must clear the DontHave set for the critical hash"
         );
     }
 
@@ -11106,11 +11323,12 @@ mod tests {
         app.fetch_channel_depth
             .store(fill_depth as i64, Ordering::Relaxed);
 
-        // Seed more pending hashes than the remaining budget.
+        // Seed more pending hashes than the remaining budget, all beyond the
+        // nomination-critical range (slots ≤ current+2 bypass the budget).
         let total_pending = remaining + 5;
         for i in 0..total_pending {
             let hash = Hash256::from_bytes([(i + 1) as u8; 32]);
-            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 3);
         }
 
         app.request_pending_tx_sets().await;

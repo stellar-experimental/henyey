@@ -474,25 +474,16 @@ impl App {
             "Armed event-driven consensus trigger timer (setupTriggerNextLedger)"
         );
 
-        // Prebuild the nomination value ~300 ms ahead of the trigger (maxtps
-        // iter 9): the ~150-200 ms tx-set build otherwise runs between the
-        // trigger firing and `scp.nominate`, on the network's nomination-
-        // convergence critical path. A plain sleep task (not a managed timer)
-        // suffices: `prebuild_nomination_value` self-gates on slot/LCL/
-        // nomination state, so a stale or duplicate firing is a cheap no-op.
-        const PREBUILD_LEAD: std::time::Duration = std::time::Duration::from_millis(300);
-        if self.is_validator && delay > PREBUILD_LEAD + std::time::Duration::from_millis(100) {
-            let herder = std::sync::Arc::clone(&self.herder);
-            let lead_delay = delay - PREBUILD_LEAD;
-            tokio::spawn(async move {
-                tokio::time::sleep(lead_delay).await;
-                let _ =
-                    henyey_common::spawn_blocking_logged("prebuild_nomination_value", move || {
-                        herder.prebuild_nomination_value(next_slot as u32)
-                    })
-                    .await;
-            });
-        }
+        // NOTE (maxtps, REVERTED): a ~300 ms nomination-value PREBUILD lived
+        // here (arm a sleep task at trigger−300 ms; `trigger_next_ledger`
+        // reused the cached value). It cut convergence median 580→320 ms but
+        // is a SUSTAINED-LOAD liability: every candidate becomes ~300 ms
+        // staler than a trigger-time build (stellar-core builds AT trigger),
+        // so txs arriving in that window systematically miss the next tx-set
+        // on EVERY node — a two-build miss wedges the tx past its loadgen
+        // account's minimum resubmission gap and insta-fails 5-minute runs
+        // (#3638). Forensics: pending_age=2 collisions with wedge-push counts
+        // of 6-22/node/ledger. Build at trigger time, like core.
     }
 
     /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().

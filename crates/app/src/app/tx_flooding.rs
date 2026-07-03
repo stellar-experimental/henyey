@@ -1009,23 +1009,36 @@ impl App {
         let current_load = window_backlog + fetch_depth;
         let remaining_budget = TX_SET_ACTIVE_WINDOW_BUDGET.saturating_sub(current_load);
 
+        // Nomination-critical fetches (slots ≤ current+2) must never be
+        // starved: they gate SCP voting for the ledger being nominated right
+        // now, so they bypass both the active-window budget pause and the
+        // per-tick take() cap. stellar-core's Tracker fetches every tracked
+        // item independently and never pauses; the budget below only guards
+        // bulk fetching of far-future slots (catchup-style backlogs).
+        let critical_end = current_ledger as u64 + 2;
+        let (critical, rest): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .filter(|(_, slot)| *slot >= min_slot && *slot <= window_end)
+            .partition(|(_, slot)| *slot <= critical_end);
+
+        let critical_hashes: HashSet<Hash256> = critical.iter().map(|(hash, _)| *hash).collect();
+        let mut pending_hashes: Vec<Hash256> = critical.into_iter().map(|(hash, _)| hash).collect();
         if remaining_budget == 0 {
             tracing::debug!(
                 current_load,
                 window_backlog,
                 fetch_depth,
                 budget = TX_SET_ACTIVE_WINDOW_BUDGET,
-                "Pausing tx_set requests: active window backlog budget full"
+                critical = pending_hashes.len(),
+                "Active window backlog budget full: pausing non-critical tx_set requests"
             );
-            return;
+        } else {
+            pending_hashes.extend(
+                rest.into_iter()
+                    .map(|(hash, _)| hash)
+                    .take(MAX_TX_SET_REQUESTS_PER_TICK.min(remaining_budget)),
+            );
         }
-
-        let pending_hashes: Vec<Hash256> = pending
-            .into_iter()
-            .filter(|(_, slot)| *slot >= min_slot && *slot <= window_end)
-            .map(|(hash, _)| hash)
-            .take(MAX_TX_SET_REQUESTS_PER_TICK.min(remaining_budget))
-            .collect();
         if pending_hashes.is_empty() {
             return;
         }
@@ -1060,6 +1073,7 @@ impl App {
             let mut last_request = self.tx_set_last_request.write().await;
             last_request.retain(|hash, _| pending_set.contains(hash));
             let exhausted_warned = self.tx_set_exhausted_warned.read().await;
+            let mut last_retry = self.tx_set_last_retry.write().await;
 
             let mut reqs = Vec::new();
             let mut exhausted = Vec::new();
@@ -1113,12 +1127,40 @@ impl App {
                     Self::tx_set_start_index(hash, peers.len(), request_state.next_peer_offset);
                 let eligible_peer = match dont_have.get_mut(hash) {
                     Some(set) => {
-                        let found = peers
+                        let mut found = peers
                             .iter()
                             .cycle()
                             .skip(start_idx)
                             .take(peers.len())
                             .find(|peer| !set.contains(peer));
+                        if found.is_none() && critical_hashes.contains(hash) {
+                            // Nomination-critical set with every peer marked
+                            // DontHave: rebuild instead of abandoning. During
+                            // nomination the DontHaves are usually just "not
+                            // yet" — the set is seconds old and still
+                            // propagating — so a permanent stop wedges SCP
+                            // voting and times out nomination rounds.
+                            // stellar-core's Tracker likewise clears its
+                            // asked-peers list on exhaustion and retries after
+                            // a pause (Tracker::tryNextPeer rebuild path).
+                            let can_rebuild = last_retry.get(hash).map_or(true, |prev| {
+                                now.duration_since(*prev) >= CRITICAL_REBUILD_PAUSE
+                            });
+                            if can_rebuild {
+                                set.clear();
+                                last_retry.insert(*hash, now);
+                                // Reset the silent-drop timeout clock so the
+                                // timeout branch above doesn't immediately
+                                // re-mark every peer DontHave.
+                                request_state.first_requested = now;
+                                found = peers.get(start_idx % peers.len().max(1));
+                                tracing::info!(
+                                    target: "maxtps_fetch",
+                                    hash = %hash,
+                                    "rebuilding exhausted critical tx-set fetch"
+                                );
+                            }
+                        }
                         if found.is_none() {
                             // All peers have said DontHave for this tx set.
                             // Track for warning (only if not already warned).
@@ -1126,8 +1168,8 @@ impl App {
                                 exhausted.push((*hash, set.len(), peers.len()));
                             }
                             self.mark_tx_set_exhausted();
-                            // Don't clear the set or return a peer - stop requesting this tx set
-                            // until catchup or tx_set tracking is reset.
+                            // Non-critical: stop requesting this tx set until
+                            // catchup or tx_set tracking is reset.
                         }
                         found
                     }

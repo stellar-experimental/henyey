@@ -2956,6 +2956,37 @@ impl App {
                 // Re-mark all surviving transactions for flooding. Matches
                 // stellar-core's resetBestFeeTxs() + rebroadcast() on ledger close.
                 self.herder.tx_queue().rebroadcast();
+
+                // Sustained-load wedge fix: PUSH the full bodies of txs that
+                // have been pending 2 ledgers to all peers. Rebroadcast alone
+                // re-MARKS them, but the per-peer advert history suppresses
+                // the re-advert to any peer recorded as already-adverted — so
+                // a tx whose demand/response was lost stays missing from
+                // every other queue and can only apply when THIS node's
+                // candidate wins nomination. One lost tx then out-waits its
+                // account's ~20 s submission cycle and a PayPregenerated run
+                // insta-fails (#3638): measured as henyey sustaining ~1150
+                // tx/s on 5-minute windows vs stellar-core's 1522 on the same
+                // hardware. The push is rare by construction (only txs that
+                // missed 2 consecutive ledgers; typically 0-5 per 5-minute
+                // window) and flood-gate rules still apply on receive.
+                if !shift_result.reflooded_txs.is_empty() {
+                    if let Some(overlay) = self.overlay().await {
+                        let count = shift_result.reflooded_txs.len();
+                        for env in shift_result.reflooded_txs {
+                            let msg = stellar_xdr::StellarMessage::Transaction(env);
+                            if let Err(e) = overlay.broadcast(msg).await {
+                                tracing::debug!(error = %e, "wedged-tx push failed");
+                            }
+                        }
+                        tracing::info!(
+                            target: "maxtps_ban",
+                            ledger_seq,
+                            count,
+                            "pushed wedged pending txs to all peers"
+                        );
+                    }
+                }
             }
             Err(e) if e.is_panic() => {
                 tracing::error!(
