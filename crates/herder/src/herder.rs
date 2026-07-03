@@ -2872,20 +2872,31 @@ impl Herder {
         // pull as fulfilled, so nothing retries and a sole-advertiser tx
         // strands. Sample the rare terminal outcomes (Duplicate and Added are
         // the normal flood cases and stay quiet).
-        if matches!(
-            result,
-            TxQueueResult::Banned | TxQueueResult::Invalid(_) | TxQueueResult::TryAgainLater
-        ) {
-            use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-            static LOGGED: AtomicU64 = AtomicU64::new(0);
-            if LOGGED.fetch_add(1, AtomicOrdering::Relaxed) % 16 == 0 {
+        match result {
+            // Banned/TryAgainLater are rare enough (~tens per run) to log
+            // unsampled — and they are exactly the flooded-copy rejections
+            // that can strand a sole-advertiser tx (#3719 part 1).
+            TxQueueResult::Banned | TxQueueResult::TryAgainLater => {
                 tracing::info!(
                     target: "maxtps_tail",
                     tx_seq = diag_seq,
                     result = ?result,
-                    "tx admission rejected (sampled 1/16)"
+                    "tx admission rejected"
                 );
             }
+            TxQueueResult::Invalid(_) => {
+                use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+                static LOGGED: AtomicU64 = AtomicU64::new(0);
+                if LOGGED.fetch_add(1, AtomicOrdering::Relaxed) % 16 == 0 {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        tx_seq = diag_seq,
+                        result = ?result,
+                        "tx admission rejected (sampled 1/16)"
+                    );
+                }
+            }
+            _ => {}
         }
 
         result

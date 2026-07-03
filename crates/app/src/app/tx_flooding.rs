@@ -333,7 +333,25 @@ impl App {
         }
 
         // Phase 2: Send adverts and mark successfully sent hashes.
+        let advert_watch = {
+            let w = self.tail_watch.read().await;
+            if w.is_empty() {
+                None
+            } else {
+                Some(w.clone())
+            }
+        };
         for (peer_id, hashes) in &per_peer {
+            if let Some(w) = advert_watch.as_ref() {
+                for hash in hashes.iter().filter(|h| w.contains(h)) {
+                    tracing::info!(
+                        target: "maxtps_tail",
+                        hash8 = %&hash.to_hex()[..16],
+                        peer = %peer_id,
+                        "watched hash RE-ADVERTED"
+                    );
+                }
+            }
             for chunk in hashes.chunks(max_chunk_size) {
                 let tx_hashes = match TxAdvertVector::try_from(
                     chunk
@@ -394,7 +412,7 @@ impl App {
         let aged = self
             .herder
             .tx_queue()
-            .sample_aged_txs(Duration::from_secs(8), 3);
+            .sample_aged_txs(Duration::from_secs(3), 3);
         if !aged.is_empty() {
             const TAIL_WATCH_CAP: usize = 32;
             let adverts_by_peer = self.tx_adverts_by_peer.read().await;
