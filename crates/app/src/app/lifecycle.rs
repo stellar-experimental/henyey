@@ -237,6 +237,12 @@ impl App {
     /// - [`FallbackCatchup::Skip`]: proceed without catchup (Watcher mode).
     pub async fn run(&self, fallback_catchup: FallbackCatchup) -> anyhow::Result<()> {
         tracing::info!("Starting main event loop");
+        if !self.config.store_rpc_data() {
+            tracing::info!(
+                "Per-tx RPC row storage disabled (validator without JSON-RPC): \
+                 skipping transactions/events table writes at ledger close"
+            );
+        }
 
         // Start overlay network if not already started.
         // (run_cmd may have already started it before catchup)
