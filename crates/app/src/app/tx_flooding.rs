@@ -395,27 +395,57 @@ impl App {
             .herder
             .tx_queue()
             .sample_aged_txs(Duration::from_secs(8), 3);
-        if aged.is_empty() {
-            return;
+        if !aged.is_empty() {
+            let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+            for (hash, age_ms) in aged {
+                let sent_to = peer_ids
+                    .iter()
+                    .filter(|pid| {
+                        adverts_by_peer
+                            .get(*pid)
+                            .is_some_and(|a| a.seen_advert(&hash))
+                    })
+                    .count();
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    age_ms,
+                    sent_to,
+                    peers = peer_ids.len(),
+                    "stranded queued tx"
+                );
+            }
         }
-        let adverts_by_peer = self.tx_adverts_by_peer.read().await;
-        for (hash, age_ms) in aged {
-            let sent_to = peer_ids
-                .iter()
-                .filter(|pid| {
-                    adverts_by_peer
-                        .get(*pid)
-                        .is_some_and(|a| a.seen_advert(&hash))
-                })
-                .count();
-            tracing::info!(
-                target: "maxtps_tail",
-                hash8 = %&hash.to_hex()[..16],
-                age_ms,
-                sent_to,
-                peers = peer_ids.len(),
-                "stranded queued tx"
-            );
+
+        // Demander-side companion: demands we issued that stayed unfulfilled
+        // for 5+ s. `peers_demanded` = how many peers we demanded from and
+        // got no usable response; a hash stranded on its origin but ABSENT
+        // from every other node's unfulfilled list was never demanded at all
+        // (advert admission problem, not response loss).
+        {
+            let now = self.clock.now();
+            let history = self.tx_demand_history.read().await;
+            let mut logged = 0;
+            for (hash, entry) in history.iter() {
+                if entry.latency_recorded {
+                    continue;
+                }
+                let age = now.saturating_duration_since(entry.first_demanded);
+                if age < Duration::from_secs(5) {
+                    continue;
+                }
+                tracing::info!(
+                    target: "maxtps_tail",
+                    hash8 = %&hash.to_hex()[..16],
+                    age_ms = age.as_millis() as u64,
+                    peers_demanded = entry.peers.len(),
+                    "unfulfilled demand"
+                );
+                logged += 1;
+                if logged >= 3 {
+                    break;
+                }
+            }
         }
     }
 
@@ -578,8 +608,23 @@ impl App {
             return DemandStatus::Demand;
         };
 
-        if entry.peers.contains_key(peer) {
-            return DemandStatus::Discard;
+        if let Some(demanded_at) = entry.peers.get(peer) {
+            // stellar-core never re-demands from the same peer — safe there
+            // because its demand responses are never lost. Henyey divergence
+            // (overlay-internal, wire-compatible): when a tx has a SOLE
+            // advertiser (warmup, or an account's first tx), a single lost
+            // response permanently strands it under core's rule — no other
+            // peer will ever advert it. Allow re-demanding from the same
+            // peer after a generous expiry so sole-holder strands self-heal
+            // within ~2 s instead of wedging the account (2026-07-03
+            // maxtps_tail forensics: unfulfilled demands stuck at
+            // peers_demanded=1 for 14+ s).
+            const SAME_PEER_REDEMAND_DELAY: Duration = Duration::from_millis(2_000);
+            if now.duration_since(*demanded_at) < SAME_PEER_REDEMAND_DELAY {
+                return DemandStatus::Discard;
+            }
+            // Fall through: eligible for re-demand from this peer; the
+            // retry-count and backoff checks below still apply.
         }
 
         let num_demanded = entry.peers.len();
@@ -2708,6 +2753,45 @@ mod tests {
         let unknown = Hash256::from_bytes([0xCC; 32]);
         assert!(matches!(
             app.demand_status(unknown, &peer, now, &history),
+            DemandStatus::Demand
+        ));
+    }
+
+    /// Sole-advertiser strand self-heal: after SAME_PEER_REDEMAND_DELAY, a
+    /// hash may be re-demanded from a peer we already demanded from (henyey
+    /// divergence from stellar-core, which never re-demands per peer — safe
+    /// only when responses are never lost).
+    #[tokio::test]
+    async fn test_demand_status_allows_same_peer_redemand_after_expiry() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let peer = make_peer_id(46);
+        let hash = Hash256::from_bytes([0xDD; 32]);
+        let now = Instant::now();
+
+        let mut history: HashMap<Hash256, TxDemandHistory> = HashMap::new();
+        let demanded_at = now - Duration::from_millis(500);
+        history.insert(
+            hash,
+            TxDemandHistory {
+                first_demanded: demanded_at,
+                last_demanded: demanded_at,
+                peers: [(peer.clone(), demanded_at)].into_iter().collect(),
+                latency_recorded: false,
+            },
+        );
+
+        // Within the expiry window: still discarded.
+        assert!(matches!(
+            app.demand_status(hash, &peer, now, &history),
+            DemandStatus::Discard
+        ));
+
+        // Past the expiry window (and past the retry backoff): re-demand.
+        let late = now + Duration::from_millis(2_500);
+        assert!(matches!(
+            app.demand_status(hash, &peer, late, &history),
             DemandStatus::Demand
         ));
     }

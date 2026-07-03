@@ -2986,6 +2986,21 @@ impl TransactionQueue {
                     if queued_tx.sequence_number() <= *applied_seq {
                         // Remove from store
                         let removed_hash = queued_tx.hash;
+                        // [maxtps_tail] interleaving diagnostic: a drop where
+                        // the queued hash differs from the applied hash means
+                        // a same-account duplicate raced (loadgen rebuild or
+                        // flood echo) — cap the log to the first few per call.
+                        let applied_hash = Hash256::hash_xdr(envelope);
+                        if removed_hash != applied_hash && removed_hashes.len() < 3 {
+                            tracing::info!(
+                                target: "maxtps_tail",
+                                queued_hash8 = %&removed_hash.to_hex()[..16],
+                                applied_hash8 = %&applied_hash.to_hex()[..16],
+                                queued_seq = queued_tx.sequence_number(),
+                                applied_seq = *applied_seq,
+                                "remove_applied dropped superseded duplicate"
+                            );
+                        }
                         store.remove(&removed_hash, ledger_version);
                         removed_hashes.push(removed_hash);
 
