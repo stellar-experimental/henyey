@@ -849,20 +849,31 @@ impl PeerTxAdverts {
         self.history.remember(hash, ledger_seq);
     }
 
-    pub fn queue_incoming(&mut self, hashes: &[Hash], ledger_seq: u32, max_ops: usize) {
+    /// Queue an incoming advert batch for demanding.
+    ///
+    /// Returns the number of hashes DROPPED from the pending-demand queue
+    /// (either truncated from an oversized batch or evicted as oldest when
+    /// the queue exceeds `max_ops`). Dropped hashes are still `remember`ed,
+    /// so this peer will not re-advert them — a dropped demand is only
+    /// recovered by another peer's advert or the sender's advert-history
+    /// expiry (maxtps_tail diagnostic).
+    pub fn queue_incoming(&mut self, hashes: &[Hash], ledger_seq: u32, max_ops: usize) -> usize {
         for hash in hashes {
             let hash256 = Hash256(hash.0);
             self.remember(hash256, ledger_seq);
         }
 
         let start = hashes.len().saturating_sub(max_ops);
+        let mut dropped = start;
         for hash in hashes.iter().skip(start) {
             self.incoming.push_back(Hash256(hash.0));
         }
 
         while self.size() > max_ops {
             self.pop_advert();
+            dropped += 1;
         }
+        dropped
     }
 
     pub fn retry_incoming(&mut self, hashes: Vec<Hash256>, max_ops: usize) {

@@ -2748,6 +2748,27 @@ impl TransactionQueue {
         self.store.read().len()
     }
 
+    /// Sample the oldest queued transactions at least `min_age` old.
+    ///
+    /// Returns `(hash, age_ms)` pairs, oldest first, capped at `cap`.
+    /// Diagnostic helper for stranded-tx attribution (maxtps_tail): a queued
+    /// tx older than a couple of ledgers indicates the flood path failed to
+    /// deliver it to the rotating leaders.
+    pub fn sample_aged_txs(&self, min_age: std::time::Duration, cap: usize) -> Vec<(Hash256, u64)> {
+        let store = self.store.read();
+        let now = Instant::now();
+        let mut aged: Vec<(Hash256, u64)> = store
+            .values()
+            .filter_map(|tx| {
+                let age = now.saturating_duration_since(tx.received_at());
+                (age >= min_age).then(|| (tx.hash(), age.as_millis() as u64))
+            })
+            .collect();
+        aged.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        aged.truncate(cap);
+        aged
+    }
+
     /// Check if the queue is empty.
     pub fn is_empty(&self) -> bool {
         self.store.read().is_empty()

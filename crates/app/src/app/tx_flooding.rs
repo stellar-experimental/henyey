@@ -231,6 +231,11 @@ impl App {
     const MAX_CARRYOVER_OPS: usize = 101; // MAX_OPS_PER_TX (100) + 1
 
     pub(super) async fn flush_tx_adverts(&self) {
+        // Retry demand responses that couldn't be sent (channel full) first —
+        // peers are already waiting on these, and their re-demand backoff
+        // penalizes us if they stay undelivered.
+        self.flush_deferred_demand_responses().await;
+
         let ops_budget = self.compute_flood_ops_budget();
         let dex_ops_budget = self.compute_dex_flood_ops_budget();
 
@@ -359,6 +364,58 @@ impl App {
                     }
                 }
             }
+        }
+
+        self.log_stranded_tx_diag(&peer_ids).await;
+    }
+
+    /// Diagnostic (maxtps_tail): log the flood state of the oldest queued
+    /// transactions. A queued tx older than ~2 ledgers means the flood path
+    /// failed to deliver it to the rotating leaders — `sent_to` splits
+    /// "origin never adverted it" (0) from "adverted everywhere but the
+    /// demand/response side lost it" (== peers). Rate-limited to one scan
+    /// per 2 s; instrumentation only.
+    async fn log_stranded_tx_diag(&self, peer_ids: &[henyey_overlay::PeerId]) {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 2_000
+            || LAST_MS
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+
+        let aged = self
+            .herder
+            .tx_queue()
+            .sample_aged_txs(Duration::from_secs(8), 3);
+        if aged.is_empty() {
+            return;
+        }
+        let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+        for (hash, age_ms) in aged {
+            let sent_to = peer_ids
+                .iter()
+                .filter(|pid| {
+                    adverts_by_peer
+                        .get(*pid)
+                        .is_some_and(|a| a.seen_advert(&hash))
+                })
+                .count();
+            tracing::info!(
+                target: "maxtps_tail",
+                hash8 = %&hash.to_hex()[..16],
+                age_ms,
+                sent_to,
+                peers = peer_ids.len(),
+                "stranded queued tx"
+            );
         }
     }
 
@@ -500,6 +557,18 @@ impl App {
         history: &HashMap<Hash256, TxDemandHistory>,
     ) -> DemandStatus {
         const MAX_RETRY_COUNT: usize = 15;
+
+        // stellar-core parity (TxDemandsManager::demandStatus:71-74): never
+        // demand a tx we already have queued or banned. Without this check a
+        // fulfilled hash keeps cycling as RetryLater through every other
+        // peer's advert/retry queue until the 60 s retention prune — at
+        // ~1500 tx/s that permanently saturates the per-peer demand queues
+        // (observed full at max_ops with 100-240 drops per advert batch),
+        // starving demands for genuinely-new txs and stranding accounts
+        // (maxtps_tail forensics, 2026-07-03).
+        if self.herder.tx_queue().contains(&hash) || self.herder.tx_queue().is_banned(&hash) {
+            return DemandStatus::Discard;
+        }
 
         if self.herder.tx_queue().contains(&hash) {
             return DemandStatus::Discard;
@@ -692,7 +761,20 @@ impl App {
         let entry = adverts_by_peer
             .entry(peer_id.clone())
             .or_insert_with(PeerTxAdverts::new);
-        entry.queue_incoming(&advert.tx_hashes.0, ledger_seq, max_ops);
+        let dropped = entry.queue_incoming(&advert.tx_hashes.0, ledger_seq, max_ops);
+        if dropped > 0 {
+            // A dropped pending demand is remembered-but-never-demanded: this
+            // peer will not re-advert it, so the tx is stranded on this node
+            // until another peer adverts it or advert history expires.
+            tracing::info!(
+                target: "maxtps_tail",
+                peer = %peer_id,
+                dropped,
+                batch = advert.tx_hashes.0.len(),
+                max_ops,
+                "advert demand-queue overflow"
+            );
+        }
     }
 
     pub(super) async fn handle_flood_demand(
@@ -710,25 +792,41 @@ impl App {
         };
 
         // Use non-blocking try_send_to to avoid stalling the event loop
-        // when the peer's outbound channel is full.  The peer will re-request
-        // any transactions it still needs.
+        // when the peer's outbound channel is full. Undeliverable responses
+        // are NOT dropped: they are deferred to `tx_deferred_demand_responses`
+        // and drained on subsequent flood ticks. stellar-core queues demand
+        // responses in its per-peer write queue and never drops them; the old
+        // drop-rest-of-batch-on-full behavior stranded txs for 2+ ledgers
+        // (demander retries burn its per-period demand budget), wedging
+        // accounts under sustained load (maxtps_tail forensics, 2026-07-03).
         //
         // Match stellar-core: only send Transaction messages for found hashes.
         // Do NOT send DontHave for unfulfilled demands — stellar-core just
         // logs/meters misses without any outbound response.
         let mut sent = 0u32;
-        let mut dropped = 0u32;
+        let mut deferred = 0u32;
         let mut banned = 0u32;
         let mut unknown = 0u32;
+        let mut channel_full = false;
+        let mut to_defer: Vec<Hash256> = Vec::new();
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
+            if channel_full {
+                if self.herder.tx_queue().get(&hash256).is_some() {
+                    to_defer.push(hash256);
+                    deferred += 1;
+                }
+                continue;
+            }
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
                 match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.into_envelope()))
                 {
                     Ok(()) => sent += 1,
                     Err(_) => {
-                        dropped += 1;
-                        break; // Channel full — stop sending to this peer
+                        // Channel full — defer this and the rest of the batch.
+                        channel_full = true;
+                        to_defer.push(hash256);
+                        deferred += 1;
                     }
                 }
             } else if self.herder.tx_queue().is_banned(&hash256) {
@@ -737,15 +835,24 @@ impl App {
                 unknown += 1;
             }
         }
-        if sent > 0 || dropped > 0 || banned > 0 || unknown > 0 {
+        if !to_defer.is_empty() {
+            const MAX_DEFERRED_PER_PEER: usize = 4_000;
+            let mut deferred_map = self.tx_deferred_demand_responses.write().await;
+            let queue = deferred_map.entry(peer_id.clone()).or_default();
+            queue.extend(to_defer);
+            while queue.len() > MAX_DEFERRED_PER_PEER {
+                queue.pop_front();
+            }
+        }
+        if sent > 0 || deferred > 0 || banned > 0 || unknown > 0 {
             // [maxtps_diag] Fulfiller-side demand outcome counters — pinpoint why
             // demands go unfulfilled (driving the demander's re-demand /
             // demand-timeout). `unknown` = hash not in our queue when demanded
-            // (advert/include race); `dropped` = peer outbound channel full.
+            // (advert/include race); `deferred` = peer outbound channel full,
+            // response queued for the next flood tick.
             // stellar-core fulfils ~100% (overlay.flood.unfulfilled-*=0).
             metrics::counter!("stellar_overlay_demand_fulfilled_total").increment(sent as u64);
-            metrics::counter!("stellar_overlay_demand_unfulfilled_dropped_total")
-                .increment(dropped as u64);
+            metrics::counter!("stellar_overlay_demand_deferred_total").increment(deferred as u64);
             metrics::counter!("stellar_overlay_demand_unfulfilled_banned_total")
                 .increment(banned as u64);
             metrics::counter!("stellar_overlay_demand_unfulfilled_unknown_total")
@@ -753,12 +860,56 @@ impl App {
             tracing::debug!(
                 peer = %peer_id,
                 sent,
-                dropped,
+                deferred,
                 banned,
                 unknown,
                 total = demand.tx_hashes.0.len(),
                 "Flood demand served"
             );
+        }
+    }
+
+    /// Drain deferred demand responses (peer outbound channel was full when
+    /// the demand arrived). Called each flood tick. Hashes whose tx has left
+    /// the queue (applied or banned) are skipped — the demander's own retry
+    /// logic covers them. Stops per peer as soon as the channel is full
+    /// again; disconnected peers' queues are dropped.
+    pub(super) async fn flush_deferred_demand_responses(&self) {
+        let Some(overlay) = self.overlay().await else {
+            return;
+        };
+        let mut deferred_map = self.tx_deferred_demand_responses.write().await;
+        if deferred_map.is_empty() {
+            return;
+        }
+        let connected: HashSet<henyey_overlay::PeerId> = overlay
+            .peer_snapshots()
+            .iter()
+            .map(|s| s.info.peer_id.clone())
+            .collect();
+        deferred_map.retain(|peer, _| connected.contains(peer));
+
+        let mut sent_total = 0u32;
+        for (peer_id, queue) in deferred_map.iter_mut() {
+            while let Some(hash) = queue.front().copied() {
+                let Some(tx) = self.herder.tx_queue().get(&hash) else {
+                    queue.pop_front();
+                    continue;
+                };
+                match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.into_envelope()))
+                {
+                    Ok(()) => {
+                        queue.pop_front();
+                        sent_total += 1;
+                    }
+                    Err(_) => break, // still full — try next tick
+                }
+            }
+        }
+        deferred_map.retain(|_, queue| !queue.is_empty());
+        if sent_total > 0 {
+            metrics::counter!("stellar_overlay_demand_deferred_flushed_total")
+                .increment(sent_total as u64);
         }
     }
 
@@ -2419,5 +2570,145 @@ mod tests {
                  instead of tracking_consensus_ledger_index (5)."
             );
         }
+    }
+
+    /// Regression test (maxtps iter 9): demand responses that hit a full
+    /// outbound channel must be DEFERRED and delivered on the next flood
+    /// tick, not dropped. The old drop-rest-of-batch behavior stranded txs
+    /// for 2+ ledgers under sustained load (the demander's retry backoff
+    /// burned its per-period demand budget), wedging accounts.
+    #[tokio::test]
+    async fn test_handle_flood_demand_defers_on_full_channel_and_flushes() {
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        // Channel capacity 1: only the first response fits.
+        let peer_id = make_peer_id(43);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 1);
+
+        let mut hashes = Vec::new();
+        for i in 1..=3u8 {
+            let mut env = make_envelope(100 * i as u32, 1);
+            set_source(&mut env, i);
+            let hash = Hash256::hash_xdr(&env);
+            assert!(app.herder.tx_queue().insert_for_test(env));
+            hashes.push(hash);
+        }
+
+        let demand = FloodDemand {
+            tx_hashes: TxDemandVector(
+                hashes
+                    .iter()
+                    .map(|h| Hash(*h.as_bytes()))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            ),
+        };
+        app.handle_flood_demand(&peer_id, demand).await;
+
+        // Exactly one Transaction fit the channel.
+        assert!(matches!(
+            receiver.try_recv().expect("first response"),
+            StellarMessage::Transaction(_)
+        ));
+        assert!(receiver.try_recv().is_none(), "channel had capacity 1");
+
+        // The remaining two must be deferred, not dropped.
+        {
+            let deferred = app.tx_deferred_demand_responses.read().await;
+            assert_eq!(
+                deferred.get(&peer_id).map(|q| q.len()),
+                Some(2),
+                "undeliverable responses must be deferred"
+            );
+        }
+
+        // Drain the channel, then flush: both remaining txs must arrive.
+        app.flush_deferred_demand_responses().await;
+        assert!(matches!(
+            receiver.try_recv().expect("second response after flush"),
+            StellarMessage::Transaction(_)
+        ));
+        // Capacity 1: the third needs one more flush after the channel drains.
+        app.flush_deferred_demand_responses().await;
+        assert!(matches!(
+            receiver.try_recv().expect("third response after flush"),
+            StellarMessage::Transaction(_)
+        ));
+        let deferred = app.tx_deferred_demand_responses.read().await;
+        assert!(
+            deferred.is_empty(),
+            "deferred map must be empty after full drain"
+        );
+    }
+
+    /// Deferred responses whose tx has left the queue (applied/banned) are
+    /// skipped at flush time rather than sent.
+    #[tokio::test]
+    async fn test_flush_deferred_skips_txs_gone_from_queue() {
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+        let peer_id = make_peer_id(44);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 16);
+
+        // A hash that is not (or no longer) in the queue.
+        let gone = Hash256::from_bytes([0xBB; 32]);
+        app.tx_deferred_demand_responses
+            .write()
+            .await
+            .entry(peer_id.clone())
+            .or_default()
+            .push_back(gone);
+
+        app.flush_deferred_demand_responses().await;
+
+        assert!(receiver.try_recv().is_none(), "nothing must be sent");
+        assert!(
+            app.tx_deferred_demand_responses.read().await.is_empty(),
+            "stale entries must be pruned"
+        );
+    }
+
+    /// stellar-core parity (TxDemandsManager::demandStatus:71-74): a tx we
+    /// already have queued — or have banned — must never be demanded.
+    /// Regression: without this, fulfilled hashes cycled as RetryLater
+    /// through every peer's queue for the 60 s retention window, saturating
+    /// the demand queues under load.
+    #[tokio::test]
+    async fn test_demand_status_discards_owned_and_banned_txs() {
+        use std::collections::HashMap;
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let peer = make_peer_id(45);
+        let history: HashMap<Hash256, TxDemandHistory> = HashMap::new();
+        let now = std::time::Instant::now();
+
+        // Owned: in the tx queue.
+        let mut env = make_envelope(100, 1);
+        set_source(&mut env, 7);
+        let owned_hash = Hash256::hash_xdr(&env);
+        assert!(app.herder.tx_queue().insert_for_test(env));
+        assert!(matches!(
+            app.demand_status(owned_hash, &peer, now, &history),
+            DemandStatus::Discard
+        ));
+
+        // Banned.
+        let mut env_b = make_envelope(200, 1);
+        set_source(&mut env_b, 8);
+        let banned_hash = Hash256::hash_xdr(&env_b);
+        assert!(app.herder.tx_queue().insert_for_test(env_b));
+        app.herder.tx_queue().ban(&[banned_hash]);
+        assert!(matches!(
+            app.demand_status(banned_hash, &peer, now, &history),
+            DemandStatus::Discard
+        ));
+
+        // Unknown: still demanded.
+        let unknown = Hash256::from_bytes([0xCC; 32]);
+        assert!(matches!(
+            app.demand_status(unknown, &peer, now, &history),
+            DemandStatus::Demand
+        ));
     }
 }
