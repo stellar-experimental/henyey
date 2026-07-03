@@ -360,6 +360,58 @@ impl App {
                 }
             }
         }
+
+        self.log_stranded_tx_diag(&peer_ids).await;
+    }
+
+    /// Diagnostic (maxtps_tail): log the flood state of the oldest queued
+    /// transactions. A queued tx older than ~2 ledgers means the flood path
+    /// failed to deliver it to the rotating leaders — `sent_to` splits
+    /// "origin never adverted it" (0) from "adverted everywhere but the
+    /// demand/response side lost it" (== peers). Rate-limited to one scan
+    /// per 2 s; instrumentation only.
+    async fn log_stranded_tx_diag(&self, peer_ids: &[henyey_overlay::PeerId]) {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 2_000
+            || LAST_MS
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+
+        let aged = self
+            .herder
+            .tx_queue()
+            .sample_aged_txs(Duration::from_secs(8), 3);
+        if aged.is_empty() {
+            return;
+        }
+        let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+        for (hash, age_ms) in aged {
+            let sent_to = peer_ids
+                .iter()
+                .filter(|pid| {
+                    adverts_by_peer
+                        .get(*pid)
+                        .is_some_and(|a| a.seen_advert(&hash))
+                })
+                .count();
+            tracing::info!(
+                target: "maxtps_tail",
+                hash8 = %&hash.to_hex()[..16],
+                age_ms,
+                sent_to,
+                peers = peer_ids.len(),
+                "stranded queued tx"
+            );
+        }
     }
 
     /// Store carry-over budgets (capped) for the next flood period.
@@ -692,7 +744,20 @@ impl App {
         let entry = adverts_by_peer
             .entry(peer_id.clone())
             .or_insert_with(PeerTxAdverts::new);
-        entry.queue_incoming(&advert.tx_hashes.0, ledger_seq, max_ops);
+        let dropped = entry.queue_incoming(&advert.tx_hashes.0, ledger_seq, max_ops);
+        if dropped > 0 {
+            // A dropped pending demand is remembered-but-never-demanded: this
+            // peer will not re-advert it, so the tx is stranded on this node
+            // until another peer adverts it or advert history expires.
+            tracing::info!(
+                target: "maxtps_tail",
+                peer = %peer_id,
+                dropped,
+                batch = advert.tx_hashes.0.len(),
+                max_ops,
+                "advert demand-queue overflow"
+            );
+        }
     }
 
     pub(super) async fn handle_flood_demand(
