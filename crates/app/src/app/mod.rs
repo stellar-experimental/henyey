@@ -1893,7 +1893,30 @@ impl App {
         // Wire SCP state persistence so the app event loop's tx_set_gc timer
         // (lifecycle.rs, phase 33) has something to purge. Parity:
         // stellar-core `HerderImpl::startTxSetGCTimer()` (HerderImpl.cpp:2440).
-        let scp_persistence = henyey_herder::SqliteScpPersistence::new(db.clone());
+        //
+        // SCP crash-recovery state lives in a DEDICATED SQLite file (own WAL,
+        // own lock domain). On the shared main DB, the per-emit
+        // scp-persist-write transactions and the 60 s trim/purge cycle
+        // serialized against the ledger-close persist on SQLite's single WAL
+        // write lock — under full-window load the resulting lock convoy
+        // (scp-persist-write + maintenance-delete + wal-checkpoint) produced
+        // 30-60 s ledger closes and killed every canonical-window run (issue
+        // #3719, campaign-2 iter-1 forensics). SCP state is ephemeral
+        // (restart recovery only, bounded to MAX_SLOTS_TO_REMEMBER), so
+        // isolating it is parity-free; any pre-split rows left in the main
+        // DB's storestate are simply ignored.
+        let scp_db = if app_config.database.in_memory {
+            henyey_db::Database::open_in_memory().expect("open in-memory SCP persistence database")
+        } else {
+            let scp_path = app_config.database.path.with_extension("scp.db");
+            henyey_db::Database::open(&scp_path).unwrap_or_else(|e| {
+                panic!(
+                    "open dedicated SCP persistence database {}: {e}",
+                    scp_path.display()
+                )
+            })
+        };
+        let scp_persistence = henyey_herder::SqliteScpPersistence::new(scp_db);
         let scp_persistence_manager = Arc::new(henyey_herder::ScpPersistenceManager::new(
             Box::new(scp_persistence),
         ));
