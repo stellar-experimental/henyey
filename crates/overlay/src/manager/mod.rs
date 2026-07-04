@@ -2744,13 +2744,13 @@ pub(crate) mod tests {
     fn test_outbound_channel_capacity_propagates_from_connection_factory() {
         use crate::loopback::LoopbackConnectionFactory;
 
-        // TCP factory → default 256
+        // TCP factory → default 16384 (holds a full max-size ledger of txs)
         let config = OverlayConfig::default();
         let secret = SecretKey::generate();
         let local_node = LocalNode::new_testnet(secret.clone());
         let manager = OverlayManager::new(config.clone(), local_node).unwrap();
         let shared = manager.shared_state();
-        assert_eq!(shared.outbound_channel_capacity, 256);
+        assert_eq!(shared.outbound_channel_capacity, 16384);
 
         // Loopback factory → 2048
         let local_node2 = LocalNode::new_testnet(secret);
