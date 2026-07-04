@@ -3032,16 +3032,32 @@ impl App {
                 if !shift_result.reflooded_txs.is_empty() {
                     if let Some(overlay) = self.overlay().await {
                         let count = shift_result.reflooded_txs.len();
+                        // Delivery accounting: broadcast() returns how many
+                        // peers actually got the message; a systematically low
+                        // sent count means the push never leaves this node
+                        // (2026-07-04 forensics: doomed txs are banned ONLY on
+                        // their origin — peers never see them).
+                        let mut sent_min = usize::MAX;
+                        let mut sent_sum = 0usize;
                         for env in shift_result.reflooded_txs {
                             let msg = stellar_xdr::StellarMessage::Transaction(env);
-                            if let Err(e) = overlay.broadcast(msg).await {
-                                tracing::debug!(error = %e, "wedged-tx push failed");
+                            match overlay.broadcast(msg).await {
+                                Ok(sent) => {
+                                    sent_min = sent_min.min(sent);
+                                    sent_sum += sent;
+                                }
+                                Err(e) => {
+                                    sent_min = 0;
+                                    tracing::debug!(error = %e, "wedged-tx push failed");
+                                }
                             }
                         }
                         tracing::info!(
                             target: "maxtps_ban",
                             ledger_seq,
                             count,
+                            sent_min,
+                            sent_avg = sent_sum / count.max(1),
                             "pushed wedged pending txs to all peers"
                         );
                     }
