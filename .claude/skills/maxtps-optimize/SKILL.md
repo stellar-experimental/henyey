@@ -28,12 +28,12 @@ Supercluster `MissionMaxTPSClassic` on a single nsc 32×64 VM). One hypothesis
 per iteration: attribute the current binder → change → prove parity → measure
 → accept/reject → document → re-attribute.
 
-**Core is not the ceiling.** stellar-core's numbers (burst 1530 / sustained
-1522 on this rig) are a diagnostic reference, not the target. henyey's
-networking and apply stack are more parallel than core's single-threaded main
-loop; within the fixed overlay/SCP wire protocols henyey should be able to
-*beat* core. The run is done when the bottleneck is provably the simulated
-network itself — not any henyey code path.
+**Core is not the ceiling.** stellar-core's numbers (full-window [2400, 2700),
+5-min ~3018 @92k accounts on this rig, 2026-07-03) are a diagnostic reference,
+not the target. henyey's networking and apply stack are more parallel than
+core's single-threaded main loop; within the fixed overlay/SCP wire protocols
+henyey should be able to *beat* core. The run is done when the bottleneck is
+provably the simulated network itself — not any henyey code path.
 
 ## Autonomy contract (read first)
 
@@ -51,8 +51,8 @@ intervention.** Concretely:
   load → core-vs-henyey comparison — see the *Diagnosis escalation ladder*),
   which will produce one. Keep going until a Stop condition fires.
 - **Drive yourself across the long steps.** Image builds (~12 min) and mission
-  runs (~10 min short / ~25 min sustained) are long; launch them in the
-  background and use `ScheduleWakeup` to resume. The run-doc is your durable
+  runs (~10 min screens / ~25-30 min full-window gate) are long; launch them in
+  the background and use `ScheduleWakeup` to resume. The run-doc is your durable
   state — write enough to it each step that any resume can continue without
   operator input. Operator messages may arrive, but you must never *wait* for
   them.
@@ -61,15 +61,20 @@ intervention.** Concretely:
   "pause" — only at a true Stop condition (extend its duration if it nears
   expiry, or re-provision if it died).
 
-Baseline context (2026-07-03, post-PR #3712): henyey burst ≈ **1510** tx/s
-(measured *before* the WAL fix — re-measure first, it may be higher now) and
-sustained ∈ **[1400, 1450)**; stellar-core burst 1530 / sustained 1522 on the
-same instance class. The prior campaigns' root causes and refuted dead ends
-are in `docs/maxtps-optimization/2026-07-02-target2000.md`, PR #3712, and
-memory `project_maxtps_sustained_fix.md` — read them before re-chasing
-anything (laggard queues, leader-computation divergence, and validate-on-fetch
-cost are already refuted; WAL-checkpoint stalls and nomination fetch
-starvation are already fixed).
+Baseline context (2026-07-03, post-#3714..#3720 and the account-count
+experiments on issue #3719): with rate-scaled accounts, henyey's 5-min edge is
+**2156** tx/s (46k accounts) and burst ≥1673; its **full-window edge is
+< 1560** — every full-window run from 1560 to 2100 died at ~7-9 min on
+storestate write-volume compounding (`scp-persist-purge` WAL holds 21-34 s,
+24 s WAL checkpoints, an 87 s close). stellar-core on the same rig:
+full-window **[2400, 2700)**, 5-min ~3018 (92k accounts). ALL older
+23k-account numbers (henyey 1560 / core 1526 and earlier) are deprecated as
+account-cadence-bound — do not compare against them. Prior campaigns' root
+causes and refuted dead ends are in
+`docs/maxtps-optimization/2026-07-02-target2000.md`,
+`docs/maxtps-optimization/2026-07-03-frontier.md`, issue #3719's closing
+comment, and memory `project_maxtps_frontier_result.md` — read them before
+re-chasing anything.
 
 ## Hard constraints (non-negotiable)
 
@@ -84,9 +89,24 @@ starvation are already fixed).
    config, identical for core, and stays untouched so numbers remain comparable.
    TPS gains must come from fuller ledgers and tighter pipelines, not faster
    clocks.
+   - **Accounts scale with load** (2026-07-03, issue #3719): the genesis
+     account count encodes a hidden inclusion-latency SLO — each account
+     resubmits every `accounts/rate` seconds and PayPregenerated fatal-rejects
+     at ~2-3 ledgers pending. The old static 23000 corrupted every number
+     above ~1500 tx/s (core measured +98% once unbound). Set
+     `GENESIS_ACCOUNTS = MAX_TX_RATE × 26`, rounded UP to the nearest 1000
+     (≥4.7 ledgers of cadence slack at the window ceiling; sized to
+     `MAX_TX_RATE` because genesis happens once per network boot).
+   - **Cadence-artifact diagnostic**: a run-fatal
+     `pay_pregenerated fatal reject … pending_age=2-3` while ledgers are full
+     and closes are fast (~200 ms) is the account-cadence artifact, NOT a node
+     limit — raise accounts and re-measure before chasing code.
+   - **Comparability**: numbers are only comparable at the same account count
+     (and same instance). Record `GENESIS_ACCOUNTS` with every measurement;
+     the run-doc table has an `accounts` column.
 3. **One hypothesis per iteration + proof** — test exactly one mechanism at a
    time so the measured Δ is attributable, and keep a change only if it is
-   *proven* to give a meaningful gain (>5%, below, gated on sustained).
+   *proven* to give a meaningful gain (>5%, below, gated on the full window).
    - **Big swings are welcome.** The *change* can be as large and ambitious as
      the diagnosed bottleneck warrants — reworking a data structure, the
      flooding/queue path, a hot loop across crate boundaries, an async persist
@@ -103,9 +123,10 @@ starvation are already fixed).
    Missions run the validator profile; RPC-serving configurations keep full
    features. A profile switch alone is acceptable only with the async
    restructure also available for full-feature nodes.
-5. **Efficiency** — short probes to screen, sustained probes only to gate
-   accepts, one reused instance. Efficiency governs *load runs*; it does not
-   discourage image rebuilds for instrumentation or code changes.
+5. **Efficiency** — cheap probes screen (burst, then 5-min), the full-window
+   probe only gates accepts, one reused instance. Efficiency governs *load
+   runs*; it does not discourage image rebuilds for instrumentation or code
+   changes.
 
 ## Definition of done — the network-bound proof (frontier mode)
 
@@ -117,7 +138,7 @@ Frontier mode ends successfully when the run doc contains BOTH:
    provisioned instance, don't reuse old numbers. From it, derive the tx-byte
    ceiling estimate for the 23-node flood fan-out at the candidate rate
    (~200 B/payment × fan-out + tx-set fetch traffic + SCP traffic).
-2. **Cycle-time attribution at the edge.** At the highest passing sustained
+2. **Cycle-time attribution at the edge.** At the highest passing full-window
    rate AND one failing step above it, decompose the full ledger cycle —
    trigger → build_value → candidate fetch → validate → ballot → externalize
    → apply → persist → next trigger — using the in-tree telemetry
@@ -131,31 +152,39 @@ Frontier mode ends successfully when the run doc contains BOTH:
 
 ## Accept / reject bar
 
-`current_best` is the **sustained** number (5-min probe,
-`SSC_MAXTPS_TXS_MULTIPLIER=300`).
+`current_best` is the **full-window** sustained number
+(`SSC_MAXTPS_TXS_MULTIPLIER=1000`, the canonical ~16.7-min offer window).
 
-- **Screen** (cheap reject): one short-probe single step at
-  `SCREEN = ceil(current_best * 1.05)` (`SSC_MAXTPS_TXS_MULTIPLIER=60`,
-  `TX_RATE=SCREEN-7`, `MAX_TX_RATE=SCREEN+8`, `NUM_PREGEN=(SCREEN+8)*65`,
-  `SSC_LOADGEN_FASTFAIL_LEDGERS=10`). Fails → **reject immediately** (~2 min
-  spent). Never run a sustained probe for a change that can't clear the
-  short screen.
-- **Gate** (required for accept): screen passed → run the sustained single
-  step at the same level: `SSC_MAXTPS_TXS_MULTIPLIER=300`, `TX_RATE=X-7`,
-  `MAX_TX_RATE=X+8`, `NUM_PREGEN=(X+8)*305`, `SSC_LOADGEN_FASTFAIL_LEDGERS=10`
-  (~8 min pass / ~4 min fail after boot). **Accept iff the sustained step
-  passes** and the parity gate is green; then `current_best = X` and
-  optionally ladder upward (repeat single steps at +5%) while the image is
-  deployed.
+Every step below is a single step at `X = ceil(current_best * 1.05)`
+(`TX_RATE=X-7`, `MAX_TX_RATE=X+8`, `SSC_LOADGEN_FASTFAIL_LEDGERS=10`,
+`GENESIS_ACCOUNTS = MAX_TX_RATE × 26` rounded up to the nearest 1000):
+
+- **Screen 1 — burst** (cheap reject): `SSC_MAXTPS_TXS_MULTIPLIER=60`,
+  `NUM_PREGEN=(X+8)*65`. Fails → **reject immediately** (~2 min spent).
+- **Screen 2 — 5-min** (mid reject): burst passed →
+  `SSC_MAXTPS_TXS_MULTIPLIER=300`, `NUM_PREGEN=(X+8)*305` (~8 min pass /
+  ~4 min fail after boot). Fails → **reject** (~10 min spent). Never run the
+  full-window gate for a change that can't clear both screens.
+- **Accept gate — full window** (required for accept): both screens passed →
+  `SSC_MAXTPS_TXS_MULTIPLIER=1000`, `NUM_PREGEN=(X+8)*1005` (~25 min pass
+  incl. boot; failures typically show by ~7-15 min). **Accept iff the
+  full-window step passes** and the parity gate is green; then
+  `current_best = X` and optionally ladder upward (repeat at +5%) while the
+  image is deployed — ladder with the full-window step, since that is the
+  currency.
 - Single-step pass/fail near the edge is stochastic ±3-4%: compare only
-  same-instance A/B, and re-baseline `current_best` after any re-provision
-  (instance drift is a documented fact — see the 2026-07-02 run doc).
+  same-instance A/B at the same account count, and re-baseline `current_best`
+  after any re-provision (instance drift is a documented fact — see the
+  2026-07-02 run doc).
 - Rejected changes are reverted; parity-safe diagnostic instrumentation may
   stay.
 
-Why sustained-gated: the 2026-07-02 campaign proved short probes accept
-changes that die under sustained load (burst hides WAL compounding, backlog
-spirals, and wedge dynamics). The short probe is a screen, never an accept.
+Why full-window-gated: the 2026-07-02 campaign proved burst probes accept
+changes that die under sustained load, and the 2026-07-03 experiments proved
+the 5-min probe over-reports BOTH implementations — henyey rates that passed
+5-min gates (1560-2100) all died at ~7-9 min of the canonical window
+(storestate write compounding), and core drops ~20% (5-min ~3018 vs
+full-window [2400, 2700)). Shorter probes are screens, never accepts.
 
 ## Bottleneck attribution — how to pick the next hypothesis
 
@@ -240,7 +269,8 @@ lever — implement it (constraint 3), don't stop.
 4. **Launcher**: write `$RUN/run_mission.sh` from the template at the end of this
    skill (it wraps `dotnet … App.dll mission MaxTPSClassic` with the standard
    flags: `--install-network-delay false --core-http-via-pod-exec
-   --genesis-test-account-count 23000 --probe-timeout 240`).
+   --probe-timeout 240`, and `--genesis-test-account-count` driven by the
+   `GENESIS_ACCOUNTS` env var — always set it per the account-scaling rule).
 5. **Provision ONE nsc instance** for the whole run (reused across iterations):
    ```
    nsc instance create --ephemeral --enable=kubernetes:1.33 --machine_type 32x64 \
@@ -255,11 +285,14 @@ lever — implement it (constraint 3), don't stop.
    pod-to-pod throughput + RTT on THIS instance (`iperf3` between two pods or
    `dd | nc`); record in the run doc header.
 7. **Baseline measurement**: build + push the current-HEAD image and measure
-   BOTH burst (short probe) and sustained (5-min single steps upward from the
-   last known sustained bound). Tag `:opt-$SID-base`. Record sustained as
-   `current_best` and note the burst number and `base_commit`. Optionally run
-   the same-instance core reference (2×2: burst/sustained × core/henyey) when
-   the campaign's claims will be stated relative to core.
+   all three tiers — burst (MULT=60), 5-min (MULT=300), and full-window
+   (MULT=1000) — stepping upward from the last known full-window bound, with
+   `GENESIS_ACCOUNTS` scaled to each window's `MAX_TX_RATE`. Tag
+   `:opt-$SID-base`. Record the full-window number as `current_best`; note
+   burst + 5-min numbers and `base_commit` (they contextualize which tier a
+   later change moves). Optionally run the same-instance core reference at
+   matching account counts when the campaign's claims will be stated relative
+   to core.
 8. **Create the run doc** `docs/maxtps-optimization/<UTC-date>-frontier.md`
    (or `-target$TARGET.md`) from the template below; fill the header +
    baseline + the seeded hypothesis backlog (all `pending`).
@@ -285,12 +318,13 @@ hypothesis.
    ```
    The change MUST NOT alter observable output. If a parity/consistency test
    fails or any observable bytes change → **reject** now (revert), document, next.
-5. **Measure** — rebuild the image, deploy, screen (short) then gate
-   (sustained) per the Accept/reject bar.
+5. **Measure** — rebuild the image, deploy, run the two screens (burst,
+   5-min) then the full-window accept gate per the Accept/reject bar.
 6. **Decide & land**:
    - **Accept**: set `current_best`; mark `accepted`; commit on the branch and
      **open a PR**; rebuild the base image tag so the next iteration stacks on
-     top. Ladder upward while deployed to find the new sustained edge.
+     top. Ladder upward (full-window steps) while deployed to find the new
+     edge.
    - **Reject**: revert the behavior change (keep parity-safe diagnostics);
      mark `rejected`.
 7. **Document & re-attribute** — update the doc row; refresh the cycle
@@ -309,21 +343,25 @@ hypothesis.
    if a push 401s.)
 2. **Clear pods** between runs: `nsc kubectl "$INST" -n default delete statefulset --all`,
    wait until 0 pods.
-3. **Screen** (short probe single step at `ceil(current_best*1.05)`) — see
-   Accept/reject bar for the exact env. Fail → reject, done (~2 min).
-4. **Gate** (sustained single step at the same level) — see Accept/reject bar.
-   Pass → accept; then ladder single steps upward (+5% each) to find the new
-   sustained edge while the image is hot.
+3. **Screens** (burst then 5-min single steps at `ceil(current_best*1.05)`,
+   `GENESIS_ACCOUNTS` scaled) — see Accept/reject bar for the exact env.
+   Either fails → reject, done (~2-10 min).
+4. **Accept gate** (full-window single step at the same level) — see
+   Accept/reject bar. Pass → accept; then ladder full-window steps upward
+   (+5% each) to find the new edge while the image is hot.
 5. **Parse**: `grep -E "Found max|Run failed" "$RUN/mission-<label>.log"`.
    Artifacts (`artifacts-<label>/`) keep the LAST step's pod logs — run
    forensics per label; use distinct labels per rung so artifacts persist.
 6. **Health**: between polls, `nsc ssh "$INST" -- sh -c 'uptime; free -h | grep Mem; df -h / | tail -1'`
    (flag sustained load >28, mem-available <5Gi, disk >85%).
 
-Short-probe validation note: `SSC_MAXTPS_TXS_MULTIPLIER=60` (1-min offer
-window) reproduces the burst ceiling within ~2%; `SSC_LOADGEN_FASTFAIL_LEDGERS=10`
-cuts failing-step cost from ~3.5 min to ~1.9 min without changing the converged
-max. Sustained (MULT=300, 5-min) is the acceptance currency.
+Probe validation notes: `SSC_MAXTPS_TXS_MULTIPLIER=60` (1-min offer window)
+reproduces the burst ceiling within ~2%; MULT=300 (5-min) catches backlog
+spirals that burst hides but still over-reports vs the canonical window
+(2026-07-03: henyey 5-min-passing rates died at ~7-9 min; core -20%);
+`SSC_LOADGEN_FASTFAIL_LEDGERS=10` cuts failing-step cost without changing the
+converged max. The full window (MULT=1000, ~16.7 min) is the acceptance
+currency.
 
 ---
 
@@ -333,7 +371,7 @@ Per `AGENTS.md`/`CLAUDE.md`:
 ```
 git add <files> && git commit \
   -m "<imperative summary of the optimization>" \
-  -m "maxtps-optimize iter N: <hypothesis>; sustained <before>→<after> tx/s (+X%). Parity: <tests run>." \
+  -m "maxtps-optimize iter N: <hypothesis>; full-window sustained <before>→<after> tx/s (+X%). Parity: <tests run>." \
   -m "Co-authored-by: Claude Code <claude-code@anthropic.com>"
 git push -u origin HEAD
 gh pr create --repo stellar-experimental/henyey --base main --head <branch> \
@@ -351,63 +389,69 @@ so the next iteration measures on top of it.
    changes. If anything fails, the corresponding change is NOT parity-safe — open
    a revert/fix and note it.
 2. **Finalize the run doc**: summary table (all hypotheses + statuses),
-   cumulative gain (baseline → final, burst AND sustained), the list of opened
+   cumulative gain (baseline → final, burst AND full-window), the list of opened
    PRs, and — mandatory — the **final bottleneck attribution**: "network-bound:
    yes/no" with the evidence (calibration numbers + cycle decomposition at the
    edge). If not network-bound, name the binder for the next campaign.
 3. **Teardown**: `nsc instance destroy "$INST" --force` and verify it's gone
    (`nsc instance list`). Revert any uncommitted local harness patches.
-4. **Report** to the operator: baseline → final (burst + sustained), accepted vs
-   rejected count, PR URLs, the bottleneck attribution, and the top remaining
-   `pending` hypotheses.
+4. **Report** to the operator: baseline → final (burst + 5-min + full-window),
+   accepted vs rejected count, PR URLs, the bottleneck attribution, and the
+   top remaining `pending` hypotheses.
 
 ---
 
-## Seeded hypothesis backlog (2026-07-03)
+## Seeded hypothesis backlog (2026-07-03, post-#3719 experiments)
 
-Ordered; re-rank from evidence each iteration. Items 1-3 are the mandatory
+Ordered; re-rank from evidence each iteration. Items 1-2 are the mandatory
 opening moves.
 
-1. **(baseline, do first)** Re-measure burst + sustained on the post-#3712
-   image (burst 1510 predates the WAL fix and may rise), fresh same-instance
-   core 2×2 reference, and Phase-0 network calibration.
-2. **Per-tx persist off the close path** (top known binder; core has no
-   per-tx SQL at all): async background writer + `validator` config profile
-   that disables per-tx row storage; missions run the profile. The
-   whole-ledger `tx_history_entry`/`tx_result_entry` blobs and scphistory must
-   keep working (history publish reads them) — consider moving the entire
-   persist txn off-path behind an ordering guarantee. Files:
-   `crates/app/src/app/ledger_close.rs` (`serialize_and_write_to_db`),
-   `crates/db`.
+1. **(baseline, do first)** Full three-tier baseline (burst / 5-min /
+   full-window) with rate-scaled accounts on current HEAD, same-instance core
+   reference at matching account counts, and Phase-0 network calibration.
+2. **Overwrite-style SCP state persistence** (THE named full-window binder,
+   2026-07-03): henyey accumulates every slot's multi-MB candidate tx sets in
+   `storestate` and purges periodically; stellar-core overwrites ~2 rows per
+   slot parity. At 10k+ tx ledgers this compounds until `scp-persist-purge`
+   holds the WAL 21-34 s, passive checkpoints take 24 s, and a close takes
+   87 s (~7-9 min into every full-window run ≥1560 tx/s). The chunked purge
+   (PR #3720) bounds the lock holds but not the volume — redesign the
+   persistence shape (bounded slots, overwrite semantics, or off-WAL
+   storage). Forensics: issue #3719 closing comment, artifacts
+   `full-henyey{1560,1700,1950,2100}*`. Files:
+   `crates/db/src/scp_persistence.rs`, `crates/db/src/queries/scp.rs`,
+   `crates/herder/src/persistence.rs` (`persist_scp_state`).
 3. **Cycle-time attribution instrumentation** — the definition-of-done
    tooling: full trigger→…→next-trigger decomposition + veth byte/packet
-   counters, built on the existing `maxtps_*` targets.
-4. **Trigger-skew compensation** (core `HerderImpl::ledgerClosed` arms
-   `5s − (now − mLastTrigger)`): retest under the sustained gate. The old
-   burst-mode rejection (−1.1%, iter 2 of 2026-07-02) is within noise and
-   predates the WAL fix; residual apply-variance skew was still visible in the
-   final forensics.
-5. **Nomination pipeline latency**: `build_value` 130-250 ms + candidate fetch
-   ~150 ms are serialized post-trigger inside the 1 s round-1 budget.
-   Staleness-safe prebuild only (rebuild at trigger if the queue grew beyond a
-   threshold) — the naive prebuild is a documented #3638 liability, see revert
-   1afc810a.
-6. **Parallel apply**: execute disjoint-account classic payments in parallel
-   with bit-identical serial-equivalent results/meta/hashes (henyey's
-   structural advantage; core applies serially).
-7. **SCP intake/verify contention**: ~90 ms verify queueing at ballot bursts;
-   ~0.75 ms/envelope serial processing on the app loop.
-8. **Flood path throughput**: outbound batch coalescing (PR #3701),
-   demand-service unfulfilled counters, advert/demand cadence at 2k+ tx/s.
-9. **Queue/ban semantics under backlog**: open-loop applied-rate framing from
-   #3705; wedge dynamics above the ceiling (age-2 collisions are the loadgen
-   death mode).
+   counters, built on the existing `maxtps_*` targets (incl. `maxtps_tail`).
+4. **Nomination pipeline latency**: `build_value` + candidate fetch are
+   serialized post-trigger inside the 1 s round-1 budget. Staleness-safe
+   prebuild only — the naive prebuild is a documented #3638 liability, see
+   revert 1afc810a.
+5. **SCP intake/verify contention**: verify queueing at ballot bursts;
+   serial envelope processing on the app loop.
+6. **Trigger-skew compensation** (core `HerderImpl::ledgerClosed` arms
+   `5s − (now − mLastTrigger)`): retest under the full-window gate.
+7. **Per-tx inclusion turnaround** (submit→apply, currently ~2 ledgers
+   worst-case per seq-chain link): shrinking it raises the measurable ceiling
+   at any account count and helps real chained-submitter latency.
 
-Refuted dead ends — do NOT re-chase without new evidence: laggard per-node
-queues (cross-node spread ~4%), leader-computation divergence (symptom of
-trigger skew), tx-set validate-on-fetch cost (15-25 ms), raw-network limits
-at current rates (~950× byte headroom measured, but re-calibrate per
-instance), `tx_queue_banned` growth (benign by design).
+Resolved / refuted — do NOT re-chase without new evidence:
+- **Account-cadence wedge** (`pending_age=2-3` fatal with healthy ledgers) —
+  harness artifact, fixed by the account-scaling rule (issue #3719).
+- **Demand-path stranding** — fixed: owned/banned demand discard + deferred
+  responses (#3717), same-peer re-demand + send-failure unmark (#3718),
+  stale-pending self-heal (#3720).
+- **Per-tx SQL write volume** — removed on validators (#3714, #3716:
+  `store_rpc_data`); maintenance-delete WAL storm chunked (#3715).
+- **Apply-path optimizations** — operator directive 2026-07-03: do not
+  pursue (apply is ~200-400 ms of a 5 s cadence; highest parity risk).
+- Laggard per-node queues, leader-computation divergence, tx-set
+  validate-on-fetch cost, raw-network limits (~45× byte headroom measured
+  2026-07-03 — re-calibrate per instance), `tx_queue_banned` growth (benign).
+- Forensics gotcha: `sent_to` in the stranded-tx diag counts BIDIRECTIONAL
+  advert marks — peer echo-adverts prove the peers HAVE the tx, not that the
+  origin delivered it.
 
 ---
 
@@ -421,20 +465,22 @@ Create at `docs/maxtps-optimization/<UTC-date>-frontier.md`:
 - Session: <SID> · Instance: <INST> (nsc 32×64) · Base commit: <sha>
 - Network calibration: <throughput> / <RTT> pod-to-pod (measured this instance)
 - Methodology: MissionMaxTPSClassic, 23-node tier-1;
-  screen = short probe (MULT=60), accept gate = sustained (MULT=300, 5-min);
-  --install-network-delay false. Accept: Δ > 5% sustained + parity green.
-- **Current best (sustained): <N> tx/s** @ <commit/PR> · Burst: <B> tx/s
-- Core reference (same instance): burst <X> / sustained <Y>
+  screens = burst (MULT=60) then 5-min (MULT=300); accept gate = full window
+  (MULT=1000, ~16.7 min); GENESIS_ACCOUNTS = MAX_TX_RATE × 26 (round up to
+  1000); --install-network-delay false. Accept: Δ > 5% full-window + parity
+  green.
+- **Current best (full-window): <N> tx/s** @ <commit/PR> · 5-min: <M> · Burst: <B>
+- Core reference (same instance, matching accounts): full-window <X> / 5-min <Y>
 
 ## Hypotheses
 
-| # | hypothesis | evidence/instrumentation | burst | sustained | Δ vs best | status | notes / next |
-|---|------------|--------------------------|-------|-----------|-----------|--------|--------------|
-| 0 | baseline   | —                        | <B>   | <N>       | —         | —      | base image |
-| 1 | …          | …                        | …     | …         | …         | pending| … |
+| # | hypothesis | evidence/instrumentation | accounts | burst | 5-min | full-window | Δ vs best | status | notes / next |
+|---|------------|--------------------------|----------|-------|-------|-------------|-----------|--------|--------------|
+| 0 | baseline   | —                        | <A>      | <B>   | <M>   | <N>         | —         | —      | base image |
+| 1 | …          | …                        | …        | …     | …     | …           | …         | pending| … |
 
 ## Summary (filled at end)
-- Baseline → final: burst <A>→<B>, sustained <C>→<D> (+X%, M of K accepted)
+- Baseline → final: burst <A>→<B>, full-window <C>→<D> (+X%, M of K accepted)
 - PRs: #… , #…
 - **Bottleneck attribution: network-bound <yes/no>** — evidence: …
 - Top remaining pending hypotheses: …
@@ -449,7 +495,7 @@ Create at `docs/maxtps-optimization/<UTC-date>-frontier.md`:
 ```bash
 #!/usr/bin/env bash
 # Usage: run_mission.sh <IMAGE> <LABEL>   (env: TX_RATE MAX_TX_RATE NUM_PREGEN
-#   SSC_MAXTPS_TXS_MULTIPLIER SSC_LOADGEN_FASTFAIL_LEDGERS)
+#   GENESIS_ACCOUNTS SSC_MAXTPS_TXS_MULTIPLIER SSC_LOADGEN_FASTFAIL_LEDGERS)
 set -uo pipefail
 IMAGE="$1"; LABEL="$2"
 export PATH="$HOME/.dotnet:$HOME/.local/bin:$PATH"
@@ -462,7 +508,8 @@ dotnet "$SSC/src/App/bin/Release/net8.0/App.dll" mission MaxTPSClassic \
   --destination "$RUNDIR/artifacts-$LABEL" --core-http-via-pod-exec \
   --image "$IMAGE" --install-network-delay false --probe-timeout 240 \
   --tx-rate "${TX_RATE:-100}" --max-tx-rate "${MAX_TX_RATE:-300}" \
-  --num-pregenerated-txs "${NUM_PREGEN:-100000}" --genesis-test-account-count 23000
+  --num-pregenerated-txs "${NUM_PREGEN:-100000}" \
+  --genesis-test-account-count "${GENESIS_ACCOUNTS:?set per account-scaling rule}"
 ```
 (Point `SSC` at the built `vendor/supercluster` for whichever checkout has the
 release `App.dll`; the env vars `SSC_MAXTPS_TXS_MULTIPLIER` / `SSC_LOADGEN_FASTFAIL_LEDGERS`
@@ -477,8 +524,11 @@ are read by the harness process, so export them when invoking.)
   internal architecture / perf are free. Core is a reference, not a ceiling.
 - **Attribute first, then remove the named binder** — henyey-specific or
   shared, it counts if wire bytes and parity hold. Don't optimize on a hunch.
-- **Sustained is the acceptance currency.** Screen short (cheap reject), gate
-  sustained (5-min single step). Same-instance A/B only; re-baseline after any
+- **The full window is the acceptance currency.** Screen with burst then
+  5-min (cheap rejects — never accepts), gate with the full-window single step
+  (MULT=1000). Accounts scale with the probe rate (MAX_TX_RATE × 26); a
+  pending_age fatal with healthy ledgers = cadence artifact, raise accounts.
+  Same-instance A/B at the same account count only; re-baseline after any
   re-provision.
 - One hypothesis per iteration for clean attribution; **big swings welcome**
   but commits atomic/minimal — one accepted optimization = one focused PR.
