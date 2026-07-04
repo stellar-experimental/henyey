@@ -8455,8 +8455,10 @@ mod tests {
         };
         let manager = LedgerManager::new("Test SDF Network ; September 2015".to_string(), config);
 
-        // Before initialize, bucket list has no config
-        assert!(manager.bucket_list.read().bucket_list_db_config().is_none());
+        // The config is installed at construction (genesis-boot nodes never
+        // pass through initialize/catchup — 2026-07-04 fix), and initialize
+        // must re-apply it to the incoming bucket list.
+        assert!(manager.bucket_list.read().bucket_list_db_config().is_some());
 
         // Initialize with empty bucket lists
         let header = create_genesis_header();
@@ -8510,9 +8512,11 @@ mod tests {
             128
         );
 
-        // Reset clears everything
+        // Reset re-installs the config on the fresh bucket list (2026-07-04
+        // fix: genesis-boot and reset paths must not lose it, or account
+        // caches silently stay disabled).
         manager.reset();
-        assert!(manager.bucket_list.read().bucket_list_db_config().is_none());
+        assert!(manager.bucket_list.read().bucket_list_db_config().is_some());
 
         // Re-initialize should re-apply config
         manager
