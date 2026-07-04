@@ -3117,13 +3117,17 @@ impl TransactionQueue {
                 // (TryAgainLater) and a PayPregenerated load-run insta-fails.
                 // Re-marking is cheap and precise: the per-peer advert history
                 // ensures only peers that never received the advert get it.
-                // Fires at ages 1 and 3 (once per level): age-2-only left
-                // under 2 ledgers between rescue and the age-4 ban — the
-                // 2026-07-04 traces show fresh txs starving in the flood
-                // queue for 3+ ledgers (sent_to=0) at ≥1930 tx/s, and the
-                // single push rescued too late for a handful of txs per run,
-                // wedging their accounts' seq chains (~1,200 lost txs / 2M).
-                if state.age == 1 || state.age == 3 {
+                // Fires at ages 2 and 3 (once per level). Age 2 is the proven
+                // rescue point (~1.4k pushes/ledger at 2000 tx/s); age 3 is a
+                // last-chance retry one ledger before the age-4 ban — the
+                // 2026-07-04 traces show fresh txs starving in the equal-fee
+                // flood queue for 3+ ledgers (sent_to=0), and the age-2-only
+                // push rescued too late for a handful of txs per 2M-tx run,
+                // wedging their accounts' seq chains. Age 1 must NOT push:
+                // ~50% of txs sit one ledger at sustained max (normal
+                // latency), and pushing them amplified flood traffic ~6x and
+                // choked the network into mass age-outs (iter-15 regression).
+                if state.age == 2 || state.age == 3 {
                     store.flood_queue.mark_for_flood(queued_tx, ledger_version);
                     // Also hand the full envelope to the caller for a DIRECT
                     // push to every peer: re-advertising alone cannot recover
@@ -11061,12 +11065,14 @@ mod broadcast_visitor_tests {
     }
 
     /// Sustain fix: a pending tx that ages without applying is re-marked for
-    /// flooding by `shift()` at ages 1 and 3 (once per level), so a tx whose
-    /// first advert was lost or starved is rescued well before the 4-ledger
-    /// auto-ban (2026-07-04: age-2-only rescue was too late for a handful of
-    /// txs per multi-million-tx run, wedging their accounts' seq chains).
+    /// flooding by `shift()` at ages 2 and 3 (once per level), so a tx whose
+    /// first advert was lost or starved is rescued before the 4-ledger
+    /// auto-ban. Age 1 must NOT re-flood: one ledger of latency is normal at
+    /// sustained max load, and pushing there amplifies flood traffic ~6x
+    /// (2026-07-04 iter-15 regression: mass age-outs from the self-inflicted
+    /// storm).
     #[test]
-    fn test_shift_refloods_pending_tx_at_ages_one_and_three() {
+    fn test_shift_refloods_pending_tx_at_ages_two_and_three() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
@@ -11084,20 +11090,20 @@ mod broadcast_visitor_tests {
         let (entries, _) = visit_all_processed(&queue, 100, None);
         assert!(entries.is_empty(), "flood queue drained after first visit");
 
-        // Age 1: re-marked for flooding (first rescue).
+        // Age 1: normal latency — must NOT re-flood.
         let shift1 = queue.shift();
-        assert_eq!(shift1.reflooded_txs.len(), 1, "age 1 must re-flood");
+        assert!(shift1.reflooded_txs.is_empty(), "age 1 must not re-flood");
         let (entries, _) = visit_all_processed(&queue, 100, None);
-        assert_eq!(entries.len(), 1, "age 1 re-marks the pending tx");
+        assert!(entries.is_empty(), "age 1 must not re-mark");
+
+        // Age 2: first rescue.
+        let shift2 = queue.shift();
+        assert_eq!(shift2.reflooded_txs.len(), 1, "age 2 must re-flood");
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert_eq!(entries.len(), 1, "age 2 re-marks the pending tx");
         assert_eq!(entries[0].hash, hash);
 
-        // Age 2: no repeat between rescue levels.
-        let shift2 = queue.shift();
-        assert!(shift2.reflooded_txs.is_empty(), "age 2 must not re-flood");
-        let (entries, _) = visit_all_processed(&queue, 100, None);
-        assert!(entries.is_empty(), "age 2 must not re-mark");
-
-        // Age 3: second rescue, one ledger before the age-4 auto-ban.
+        // Age 3: last-chance retry, one ledger before the age-4 auto-ban.
         let shift3 = queue.shift();
         assert_eq!(shift3.reflooded_txs.len(), 1, "age 3 must re-flood");
         let (entries, _) = visit_all_processed(&queue, 100, None);
