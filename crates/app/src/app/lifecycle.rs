@@ -165,6 +165,21 @@ where
 ///
 /// Mirrors stellar-core: OverlayManagerImpl.cpp:1231-1236 — `forgetFloodedMsg`
 /// is called when the add result is NOT `ADD_STATUS_PENDING` or `ADD_STATUS_DUPLICATE`.
+/// Static label for the receive-result metric/log (diagnostic only).
+fn tx_receive_result_label(result: &henyey_herder::TxQueueResult) -> &'static str {
+    use henyey_herder::TxQueueResult;
+    match result {
+        TxQueueResult::Added => "added",
+        TxQueueResult::Duplicate => "duplicate",
+        TxQueueResult::QueueFull => "queue_full",
+        TxQueueResult::FeeTooLow => "fee_too_low",
+        TxQueueResult::Invalid(_) => "invalid",
+        TxQueueResult::Banned => "banned",
+        TxQueueResult::Filtered => "filtered",
+        TxQueueResult::TryAgainLater => "try_again_later",
+    }
+}
+
 fn should_forget_tx_flood_record(result: &henyey_herder::TxQueueResult) -> bool {
     use henyey_herder::TxQueueResult;
     match result {
@@ -1872,6 +1887,33 @@ impl App {
                         overlay.forget_flooded_msg(&flood_msg_hash);
                     }
                 }
+                // Receive-result distribution: names the rejection that eats
+                // re-pushed stranded txs (age-2 wedged-tx bodies systematically
+                // fail to enter ANY peer queue — 2026-07-04 forensics).
+                metrics::counter!(
+                    "henyey_overlay_tx_receive_result_total",
+                    "result" => tx_receive_result_label(&result)
+                )
+                .increment(1);
+                if !matches!(
+                    result,
+                    henyey_herder::TxQueueResult::Added | henyey_herder::TxQueueResult::Duplicate
+                ) {
+                    // Sampled 1/64: late flood copies of already-included txs
+                    // legitimately return Banned at high volume; the counter
+                    // above carries exact totals.
+                    static REJECT_SAMPLE: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if REJECT_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+                        tracing::warn!(
+                            target: "maxtps_ban",
+                            hash8 = %&tx_hash.to_hex()[..16],
+                            peer = %msg.from_peer,
+                            result = tx_receive_result_label(&result),
+                            "flooded tx rejected by local queue (sampled 1/64)"
+                        );
+                    }
+                }
                 match result {
                     henyey_herder::TxQueueResult::Added => {
                         tracing::debug!(peer = %msg.from_peer, "Transaction added to queue");
@@ -2904,7 +2946,22 @@ impl App {
 
         // Hand off to Herder for gate recheck + self-message skip +
         // non-quorum reject + slot_quorum_tracker + prefetch + pending.add.
+        let herder_t0 = std::time::Instant::now();
         let (envelope_result, reason) = self.herder.process_verified(ve);
+        // [maxtps_scp] campaign-2 iter-3: single scp_verified branch calls
+        // were observed blocking the event loop for 18+ s at the full-window
+        // edge — attribute whether the stall is inside the herder call.
+        let herder_ms = herder_t0.elapsed().as_millis() as u64;
+        if herder_ms > 1_000 {
+            tracing::info!(
+                target: "maxtps_scp",
+                slot,
+                herder_ms,
+                is_externalize,
+                result = ?envelope_result,
+                "slow_process_verified"
+            );
+        }
 
         // Per-reason post-verify metric.
         self.record_post_verify_reason(reason);

@@ -14,11 +14,20 @@ pub trait ConnectionFactory: Send + Sync {
     ///
     /// Controls the mpsc channel size between the overlay manager and each
     /// peer's send loop. When the channel is full, `broadcast()` and
-    /// `try_send_to()` drop messages (logged + counted). OverLoopback
-    /// overrides this to a larger value because app-backed simulation nodes
-    /// drain the channel more slowly than production TCP peers.
+    /// `try_send_to()` drop messages (logged + counted).
+    ///
+    /// Sized to hold a full max-size ledger of transaction messages plus
+    /// SCP/advert/demand overhead. stellar-core's FlowControl allows up to
+    /// `getLastMaxTxSetSizeOps()` queued TRANSACTION messages per peer
+    /// (12,600 at the mission tx-set cap) and NEVER capacity-drops SCP
+    /// messages (FlowControl.cpp:476-542). The previous 256 was ~50x below
+    /// core's allowance: at ~2000 tx/s sustained (13.5k-tx ledgers) every
+    /// node dropped thousands of broadcasts per minute ("Broadcast
+    /// backpressure" warns), silently losing submitted txs — the 2026-07-04
+    /// campaign-2 ceiling at 2000 tx/s. Memory is bounded lazily (tokio mpsc
+    /// does not preallocate): worst case ~16k x ~400 B = ~6.5 MB per peer.
     fn outbound_channel_capacity(&self) -> usize {
-        256
+        16384
     }
 }
 
@@ -42,8 +51,10 @@ mod tests {
     use crate::loopback::LoopbackConnectionFactory;
 
     #[test]
-    fn test_tcp_outbound_channel_capacity_is_256() {
-        assert_eq!(TcpConnectionFactory.outbound_channel_capacity(), 256);
+    fn test_tcp_outbound_channel_capacity_holds_max_ledger() {
+        // Must hold a full max-size ledger of tx broadcasts (12,600 ops at
+        // the mission cap) plus SCP/advert overhead — see method docs.
+        assert!(TcpConnectionFactory.outbound_channel_capacity() >= 16384);
     }
 
     #[test]

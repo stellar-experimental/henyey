@@ -433,6 +433,38 @@ impl TxSetTracker {
         before - self.cache.len()
     }
 
+    /// Evict cached tx sets outside `[min_slot, max_slot]`, preserving
+    /// unknown-slot entries (`slot: None`) and `keep_slot`.
+    ///
+    /// Parity: stellar-core `PendingEnvelopes::eraseOutsideRange`
+    /// (PendingEnvelopes.cpp:790-796): `mTxSetCache.erase_if` keeps slot 0
+    /// (unknown, loaded from database) and `slotToKeep`, and evicts entries
+    /// with `slot < minSlot` or `slot > maxSlot`.
+    /// Returns the number of entries evicted.
+    pub fn evict_cached_outside_range(
+        &self,
+        min_slot: Option<u64>,
+        max_slot: Option<u64>,
+        keep_slot: u64,
+    ) -> usize {
+        let before = self.cache.len();
+        self.cache.retain(|_, entry| match entry.slot {
+            None => true,
+            Some(s) => {
+                s == keep_slot
+                    || !(min_slot.is_some_and(|m| s < m) || max_slot.is_some_and(|m| s > m))
+            }
+        });
+        before - self.cache.len()
+    }
+
+    /// Slot provenance of a cached tx set: `None` = not cached,
+    /// `Some(None)` = cached with unknown slot, `Some(Some(s))` = cached at `s`.
+    #[cfg(test)]
+    pub(crate) fn cached_slot(&self, hash: &Hash256) -> Option<Option<u64>> {
+        self.cache.get(hash).map(|entry| entry.slot)
+    }
+
     /// Evict cached tx sets with a known slot > `max_slot`.
     /// Entries with `slot: None` are preserved (unknown-slot sentinel).
     /// Parity: stellar-core `PendingEnvelopes::eraseOutsideRange` evicts tx-set
@@ -1402,6 +1434,53 @@ mod tests {
         // Touch with None → should keep 20
         assert!(tracker.is_cached_and_touch_slot(&hash, None));
         assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+    }
+
+    #[test]
+    fn test_evict_cached_outside_range_core_parity() {
+        let tracker = TxSetTracker::new(256);
+
+        // Unknown-slot entry (direct store) — always preserved (core slot-0 rule).
+        let ts_none = make_tx_set(80);
+        let hash_none = *ts_none.hash();
+        tracker.store(ts_none);
+
+        // Slotted entries: 20 (old), 64 (checkpoint keep), 60 (in window), 200 (future).
+        for (seed, slot) in [(81u8, 20u64), (82, 64), (83, 60), (84, 200)] {
+            let ts = make_tx_set(seed);
+            let hash = *ts.hash();
+            tracker.request(hash, slot);
+            tracker.receive(ts);
+        }
+
+        // Window [54, 150], keep_slot 64 (outside-lower would not apply to 64 anyway;
+        // use keep below min to prove precedence next).
+        let evicted = tracker.evict_cached_outside_range(Some(54), Some(150), 64);
+        assert_eq!(
+            evicted, 2,
+            "slot 20 (below min) and 200 (above max) evicted"
+        );
+        assert!(tracker.is_cached(&hash_none), "unknown-slot preserved");
+        assert!(
+            tracker.is_cached(make_tx_set(83).hash()),
+            "in-window preserved"
+        );
+        assert!(
+            tracker.is_cached(make_tx_set(82).hash()),
+            "keep_slot preserved"
+        );
+
+        // keep_slot below min is still preserved (core slotToKeep precedence).
+        let ts_old_keep = make_tx_set(85);
+        let hash_old_keep = *ts_old_keep.hash();
+        tracker.request(hash_old_keep, 30);
+        tracker.receive(ts_old_keep);
+        let evicted = tracker.evict_cached_outside_range(Some(54), Some(150), 30);
+        assert_eq!(evicted, 0);
+        assert!(
+            tracker.is_cached(&hash_old_keep),
+            "keep_slot below min_slot preserved"
+        );
     }
 
     #[test]

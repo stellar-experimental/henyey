@@ -1224,7 +1224,23 @@ impl Herder {
         let Some(manager) = self.scp_persistence.get() else {
             return;
         };
-        if let Err(e) = manager.purge_unreferenced_tx_sets() {
+        // Trim persisted slot STATES below the remember horizon before
+        // purging tx sets. Without this, every slot state since boot stays
+        // persisted, its tx-set references never expire, and the purge can
+        // never delete them — storestate grows without bound and the purge
+        // scan itself becomes a multi-second WAL hold (the full-window
+        // sustained binder, issue #3719). stellar-core bounds this
+        // structurally: slot states live in a MAX_SLOTS_TO_REMEMBER+1 row
+        // ring (`slot % (N+1)`, PersistentState::setSCPStateForSlot), so old
+        // references vanish by overwrite. Trimming to the same horizon keeps
+        // restore-on-restart semantics equivalent to core's ring.
+        let min_slot = u64::from(self.tracking_consensus_ledger_index().as_u32())
+            .saturating_sub(MAX_SLOTS_TO_REMEMBER);
+        if min_slot > 0 {
+            if let Err(e) = manager.cleanup(min_slot) {
+                error!(error = %e, min_slot, "Failed to clean up persisted SCP state");
+            }
+        } else if let Err(e) = manager.purge_unreferenced_tx_sets() {
             error!(error = %e, "Failed to purge unreferenced persisted tx sets");
         }
     }
@@ -2525,7 +2541,20 @@ impl Herder {
                 // Route based on slot eligibility.
                 if slot <= self.tracking_slot().get() {
                     debug!(slot, "Envelope ready, processing through SCP");
+                    // [maxtps_scp] campaign-2 iter-3: attribute 18+ s
+                    // scp_verified stalls — is the SCP machine drive the
+                    // blocking segment?
+                    let scp_t0 = std::time::Instant::now();
                     let scp_result = self.process_scp_envelope_with_tx_set(envelope_clone);
+                    let scp_ms = scp_t0.elapsed().as_millis() as u64;
+                    if scp_ms > 1_000 {
+                        tracing::info!(
+                            target: "maxtps_scp",
+                            slot,
+                            scp_ms,
+                            "slow_scp_machine_drive"
+                        );
+                    }
                     // Pop the duplicate from ready queue to prevent later
                     // double-processing by process_ready_fetching_envelopes.
                     // Use pop_from_slot (not pop) to avoid accidentally popping
@@ -3410,14 +3439,14 @@ impl Herder {
             .erase_outside_range(min_slot, max_slot, keep_slot);
 
         // Evict cached tx sets outside the valid slot range in scp_driver.
-        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange (line 726-731)
-        // also prunes the tx-set cache for entries outside [min, max].
-        // The lower bound is already handled by purge_slots_below / trim_stale_caches;
-        // this covers the upper bound so far-future slot touches cannot pin tx-sets
-        // indefinitely outside the active window.
-        if let Some(max) = max_slot {
-            self.scp_driver.evict_cached_above(max);
-        }
+        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange
+        // (PendingEnvelopes.cpp:790-796) prunes mTxSetCache on BOTH bounds at
+        // every newSlotExternalized, keeping slot-0 (unknown) and slotToKeep.
+        // The lower bound MUST run here on the live path: before 2026-07-04
+        // the only below-prune ran on catchup, so under load the cache grew
+        // ~16 MB/ledger unbounded (campaign-2 OOM leak).
+        self.scp_driver
+            .evict_cached_outside_range(min_slot, max_slot, keep_slot);
 
         // Clean up old data
         self.cleanup();
@@ -4572,7 +4601,19 @@ impl Herder {
     /// `spawn_blocking` tasks serialize correctly.
     fn cache_tx_set(&self, tx_set: TransactionSet) {
         let hash = *tx_set.hash();
-        self.scp_driver.cache_tx_set(tx_set);
+        // Stamp slot provenance (the slot SCP is working on) so the per-close
+        // range prune in `ledger_closed` can evict this set once it leaves the
+        // remembered window. Slot 0 (boot/syncing) keeps the unknown-slot
+        // sentinel — mirroring stellar-core's slot-0 rule for tx sets loaded
+        // from the database (PendingEnvelopes.cpp:789-791). Without provenance
+        // these entries survive every slot-range prune and the cache grows
+        // ~16 MB/ledger unbounded under load (2026-07-04 campaign-2 leak).
+        let slot = self.tracking_slot().get();
+        if slot == 0 {
+            self.scp_driver.cache_tx_set(tx_set);
+        } else {
+            self.scp_driver.cache_tx_set_with_slot(tx_set, slot);
+        }
 
         // Resolve any deferred slots that were waiting for this tx_set.
         // When MaybeValidDeferred clears fully_validated, the validator
@@ -4587,8 +4628,6 @@ impl Herder {
             self.scp.restore_slot_fully_validated(slot);
         }
 
-        let slot = self.tracking_slot();
-        let _ = slot; // slot no longer needed for notification
         self.fetching_envelopes.on_tx_set_accepted(&hash);
     }
 
@@ -9922,6 +9961,53 @@ mod tests {
         assert!(
             !manager.has_tx_set(&orphan_hash).unwrap(),
             "orphan tx set must be purged"
+        );
+    }
+
+    /// #3719 storestate-growth regression: the live GC entry point must trim
+    /// persisted slot STATES below the remember horizon (tracking − 12,
+    /// mirroring core's MAX_SLOTS_TO_REMEMBER ring) so old tx-set references
+    /// expire and their tx sets become purgeable. Pre-fix, slot states
+    /// accumulated forever and storestate grew without bound.
+    #[test]
+    fn test_purge_persisted_tx_sets_trims_old_slot_states() {
+        let herder = make_test_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let old_hash = stellar_xdr::Hash([3u8; 32]);
+        let recent_hash = stellar_xdr::Hash([4u8; 32]);
+
+        let old_env = make_persist_envelope_with_tx_set_hash(100, old_hash.clone());
+        manager
+            .persist_scp_state(100, &[old_env], &[(old_hash.clone(), vec![1])], &[])
+            .expect("persist old slot");
+        let recent_env = make_persist_envelope_with_tx_set_hash(119, recent_hash.clone());
+        manager
+            .persist_scp_state(119, &[recent_env], &[(recent_hash.clone(), vec![2])], &[])
+            .expect("persist recent slot");
+
+        // Tracking at 120 → remember horizon = 108: slot 100 is stale,
+        // slot 119 is live.
+        herder.bootstrap(120);
+        herder.purge_persisted_tx_sets();
+
+        assert!(
+            !manager.has_tx_set(&old_hash).unwrap(),
+            "tx set referenced only by a below-horizon slot state must be purged"
+        );
+        assert!(
+            manager.has_tx_set(&recent_hash).unwrap(),
+            "tx set referenced by a live slot state must be retained"
+        );
+        let restored = manager.restore_scp_state().expect("restore");
+        assert!(
+            restored.envelopes.iter().all(|(slot, _)| *slot >= 108),
+            "restore must not resurrect below-horizon slot states"
+        );
+        assert!(
+            restored.envelopes.iter().any(|(slot, _)| *slot == 119),
+            "live slot state must survive the trim"
         );
     }
 
@@ -15683,6 +15769,94 @@ mod fetching_envelopes_routing_tests {
         assert!(
             herder.fetching_envelopes.slots.read().contains_key(&64),
             "slot 64 preserved (checkpoint keep_slot and within range)"
+        );
+    }
+
+    /// Regression test for the campaign-2 memory leak (2026-07-04): cached
+    /// tx sets must be pruned outside `[min_slot, max_slot]` on every LIVE
+    /// ledger close. Before the fix, the only lower-bound prune ran on the
+    /// catchup path, so at ~7k tx/ledger the cache grew ~16 MB/ledger
+    /// unbounded until the host OOM'd (23-node mission, 64 GB exhausted at
+    /// ~minute 12 of every full-window run).
+    #[test]
+    fn test_ledger_closed_prunes_stale_cached_tx_sets() {
+        let herder = make_test_herder();
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 66;
+        }
+        // min_ledger_seq = 54, keep_slot (checkpoint) = 64 — see
+        // test_ledger_closed_checkpoint_preserved_at_boundary for the math.
+
+        // Old candidate (slot 20 < min 54, != keep) — must be evicted.
+        let ts_old = TransactionSet::new(Hash256::from_bytes([201; 32]), Vec::new());
+        let hash_old = *ts_old.hash();
+        herder.scp_driver.cache_tx_set_with_slot(ts_old, 20);
+        // Checkpoint set (slot 64 == keep_slot) — preserved.
+        let ts_keep = TransactionSet::new(Hash256::from_bytes([202; 32]), Vec::new());
+        let hash_keep = *ts_keep.hash();
+        herder.scp_driver.cache_tx_set_with_slot(ts_keep, 64);
+        // In-window set (slot 60 >= 54) — preserved.
+        let ts_in = TransactionSet::new(Hash256::from_bytes([203; 32]), Vec::new());
+        let hash_in = *ts_in.hash();
+        herder.scp_driver.cache_tx_set_with_slot(ts_in, 60);
+
+        herder.ledger_closed(65, &[], &[], 0);
+
+        assert!(
+            !herder.scp_driver.has_tx_set(&hash_old),
+            "stale cached tx set (slot 20 < min 54) must be evicted on live close"
+        );
+        assert!(
+            herder.scp_driver.has_tx_set(&hash_keep),
+            "checkpoint keep_slot tx set preserved"
+        );
+        assert!(
+            herder.scp_driver.has_tx_set(&hash_in),
+            "in-window tx set preserved"
+        );
+    }
+
+    /// Companion to the leak fix: own-built candidates must carry slot
+    /// provenance (tracking slot), otherwise they are unknown-slot entries
+    /// that survive every slot-range prune forever.
+    #[test]
+    fn test_cache_tx_set_stores_tracking_slot_provenance() {
+        let herder = make_test_herder();
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 66;
+        }
+
+        let ts = TransactionSet::new(Hash256::from_bytes([204; 32]), Vec::new());
+        let hash = *ts.hash();
+        herder.cache_tx_set(ts);
+
+        assert_eq!(
+            herder.scp_driver.cached_tx_set_slot(&hash),
+            Some(Some(66)),
+            "own-built candidate must be cached with tracking-slot provenance"
+        );
+    }
+
+    /// Boot-time tx sets (tracking slot 0, e.g. restored from the database)
+    /// keep the unknown-slot sentinel — mirroring stellar-core's slot-0 rule.
+    #[test]
+    fn test_cache_tx_set_boot_keeps_unknown_slot() {
+        let herder = make_test_herder();
+
+        let ts = TransactionSet::new(Hash256::from_bytes([205; 32]), Vec::new());
+        let hash = *ts.hash();
+        herder.cache_tx_set(ts);
+
+        assert_eq!(
+            herder.scp_driver.cached_tx_set_slot(&hash),
+            Some(None),
+            "boot-time (slot 0) tx sets keep the unknown-slot sentinel"
         );
     }
 

@@ -3117,8 +3117,17 @@ impl TransactionQueue {
                 // (TryAgainLater) and a PayPregenerated load-run insta-fails.
                 // Re-marking is cheap and precise: the per-peer advert history
                 // ensures only peers that never received the advert get it.
-                // Exactly-once per age level (fires on the 2→ transition).
-                if state.age == 2 {
+                // Fires at ages 2 and 3 (once per level). Age 2 is the proven
+                // rescue point (~1.4k pushes/ledger at 2000 tx/s); age 3 is a
+                // last-chance retry one ledger before the age-4 ban — the
+                // 2026-07-04 traces show fresh txs starving in the equal-fee
+                // flood queue for 3+ ledgers (sent_to=0), and the age-2-only
+                // push rescued too late for a handful of txs per 2M-tx run,
+                // wedging their accounts' seq chains. Age 1 must NOT push:
+                // ~50% of txs sit one ledger at sustained max (normal
+                // latency), and pushing them amplified flood traffic ~6x and
+                // choked the network into mass age-outs (iter-15 regression).
+                if state.age == 2 || state.age == 3 {
                     store.flood_queue.mark_for_flood(queued_tx, ledger_version);
                     // Also hand the full envelope to the caller for a DIRECT
                     // push to every peer: re-advertising alone cannot recover
@@ -3136,6 +3145,27 @@ impl TransactionQueue {
                     if let Some(newest) = banned.back_mut() {
                         newest.insert(queued_tx.hash);
                     }
+                    // Rare terminal event (a handful per multi-million-tx load
+                    // run) and the head of every wedged-account chain in
+                    // pregenerated load: once banned here, nothing resubmits
+                    // the tx and the account's later seqs can never apply.
+                    // WARN with identifiers so cross-node forensics can trace
+                    // the dissemination failure that let it age out.
+                    tracing::warn!(
+                        target: "maxtps_ban",
+                        hash = %queued_tx.hash,
+                        source_account_key8 = %account_key
+                            .iter()
+                            .take(8)
+                            .fold(String::new(), |mut s, b| {
+                                use std::fmt::Write;
+                                let _ = write!(s, "{b:02x}");
+                                s
+                            }),
+                        seq = envelope_sequence_number(&queued_tx.envelope),
+                        age = state.age,
+                        "auto-ban: pending tx aged out without inclusion"
+                    );
                     // Remove from store and track for seen cleanup
                     store.remove(&queued_tx.hash, ledger_version);
                     evicted_hashes.push(queued_tx.hash);
@@ -11034,12 +11064,15 @@ mod broadcast_visitor_tests {
         assert_eq!(budget.ops_remaining, 0);
     }
 
-    /// Sustain fix: a pending tx that ages 2 ledgers without applying is
-    /// re-marked for flooding by `shift()` — exactly once, on the 2→
-    /// transition — so a tx whose first advert was lost is not stranded on
-    /// the submitting node until the 4-ledger auto-ban.
+    /// Sustain fix: a pending tx that ages without applying is re-marked for
+    /// flooding by `shift()` at ages 2 and 3 (once per level), so a tx whose
+    /// first advert was lost or starved is rescued before the 4-ledger
+    /// auto-ban. Age 1 must NOT re-flood: one ledger of latency is normal at
+    /// sustained max load, and pushing there amplifies flood traffic ~6x
+    /// (2026-07-04 iter-15 regression: mass age-outs from the self-inflicted
+    /// storm).
     #[test]
-    fn test_shift_refloods_pending_tx_at_age_two() {
+    fn test_shift_refloods_pending_tx_at_ages_two_and_three() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
@@ -11057,21 +11090,24 @@ mod broadcast_visitor_tests {
         let (entries, _) = visit_all_processed(&queue, 100, None);
         assert!(entries.is_empty(), "flood queue drained after first visit");
 
-        // Age 1: not re-flooded yet.
-        queue.shift();
+        // Age 1: normal latency — must NOT re-flood.
+        let shift1 = queue.shift();
+        assert!(shift1.reflooded_txs.is_empty(), "age 1 must not re-flood");
         let (entries, _) = visit_all_processed(&queue, 100, None);
-        assert!(entries.is_empty(), "age 1 must not re-flood");
+        assert!(entries.is_empty(), "age 1 must not re-mark");
 
-        // Age 2: re-marked for flooding.
-        queue.shift();
+        // Age 2: first rescue.
+        let shift2 = queue.shift();
+        assert_eq!(shift2.reflooded_txs.len(), 1, "age 2 must re-flood");
         let (entries, _) = visit_all_processed(&queue, 100, None);
-        assert_eq!(entries.len(), 1, "age 2 must re-flood the pending tx");
+        assert_eq!(entries.len(), 1, "age 2 re-marks the pending tx");
         assert_eq!(entries[0].hash, hash);
 
-        // Age 3: fires only once (2→ transition), no repeat.
-        queue.shift();
+        // Age 3: last-chance retry, one ledger before the age-4 auto-ban.
+        let shift3 = queue.shift();
+        assert_eq!(shift3.reflooded_txs.len(), 1, "age 3 must re-flood");
         let (entries, _) = visit_all_processed(&queue, 100, None);
-        assert!(entries.is_empty(), "re-flood fires exactly once at age 2");
+        assert_eq!(entries.len(), 1, "age 3 re-marks the pending tx");
     }
 
     #[test]
