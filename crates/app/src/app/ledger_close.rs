@@ -2395,6 +2395,31 @@ impl App {
 
         // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
         if let Some(ref perf) = result.perf {
+            // [maxtps_close] campaign-2 iter-3: slow closes clustered at
+            // seq ~120-150 are the full-window killer (two consecutive slow
+            // closes trigger a loadgen catch-up burst that collapses the
+            // account-cadence slack). Dump the in-close phase breakdown for
+            // any close slower than 1.5 s so the binding phase is
+            // self-naming. Slow-only; instrumentation.
+            if perf.total_us > 1_500_000 {
+                tracing::info!(
+                    target: "maxtps_close",
+                    ledger_seq = result.header.ledger_seq,
+                    total_us = perf.total_us,
+                    begin_us = perf.begin_close_us,
+                    tx_exec_us = perf.tx_exec_us,
+                    commit_setup_us = perf.commit_setup_us,
+                    bucket_lock_wait_us = perf.bucket_lock_wait_us,
+                    eviction_us = perf.eviction_us,
+                    soroban_state_us = perf.soroban_state_us,
+                    add_batch_us = perf.add_batch_us,
+                    hot_archive_us = perf.hot_archive_us,
+                    header_us = perf.header_us,
+                    commit_close_us = perf.commit_close_us,
+                    meta_us = perf.meta_us,
+                    "slow close phase breakdown"
+                );
+            }
             let us_to_secs = |us: u64| us as f64 / 1_000_000.0;
             crate::metrics::CLOSE_BEGIN_SECONDS.record(us_to_secs(perf.begin_close_us));
             crate::metrics::CLOSE_TX_EXEC_SECONDS.record(us_to_secs(perf.tx_exec_us));
