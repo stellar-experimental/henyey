@@ -3136,6 +3136,27 @@ impl TransactionQueue {
                     if let Some(newest) = banned.back_mut() {
                         newest.insert(queued_tx.hash);
                     }
+                    // Rare terminal event (a handful per multi-million-tx load
+                    // run) and the head of every wedged-account chain in
+                    // pregenerated load: once banned here, nothing resubmits
+                    // the tx and the account's later seqs can never apply.
+                    // WARN with identifiers so cross-node forensics can trace
+                    // the dissemination failure that let it age out.
+                    tracing::warn!(
+                        target: "maxtps_ban",
+                        hash = %queued_tx.hash,
+                        source_account_key8 = %account_key
+                            .iter()
+                            .take(8)
+                            .fold(String::new(), |mut s, b| {
+                                use std::fmt::Write;
+                                let _ = write!(s, "{b:02x}");
+                                s
+                            }),
+                        seq = envelope_sequence_number(&queued_tx.envelope),
+                        age = state.age,
+                        "auto-ban: pending tx aged out without inclusion"
+                    );
                     // Remove from store and track for seen cleanup
                     store.remove(&queued_tx.hash, ledger_version);
                     evicted_hashes.push(queued_tx.hash);
