@@ -1560,7 +1560,16 @@ impl LedgerManager {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
 
         Self {
-            bucket_list: Arc::new(RwLock::new(BucketList::default())),
+            bucket_list: Arc::new(RwLock::new({
+                // Install the BucketListDB config at construction so
+                // genesis-boot networks (no catchup/restore install path)
+                // still get per-bucket account-entry caches
+                // (maybe_initialize_caches no-ops without a config —
+                // campaign-2 iter-4b, issue #3719).
+                let mut bl = BucketList::default();
+                bl.set_bucket_list_db_config(config.bucket_list_db.clone());
+                bl
+            })),
             hot_archive_bucket_list: Arc::new(RwLock::new(Some(HotArchiveBucketList::new()))),
             network_id,
             state: RwLock::new(LedgerState {
@@ -2130,8 +2139,13 @@ impl LedgerManager {
         // initialized=false flag is sufficient to block concurrent readers).
         drop(state);
 
-        // Clear bucket lists
-        *self.bucket_list.write() = BucketList::default();
+        // Clear bucket lists (re-install the BucketListDB config so
+        // account-entry caches keep working after re-initialization).
+        *self.bucket_list.write() = {
+            let mut bl = BucketList::default();
+            bl.set_bucket_list_db_config(self.config.bucket_list_db.clone());
+            bl
+        };
         *self.hot_archive_bucket_list.write() = Some(HotArchiveBucketList::new());
 
         // Explicitly drop old module cache to release memory

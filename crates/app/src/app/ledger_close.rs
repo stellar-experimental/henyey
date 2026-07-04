@@ -2417,6 +2417,12 @@ impl App {
                     header_us = perf.header_us,
                     commit_close_us = perf.commit_close_us,
                     meta_us = perf.meta_us,
+                    cache_hits = perf.cache.hits,
+                    cache_misses = perf.cache.misses,
+                    cache_entries = perf.cache.entry_count,
+                    snap_hits = perf.snapshot_cache.snapshot_cache_hits,
+                    prefetch_hits = perf.snapshot_cache.prefetch_cache_hits,
+                    fallback_lookups = perf.snapshot_cache.fallback_lookups,
                     "slow close phase breakdown"
                 );
             }
