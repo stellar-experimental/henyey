@@ -5921,6 +5921,22 @@ impl LedgerCloseContext<'_> {
             )?;
             let add_batch_us = add_batch_start.elapsed().as_micros() as u64;
 
+            // Initialize account-entry caches for any NEW disk-indexed
+            // buckets this batch's spills produced (campaign-2 iter-4,
+            // issue #3719). `maybe_initialize_caches` was previously only
+            // invoked on the post-catchup warm-up path, so genesis-boot
+            // networks and buckets created by mid-flight level spills ran
+            // cacheless — every account load on a >20 MB (DiskIndex) bucket
+            // paid a 16 KB mmap page scan, degrading tx apply ~300× once
+            // entries sank past the seq-64/128 spills (48-52 s closes at
+            // ~7000 tx/ledger; the full-window sustained killer). The call
+            // is idempotent (per-bucket OnceLock) and a no-op walk when all
+            // caches exist; first-call index/cache builds for fresh spill
+            // buckets are paid here (visible in add_batch timing) instead of
+            // inline in the next ledger's apply. Mirrors stellar-core's
+            // LiveBucketIndex::maybeInitializeCache lifecycle.
+            bucket_list.maybe_initialize_caches();
+
             // Record completed merges in the shared merge map for deduplication.
             // This matches stellar-core's adoptFileAsBucket() -> recordMerge() flow.
             if let Some(ref merge_map) = self.manager.finished_merges {
