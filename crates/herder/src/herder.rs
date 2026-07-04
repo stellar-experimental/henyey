@@ -2541,7 +2541,20 @@ impl Herder {
                 // Route based on slot eligibility.
                 if slot <= self.tracking_slot().get() {
                     debug!(slot, "Envelope ready, processing through SCP");
+                    // [maxtps_scp] campaign-2 iter-3: attribute 18+ s
+                    // scp_verified stalls — is the SCP machine drive the
+                    // blocking segment?
+                    let scp_t0 = std::time::Instant::now();
                     let scp_result = self.process_scp_envelope_with_tx_set(envelope_clone);
+                    let scp_ms = scp_t0.elapsed().as_millis() as u64;
+                    if scp_ms > 1_000 {
+                        tracing::info!(
+                            target: "maxtps_scp",
+                            slot,
+                            scp_ms,
+                            "slow_scp_machine_drive"
+                        );
+                    }
                     // Pop the duplicate from ready queue to prevent later
                     // double-processing by process_ready_fetching_envelopes.
                     // Use pop_from_slot (not pop) to avoid accidentally popping
