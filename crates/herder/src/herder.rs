@@ -3439,14 +3439,14 @@ impl Herder {
             .erase_outside_range(min_slot, max_slot, keep_slot);
 
         // Evict cached tx sets outside the valid slot range in scp_driver.
-        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange (line 726-731)
-        // also prunes the tx-set cache for entries outside [min, max].
-        // The lower bound is already handled by purge_slots_below / trim_stale_caches;
-        // this covers the upper bound so far-future slot touches cannot pin tx-sets
-        // indefinitely outside the active window.
-        if let Some(max) = max_slot {
-            self.scp_driver.evict_cached_above(max);
-        }
+        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange
+        // (PendingEnvelopes.cpp:790-796) prunes mTxSetCache on BOTH bounds at
+        // every newSlotExternalized, keeping slot-0 (unknown) and slotToKeep.
+        // The lower bound MUST run here on the live path: before 2026-07-04
+        // the only below-prune ran on catchup, so under load the cache grew
+        // ~16 MB/ledger unbounded (campaign-2 OOM leak).
+        self.scp_driver
+            .evict_cached_outside_range(min_slot, max_slot, keep_slot);
 
         // Clean up old data
         self.cleanup();
@@ -4601,7 +4601,19 @@ impl Herder {
     /// `spawn_blocking` tasks serialize correctly.
     fn cache_tx_set(&self, tx_set: TransactionSet) {
         let hash = *tx_set.hash();
-        self.scp_driver.cache_tx_set(tx_set);
+        // Stamp slot provenance (the slot SCP is working on) so the per-close
+        // range prune in `ledger_closed` can evict this set once it leaves the
+        // remembered window. Slot 0 (boot/syncing) keeps the unknown-slot
+        // sentinel — mirroring stellar-core's slot-0 rule for tx sets loaded
+        // from the database (PendingEnvelopes.cpp:789-791). Without provenance
+        // these entries survive every slot-range prune and the cache grows
+        // ~16 MB/ledger unbounded under load (2026-07-04 campaign-2 leak).
+        let slot = self.tracking_slot().get();
+        if slot == 0 {
+            self.scp_driver.cache_tx_set(tx_set);
+        } else {
+            self.scp_driver.cache_tx_set_with_slot(tx_set, slot);
+        }
 
         // Resolve any deferred slots that were waiting for this tx_set.
         // When MaybeValidDeferred clears fully_validated, the validator
@@ -4616,8 +4628,6 @@ impl Herder {
             self.scp.restore_slot_fully_validated(slot);
         }
 
-        let slot = self.tracking_slot();
-        let _ = slot; // slot no longer needed for notification
         self.fetching_envelopes.on_tx_set_accepted(&hash);
     }
 
@@ -15759,6 +15769,94 @@ mod fetching_envelopes_routing_tests {
         assert!(
             herder.fetching_envelopes.slots.read().contains_key(&64),
             "slot 64 preserved (checkpoint keep_slot and within range)"
+        );
+    }
+
+    /// Regression test for the campaign-2 memory leak (2026-07-04): cached
+    /// tx sets must be pruned outside `[min_slot, max_slot]` on every LIVE
+    /// ledger close. Before the fix, the only lower-bound prune ran on the
+    /// catchup path, so at ~7k tx/ledger the cache grew ~16 MB/ledger
+    /// unbounded until the host OOM'd (23-node mission, 64 GB exhausted at
+    /// ~minute 12 of every full-window run).
+    #[test]
+    fn test_ledger_closed_prunes_stale_cached_tx_sets() {
+        let herder = make_test_herder();
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 66;
+        }
+        // min_ledger_seq = 54, keep_slot (checkpoint) = 64 — see
+        // test_ledger_closed_checkpoint_preserved_at_boundary for the math.
+
+        // Old candidate (slot 20 < min 54, != keep) — must be evicted.
+        let ts_old = TransactionSet::new(Hash256::from_bytes([201; 32]), Vec::new());
+        let hash_old = *ts_old.hash();
+        herder.scp_driver.cache_tx_set_with_slot(ts_old, 20);
+        // Checkpoint set (slot 64 == keep_slot) — preserved.
+        let ts_keep = TransactionSet::new(Hash256::from_bytes([202; 32]), Vec::new());
+        let hash_keep = *ts_keep.hash();
+        herder.scp_driver.cache_tx_set_with_slot(ts_keep, 64);
+        // In-window set (slot 60 >= 54) — preserved.
+        let ts_in = TransactionSet::new(Hash256::from_bytes([203; 32]), Vec::new());
+        let hash_in = *ts_in.hash();
+        herder.scp_driver.cache_tx_set_with_slot(ts_in, 60);
+
+        herder.ledger_closed(65, &[], &[], 0);
+
+        assert!(
+            !herder.scp_driver.has_tx_set(&hash_old),
+            "stale cached tx set (slot 20 < min 54) must be evicted on live close"
+        );
+        assert!(
+            herder.scp_driver.has_tx_set(&hash_keep),
+            "checkpoint keep_slot tx set preserved"
+        );
+        assert!(
+            herder.scp_driver.has_tx_set(&hash_in),
+            "in-window tx set preserved"
+        );
+    }
+
+    /// Companion to the leak fix: own-built candidates must carry slot
+    /// provenance (tracking slot), otherwise they are unknown-slot entries
+    /// that survive every slot-range prune forever.
+    #[test]
+    fn test_cache_tx_set_stores_tracking_slot_provenance() {
+        let herder = make_test_herder();
+        herder.bootstrap(65);
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 66;
+        }
+
+        let ts = TransactionSet::new(Hash256::from_bytes([204; 32]), Vec::new());
+        let hash = *ts.hash();
+        herder.cache_tx_set(ts);
+
+        assert_eq!(
+            herder.scp_driver.cached_tx_set_slot(&hash),
+            Some(Some(66)),
+            "own-built candidate must be cached with tracking-slot provenance"
+        );
+    }
+
+    /// Boot-time tx sets (tracking slot 0, e.g. restored from the database)
+    /// keep the unknown-slot sentinel — mirroring stellar-core's slot-0 rule.
+    #[test]
+    fn test_cache_tx_set_boot_keeps_unknown_slot() {
+        let herder = make_test_herder();
+
+        let ts = TransactionSet::new(Hash256::from_bytes([205; 32]), Vec::new());
+        let hash = *ts.hash();
+        herder.cache_tx_set(ts);
+
+        assert_eq!(
+            herder.scp_driver.cached_tx_set_slot(&hash),
+            Some(None),
+            "boot-time (slot 0) tx sets keep the unknown-slot sentinel"
         );
     }
 

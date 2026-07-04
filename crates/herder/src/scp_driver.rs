@@ -916,6 +916,20 @@ impl ScpDriver {
         self.tx_tracker.store(tx_set);
     }
 
+    /// Cache a transaction set with slot provenance so slot-range cleanup
+    /// (`evict_cached_outside_range`) can evict it once its slot leaves the
+    /// remembered window.
+    pub fn cache_tx_set_with_slot(&self, tx_set: TransactionSet, slot: SlotIndex) {
+        self.tx_tracker.store_with_slot(tx_set, slot);
+    }
+
+    /// Slot provenance of a cached tx set: `None` = not cached,
+    /// `Some(None)` = cached with unknown slot, `Some(Some(s))` = cached at `s`.
+    #[cfg(test)]
+    pub(crate) fn cached_tx_set_slot(&self, hash: &Hash256) -> Option<Option<SlotIndex>> {
+        self.tx_tracker.cached_slot(hash)
+    }
+
     /// Get a cached transaction set by hash.
     pub fn get_tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
         self.tx_tracker.get(hash)
@@ -2875,6 +2889,23 @@ impl ScpDriver {
     /// `trim_stale_caches`; this covers the upper bound.
     pub fn evict_cached_above(&self, max_slot: SlotIndex) -> usize {
         self.tx_tracker.evict_cached_above(max_slot)
+    }
+
+    /// Evict cached tx sets outside `[min_slot, max_slot]`, preserving
+    /// unknown-slot entries and `keep_slot`.
+    ///
+    /// Parity: stellar-core `PendingEnvelopes::eraseOutsideRange`
+    /// (PendingEnvelopes.cpp:790-796) prunes `mTxSetCache` on BOTH bounds at
+    /// every `newSlotExternalized`, keeping slot-0 (unknown) entries and
+    /// `slotToKeep` (the most recent checkpoint ledger).
+    pub fn evict_cached_outside_range(
+        &self,
+        min_slot: Option<SlotIndex>,
+        max_slot: Option<SlotIndex>,
+        keep_slot: SlotIndex,
+    ) -> usize {
+        self.tx_tracker
+            .evict_cached_outside_range(min_slot, max_slot, keep_slot)
     }
 
     /// Get local SCP envelopes for a slot.
