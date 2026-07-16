@@ -185,11 +185,27 @@ Based on the issue's status, invoke the specialist skill **as a foreground sub-a
 | Status | `model` | Sub-agent prompt |
 |---|---|---|
 | `backlog` | `haiku` | `Run /triage <ISSUE> and report the final board state transition.` |
-| `ready-for-planning` | `opus` | `Run /plan <ISSUE> and report the final board state transition.` |
-| `ready-for-doing` | `opus` | `Run /do <ISSUE> and report the final board state transition.` |
-| `in-review` | `opus` | `Run /review-pr <ISSUE> and report the final board state transition.` |
+| `ready-for-planning` | `opus` (or `sonnet` if the issue carries **both** the `self-improvement` and `trivial` labels) | `Run /plan <ISSUE> and report the final board state transition.` |
+| `ready-for-doing` | `opus` (or `sonnet` if the issue carries **both** the `self-improvement` and `trivial` labels) | `Run /do <ISSUE> and report the final board state transition.` |
+| `in-review` | `opus` (or `sonnet` if the linked PR is **docs-only** — see the pre-check below) | `Run /review-pr <ISSUE> and report the final board state transition.` |
 
-**Rationale:** triage is a simple decision task (haiku is plenty). Planning, implementation, and review need strong code/plan reasoning (opus). The cross-model diversity that a second model family used to provide on plan-critics and PR-reviewers is now supplied by the **adversarial refute pass** built into `/plan` and `/review-pr` (an independent opus "skeptic" sub-agent tries to refute each blocking finding; a finding only stands if it survives refutation) — so an all-opus pipeline no longer risks the false-positive blind spot a single model family otherwise would.
+**Model-tiering pre-check for `in-review`.** Before dispatching `/review-pr`, do a cheap orchestrator-level check of the linked PR's changed files and select `sonnet` when **every** changed path is docs-only — the same class `/review-pr` treats as `kind: docs` (docs/refactor/test-only get the lighter "existing tests still pass" review, not the full feature test-coverage gate). This selection happens entirely at the dispatcher; the `/review-pr` specialist is unchanged.
+
+```bash
+# Docs-only iff EVERY changed path matches *.md, docs/**, or README* (case-insensitive
+# on the basename). Any non-matching path (a *.rs, *.toml, *.sh, workflow, etc.) → opus.
+mapfile -t FILES < <(gh pr view "$PR_NUM" --repo stellar-experimental/henyey --json files --jq '.files[].path')
+DOCS_ONLY=1
+for f in "${FILES[@]}"; do
+  case "$f" in
+    *.md|docs/*|README|README.*|*/README|*/README.*) ;;   # docs-only path, keep scanning
+    *) DOCS_ONLY=0; break ;;                                # any code/config path → not docs-only
+  esac
+done
+[ "${#FILES[@]}" -gt 0 ] && [ "$DOCS_ONLY" -eq 1 ] && MODEL=sonnet || MODEL=opus
+```
+
+**Rationale:** triage is a simple decision task (haiku is plenty). Planning, implementation, and review need strong code/plan reasoning (opus) — **except** for trivial self-filed pipeline work: an issue carrying **both** `self-improvement` and `trivial` (skill wording, doc fixes, mechanical script tweaks — the low-risk class `/project-loop`'s own reflection pass files, per its Step H `trivial` vs `needs-design` classification) does not need top-tier reasoning, so `/plan` and `/do` for it dispatch on `sonnet`. Anything else — real crate code, parity-sensitive logic — still gets `opus`. Likewise a **docs-only** PR (every changed file is `*.md` / `docs/**` / `README*`) gets a `sonnet` `/review-pr`, while any PR touching code/config gets `opus`. The cross-model diversity that a second model family used to provide on plan-critics and PR-reviewers is now supplied by the **adversarial refute pass** built into `/plan` and `/review-pr` (an independent "skeptic" sub-agent tries to refute each blocking finding; a finding only stands if it survives refutation) — so the primarily-opus pipeline no longer risks the false-positive blind spot a single model family otherwise would.
 
 **Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true`. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a recognized failure marker (e.g. `## Plan: Triage Disagreement`, `## Plan: Scope Mismatch`, `## ⚠️ Plan: Force-Converged`, `## Do: Plan Wrong`, `## Do: Local Verification Failed`, `## Review: Cycle Cap Reached`, `## Review: No PR Linked`) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
 
