@@ -348,6 +348,67 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Assertion group 5.6: quarantine-hold-until-both-shells (#3711).
+#   check_quarantine_active's hold:until-#<N> sentinel pins an entry to a
+#   GitHub issue's lifecycle: an OPEN (or indeterminate) issue must BLOCK
+#   (fail-closed) even when the per-hunk content-check would CLEAR (drifted
+#   diff — the #3711 false-clear); a confirmed CLOSED issue releases the
+#   sentinel and falls through to the normal logic. The gh call goes through
+#   `timeout 15 gh ...` — timeout exec()s a REAL binary from PATH, so a
+#   shell-function gh mock is invisible to it and the test uses a PATH shim
+#   (driven by exported _GH_HOLD_STATE). git IS mockable as a function: the
+#   sha is an ancestor and every hunk fails to reverse-apply, so WITHOUT the
+#   sentinel the entry clears.
+# ─────────────────────────────────────────────────────────────────────────────
+HOLD_SHIM_DIR="$SCRATCH/hold-gh-shim"
+mkdir -p "$HOLD_SHIM_DIR"
+cat > "$HOLD_SHIM_DIR/gh" <<'SHIM'
+#!/usr/bin/env bash
+[ "${_GH_HOLD_RC:-0}" -ne 0 ] && exit "${_GH_HOLD_RC}"
+[ -n "${_GH_HOLD_STATE:-}" ] && printf '%s\n' "$_GH_HOLD_STATE"
+exit 0
+SHIM
+chmod +x "$HOLD_SHIM_DIR/gh"
+
+assert_hold_until_roundtrip() {
+  local shbin="$1" shname="$2"
+  local qfile="$SCRATCH/hold-$shname.txt"
+  local bad="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  printf '%s hold:until-#3702 restore-from-disk wedge hold\n' "$bad" > "$qfile"
+  local code="
+    export PATH='$HOLD_SHIM_DIR':\"\$PATH\";
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    git() {
+      case \"\$1\" in
+        merge-base) return 0 ;;
+        diff) printf 'diff --git a/f.rs b/f.rs\nindex 1111111..2222222 100644\n--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,3 @@ mod m {\n+    drifted_away\n }\n'; return 0 ;;
+        apply) return 1 ;;
+        *) return 0 ;;
+      esac
+    };
+    export _GH_HOLD_STATE=OPEN;
+    rc_open=0; check_quarantine_active '$qfile' || rc_open=\$?;
+    open_status=\$QUARANTINE_STATUS;
+    export _GH_HOLD_STATE=CLOSED;
+    rc_closed=0; check_quarantine_active '$qfile' || rc_closed=\$?;
+    printf 'open=%s/%s closed=%s/%s' \"\$rc_open\" \"\$open_status\" \"\$rc_closed\" \"\$QUARANTINE_STATUS\"
+  "
+  run_in_shell "$shbin" "$code"
+  local label="quarantine-hold-until[$shname]: OPEN blocks (fail-closed), CLOSED falls through"
+  if [[ "$_RC" -eq 0 && "$_STDOUT" == "open=0/blocked_active closed=1/clear" ]]; then
+    ok "$label"
+  else
+    notok "$label" "rc=$_RC" "stdout: $_STDOUT" "stderr: $_STDERR"
+  fi
+}
+assert_hold_until_roundtrip bash bash
+if [[ "$HAVE_ZSH" -eq 1 ]]; then
+  assert_hold_until_roundtrip zsh zsh
+else
+  skip "quarantine-hold-until[zsh]: OPEN blocks (fail-closed), CLOSED falls through" "zsh not installed"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Assertion group 6: anomaly-roundtrip-fresh-shells-both (anti-regression #3133).
 #   Append in one fresh shell, dump in a SECOND fresh shell (separate process),
 #   both pointed at the same PIPELINE_ANOMALY_LOG; assert the line persists.

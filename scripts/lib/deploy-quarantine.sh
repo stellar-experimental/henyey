@@ -19,6 +19,23 @@
 #     so it is an actual deploy target — #3632), the entry auto-clears (see
 #     check_quarantine_active). Additive — absent on legacy entries, which keep
 #     the per-hunk content-check as their backstop.
+#   - An optional `hold:until-#<N>` sentinel token MAY appear anywhere in the
+#     reason (canonically right after the SHA):
+#         <sha> hold:until-#<N> <reason...>
+#     It pins the entry to the LIFECYCLE OF GITHUB ISSUE #N instead of the
+#     textual presence of the SHA's diff. check_quarantine_active honors it
+#     BEFORE the resolved-token auto-clear and the per-hunk content-check:
+#     while issue #N is not verifiably CLOSED (issue OPEN, empty gh output,
+#     gh error, timeout, offline) the entry BLOCKS — fail-closed. Only a
+#     confirmed CLOSED state releases the sentinel, after which the entry
+#     falls through to the normal resolved/content-check logic. Rationale
+#     (#3711): the per-hunk content-check backstop DECAYS as main evolves —
+#     once every hunk of the quarantined commit drifts, the gate false-clears
+#     even though the behavioral regression the hold protects against (e.g.
+#     #3702) is still open. quarantine_autostamp NEVER stamps `resolved:`
+#     onto a hold:until entry — the sentinel is manual-lifecycle-only (this
+#     also prevents the #3708 bundled-`#N` false-clear class on exactly the
+#     entries that must not auto-clear).
 #   - Lines starting with # (after optional whitespace) are comments
 #   - Blank/whitespace-only lines are skipped
 #   - CRLF is stripped during parsing
@@ -359,6 +376,18 @@ fi
 #
 # Algorithm per entry:
 #   1. If SHA is NOT an ancestor of origin/main → not deployed, skip.
+#   1b. hold:until-#<N> sentinel (#3711), checked BEFORE steps 2 and 3
+#      (numbered 1b so the long-standing step-2/step-3 references elsewhere
+#      stay valid): if the entry's reason carries `hold:until-#<N>`, query the
+#      issue state (`timeout 15 gh issue view <N> --json state -q .state`).
+#      Only a confirmed `CLOSED` releases the sentinel — the entry then falls
+#      through to steps 2/3 as if the token were absent. EVERY other outcome
+#      (issue OPEN, empty output, gh error, timeout, offline) FAILS CLOSED:
+#      QUARANTINE_STATUS=blocked_active / QUARANTINED_MATCH=<sha>, exactly
+#      like an active content match. Rationale: the step-3 content-check
+#      backstop decays as main evolves (once every hunk drifts it
+#      false-clears), which is the wrong semantics for "hold all deploys
+#      until an open issue is fixed" (#3702's hold false-cleared this way).
 #   2. resolved-SHA auto-clear (#3256, VE-green-gated for #3632): if the entry
 #      carries a valid `resolved:<fix-sha>` token, the fix SHA is NOT the
 #      entry's own SHA (self-resolution guard), that fix SHA is an ancestor of
@@ -437,11 +466,13 @@ check_quarantine_active() {
     return 1
   fi
 
-  # Iterate QUARANTINE_ENTRIES and the index-aligned QUARANTINE_RESOLVED in
-  # lockstep over two FDs. `read -r ... <&3 && read -r ... <&4` advances both
-  # streams one line per loop and behaves identically under bash and zsh.
-  local sha resolved merge_base_rc present_rc resolved_rc
-  while IFS= read -r sha <&3 && IFS= read -r resolved <&4; do
+  # Iterate QUARANTINE_ENTRIES and the index-aligned QUARANTINE_RESOLVED /
+  # QUARANTINE_REASONS in lockstep over three FDs. `read -r ... <&3 && read -r
+  # ... <&4 && read -r ... <&5` advances all streams one line per loop and
+  # behaves identically under bash and zsh (same idiom as quarantine_autostamp).
+  local sha resolved reason merge_base_rc present_rc resolved_rc
+  local hold_issue hold_state
+  while IFS= read -r sha <&3 && IFS= read -r resolved <&4 && IFS= read -r reason <&5; do
     [[ -z "$sha" ]] && continue
 
     # Step 1: ancestry check. If SHA isn't reachable, its content can't
@@ -464,6 +495,41 @@ check_quarantine_active() {
     if [[ "$merge_base_rc" -eq 1 ]]; then
       # Not in ancestry — content cannot be present. Skip.
       continue
+    fi
+
+    # Step 1b: hold:until-#<N> sentinel (#3711). A hold entry is pinned to the
+    # lifecycle of GitHub issue #N, NOT to the textual presence of the SHA's
+    # diff — the step-3 content-check backstop DECAYS as main evolves (once
+    # every hunk of the quarantined commit drifts, it false-clears even though
+    # the behavioral regression the hold protects against is still open). Only
+    # a confirmed CLOSED issue releases the sentinel; every uncertain outcome
+    # (issue OPEN, empty output, gh error, timeout, offline) FAILS CLOSED to
+    # blocked_active, exactly like an active content match. Token extraction
+    # uses grep (not the `=~` capture array) so it is identical under bash and
+    # zsh — zsh populates `$match`, not `$BASH_REMATCH` (#3256). `|| true`
+    # keeps the normal no-token case from tripping a caller's set -e/pipefail.
+    hold_issue="$(printf '%s' " $reason " | grep -oE 'hold:until-#[0-9]+' | head -n1 || true)"
+    if [[ -n "$hold_issue" ]]; then
+      hold_issue="${hold_issue#hold:until-#}"
+      # `timeout 15` bounds a hung gh/network call. Any failure path (non-zero
+      # rc, no output) leaves hold_state empty → NOT "CLOSED" → fail-closed.
+      hold_state="$(timeout 15 gh issue view "$hold_issue" \
+                      --repo "${QUARANTINE_GH_REPO:-stellar-experimental/henyey}" \
+                      --json state -q .state 2>/dev/null)" || hold_state=""
+      if [[ "$hold_state" != "CLOSED" ]]; then
+        # Issue still open OR state indeterminate → BLOCK (fail-closed).
+        local warning="hold-until-active: ${sha:0:8} (#${hold_issue} state=${hold_state:-unknown})"
+        if [[ -n "$QUARANTINE_WARNINGS" ]]; then
+          QUARANTINE_WARNINGS+=", $warning"
+        else
+          QUARANTINE_WARNINGS="$warning"
+        fi
+        QUARANTINE_STATUS="blocked_active"
+        QUARANTINED_MATCH="$sha"
+        return 0
+      fi
+      # Issue is CLOSED → sentinel released. Fall through to the resolved-token
+      # (step 2) and per-hunk content-check (step 3) logic for this entry.
     fi
 
     # Step 2: resolved-SHA auto-clear (#3256, tightened for #3632). If this
@@ -523,7 +589,7 @@ check_quarantine_active() {
       return 0
     fi
     # present_rc == 1: every hunk failed to reverse-apply → content removed. Skip.
-  done 3<<< "$QUARANTINE_ENTRIES" 4<<< "$QUARANTINE_RESOLVED"
+  done 3<<< "$QUARANTINE_ENTRIES" 4<<< "$QUARANTINE_RESOLVED" 5<<< "$QUARANTINE_REASONS"
 
   # No active match
   QUARANTINE_STATUS="clear"
@@ -796,10 +862,11 @@ _quarantine_fix_sha_for_issue() {
 # quarantine_autostamp QUARANTINE_FILE
 #
 # Best-effort, full-autonomy auto-stamping (#3258). For each entry NOT already
-# carrying a `resolved:` token, follow GitHub's structured linkage to the
-# merge-commit SHA of the MERGED PR that closed the entry's recorded crash
-# issue (`regression #N`, written by monitor-tick §3d), and stamp it via the
-# existing #3260 `quarantine_resolve`.
+# carrying a `resolved:` token AND NOT carrying a `hold:until-#<N>` sentinel
+# (manual-lifecycle-only, #3711 — see below), follow GitHub's structured
+# linkage to the merge-commit SHA of the MERGED PR that closed the entry's
+# recorded crash issue (`regression #N`, written by monitor-tick §3d), and
+# stamp it via the existing #3260 `quarantine_resolve`.
 #
 # This function is WRITE-ONLY and STRICTLY MONOTONIC: it can only ADD a
 # `resolved:` token (delegating to quarantine_resolve, which is atomic tmp+mv,
@@ -847,6 +914,17 @@ quarantine_autostamp() {
     [[ -z "$sha" ]] && continue
     # Already stamped → leave untouched, do NOT query gh (idempotent + cheap).
     [[ "$resolved" != "-" ]] && continue
+
+    # hold:until-#<N> sentinel entries are MANUAL-LIFECYCLE-ONLY (#3711):
+    # never stamp `resolved:` onto them. The `#N` in a hold token is the
+    # ISSUE THE HOLD WAITS ON, not a crash regression whose merged closing PR
+    # should lift the gate — stamping it would recreate the #3708
+    # bundled-`#N` false-clear class on exactly the entries that must not
+    # auto-clear. check_quarantine_active releases the hold only once the
+    # issue is CLOSED; the operator removes the entry.
+    if printf '%s' " $reason " | grep -qE 'hold:until-#[0-9]+'; then
+      continue
+    fi
 
     # Recover the crash issue # from the reason. No `#N` → skip (the gate's
     # per-hunk content-check governs this entry).
