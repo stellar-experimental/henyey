@@ -267,6 +267,9 @@ it.)
 - `$TARGET = <crate path>`: resolve to the spec mapped to that crate.
 - `$TARGET = all`: run all 7 spec ↔ crate pairs. Recommend
   parallel subagents (one per pair) since each is independent.
+  Dispatch each with an explicit `model="sonnet"` on the Agent
+  call — spec ↔ crate cross-referencing is a mechanical
+  read-and-classify task that does not need a top-tier model.
 
 ## Reading strategy
 

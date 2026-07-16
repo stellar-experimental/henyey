@@ -31,7 +31,7 @@ It reuses `/project-tick`'s board query (Step 1), actionability filter (Step 2 +
 
 - **`IN_FLIGHT`** — set of issue numbers currently dispatched to a sub-agent. Picks dedupe against this; it is cleared per-issue when that issue's sub-agent returns.
 - **`AREA_LOCKS`** — set of "areas" (crate / script / skill-dir) currently being modified by an in-flight `/do` or `/review-pr`. Used for conflict-avoidance (below). Released when the owning sub-agent returns.
-- **`CI_WAITERS`** — PRs whose CI is being polled in the background (issue → PR mapping). Not a dispatch slot.
+- **`CI_WAITERS`** — PRs whose CI is still pending (issue → PR mapping). Re-checked with a cheap `gh` call each pass (Step C); not a separate background process and not a dispatch slot.
 - **`ANOMALY_LOG`** — the per-session anomaly log (append-only via the helper below; see "Self-reflection").
 - **`PASS_HISTORY`** — recent picks/dispatches/outcomes, fed to the meta-reviewer.
 - **`BACKOFF`** — current idle backoff interval (escalating).
@@ -97,11 +97,27 @@ Dispatch the picked issues **in parallel** — emit all the Agent/Task tool call
 | Status | `model` | Sub-agent prompt |
 |---|---|---|
 | `backlog` | `haiku` | `Run /triage <ISSUE> and report the final board state transition.` |
-| `ready-for-planning` | `opus` | `Run /plan <ISSUE> and report the final board state transition.` |
-| `ready-for-doing` | `opus` | `Run /do <ISSUE> and report the final board state transition.` |
-| `in-review` | `opus` | `Run /review-pr <ISSUE> and report the final board state transition.` |
+| `ready-for-planning` | `opus` (or `sonnet` if the issue carries **both** the `self-improvement` and `trivial` labels) | `Run /plan <ISSUE> and report the final board state transition.` |
+| `ready-for-doing` | `opus` (or `sonnet` if the issue carries **both** the `self-improvement` and `trivial` labels) | `Run /do <ISSUE> and report the final board state transition.` |
+| `in-review` | `opus` (or `sonnet` if the linked PR is **docs-only** — see the pre-check below) | `Run /review-pr <ISSUE> and report the final board state transition.` |
 
-Same rationale as `/project-tick`: haiku for triage, opus for plan/code/review. Cross-model diversity is now provided by the **adversarial refute pass (run in-agent)** inside `/plan` and `/review-pr`, not a second model family. Under this single-level dispatch model the specialists run their adversarial lenses (the `/plan` critics + refute, the `/review-pr` reviewers + refute) as **in-agent multi-lens passes** — the supported mode — because a dispatched specialist cannot itself spawn nested sub-agents. Option 1 (the orchestrator spawning the adversarial lenses as sibling sub-agents for true OS-level independence) is recorded as a documented **future upgrade hook**, to be wired here should a nested-spawn capability later become available.
+**Model-tiering pre-check for `in-review`.** Before dispatching `/review-pr`, do a cheap orchestrator-level check of the linked PR's changed files and select `sonnet` when **every** changed path is docs-only — the same class `/review-pr` treats as `kind: docs` (docs/refactor/test-only get the lighter "existing tests still pass" review, not the full feature test-coverage gate). This selection happens entirely at the dispatcher; the `/review-pr` specialist is unchanged.
+
+```bash
+# Docs-only iff EVERY changed path matches *.md, docs/**, or README* (case-insensitive
+# on the basename). Any non-matching path (a *.rs, *.toml, *.sh, workflow, etc.) → opus.
+mapfile -t FILES < <(gh pr view "$PR_NUM" --repo stellar-experimental/henyey --json files --jq '.files[].path')
+DOCS_ONLY=1
+for f in "${FILES[@]}"; do
+  case "$f" in
+    *.md|docs/*|README|README.*|*/README|*/README.*) ;;   # docs-only path, keep scanning
+    *) DOCS_ONLY=0; break ;;                                # any code/config path → not docs-only
+  esac
+done
+[ "${#FILES[@]}" -gt 0 ] && [ "$DOCS_ONLY" -eq 1 ] && MODEL=sonnet || MODEL=opus
+```
+
+Same rationale as `/project-tick`: haiku for triage, opus for plan/code/review — **except** trivial self-filed pipeline work (an issue carrying **both** `self-improvement` and `trivial`, the low-risk class Step H's reflection pass files) dispatches `/plan` and `/do` on `sonnet`, and a docs-only PR (every changed file `*.md` / `docs/**` / `README*`) gets a `sonnet` `/review-pr`; anything touching real crate code / parity-sensitive logic / config still gets `opus`. Cross-model diversity is now provided by the **adversarial refute pass (run in-agent)** inside `/plan` and `/review-pr`, not a second model family. Under this single-level dispatch model the specialists run their adversarial lenses (the `/plan` critics + refute, the `/review-pr` reviewers + refute) as **in-agent multi-lens passes** — the supported mode — because a dispatched specialist cannot itself spawn nested sub-agents. Option 1 (the orchestrator spawning the adversarial lenses as sibling sub-agents for true OS-level independence) is recorded as a documented **future upgrade hook**, to be wired here should a nested-spawn capability later become available.
 
 All sub-agents run in the **foreground** (`run_in_background: false`) so you block on the batch and collect their reported state transitions. Sub-agent build artifacts (worktrees, cargo-targets) must stay under `~/data/<session>/` — the worktree-contract helper (`scripts/lib/agent-worktree-contract.sh`) enforces this; if a sub-agent reports a workspace that escaped `~/data`, record an anomaly (below).
 
@@ -115,26 +131,20 @@ When the batch returns, for each sub-agent:
 
 Then handle these special cases before the next pass:
 
-- **A `/do` opened a PR (new `in-review` item):** do **not** block a slot waiting on its CI. **Pipeline it** — spawn a detached background poller for that PR's CI and immediately continue picking other work (the PR is in `CI_WAITERS`, excluded from picks until CI resolves). The poller re-invokes you on completion:
+- **A `/do` opened a PR (new `in-review` item):** do **not** block a slot waiting on its CI. **Pipeline it** — record the PR in `CI_WAITERS` (issue → PR mapping) and immediately continue picking other work; the PR is excluded from picks until its CI resolves (Step C/Step 2b filters it out while pending). **There is no separate background poller.** The continuous main-loop structure *is* the polling mechanism: on each subsequent pass, Step C re-checks every `CI_WAITERS` entry with a single cheap call and either clears it (CI settled → the in-review item becomes actionable and Step D picks it for `/review-pr`) or leaves it pending for the next pass.
 
   ```bash
-  # Detached CI poller for PR $PR_NUM (issue $ISSUE). Re-invokes /project-loop
-  # when CI finishes so the orchestrator can dispatch /review-pr. Runs OUTSIDE
-  # a dispatch slot. Artifacts (none needed) would live under ~/data/<session>.
-  ( while :; do
-      ROLLUP=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
-                 --json statusCheckRollup --jq '.statusCheckRollup')
-      TOTAL=$(echo "$ROLLUP" | jq 'length')
-      PENDING=$(echo "$ROLLUP" | jq '[.[]|select((.status != null and (.status|ascii_upcase)!="COMPLETED") or (.status==null and (.state|ascii_upcase)=="PENDING"))]|length')
-      [ "$TOTAL" -gt 0 ] && [ "$PENDING" -eq 0 ] && break
-      sleep 120
-    done
-    # CI settled — signal the orchestrator to re-pick (it will see the in-review
-    # item is now actionable per Step 2b and dispatch /review-pr).
-  ) &  # run_in_background via the Bash tool's run_in_background flag
+  # Cheap per-pass CI re-check for a CI_WAITERS entry (PR $PR_NUM, issue $ISSUE).
+  # Run inline during Step C — NOT as a detached background job. Returns 0 (settled)
+  # or 1 (still pending); the orchestrator's own loop supplies the "polling".
+  ROLLUP=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+             --json statusCheckRollup --jq '.statusCheckRollup')
+  TOTAL=$(echo "$ROLLUP" | jq 'length')
+  PENDING=$(echo "$ROLLUP" | jq '[.[]|select((.status != null and (.status|ascii_upcase)!="COMPLETED") or (.status==null and (.state|ascii_upcase)=="PENDING"))]|length')
+  if [ "$TOTAL" -gt 0 ] && [ "$PENDING" -eq 0 ]; then echo settled; else echo pending; fi
   ```
 
-  Use the **Bash tool's `run_in_background`** for the poller (a detached re-invoke on completion), not a foreground `sleep`. When CI is **green**, the next pass picks the in-review item and dispatches `/review-pr` to merge. When CI is **red**, the next pass picks it and `/review-pr` bounces it.
+  When the check reports **settled**, clear the `CI_WAITERS` entry so the next Step D pick dispatches `/review-pr`: green CI → `/review-pr` merges; red CI → `/review-pr` bounces it. If you want a real delay between re-checks so you don't hammer `gh` while a PR's CI is slow, do **not** spawn a background job — either rely on the idle-backoff timing from Step G (a drained board naturally spaces the passes out), or, when the board is otherwise empty but a `CI_WAITER` is still pending, use a short bounded inline foreground `sleep` within the pass before the next re-check. A detached background bash job **cannot** re-invoke or wake this Claude session, so it can never trigger the `/review-pr` dispatch — only the orchestrator's own continued looping does.
 
 - **Known flaky testnet check (#2916 — "horizon core up"):** if the **sole** failing check on a PR is the flaky testnet "horizon core up" job and everything else is green, you may **re-run that one failed job once** — **but only after the main-health pre-check below clears it as a genuine, PR-isolated flake.**
 
@@ -183,7 +193,7 @@ When no actionable items remain (board drained for now):
 
 1. Run the **self-reflection pass** (Step H) **if due** (always on an idle transition; at most ~once/hour while busy — track the last reflection time).
 2. Schedule the next pass after a **backoff**: escalating intervals — start short (~30s), then grow (1m → 2m → 5m → 10m), **capped at ~15–30 min**. Reset the backoff to the short interval as soon as a pass does real work (picked/dispatched something) or a `CI_WAITER` fires.
-3. Wake mechanism: use a **detached background poller** (Bash tool `run_in_background`) that sleeps the backoff interval and then re-invokes you, OR a self-scheduled wake — so the loop is genuinely continuous without a foreground `sleep` blocking the session. A `CI_WAITER` completing also wakes you (to dispatch the now-actionable `/review-pr`). **Caveat:** the orchestrator only runs while its Claude session is alive — a detached background poller can only re-invoke you via the harness on process exit, so it cannot wake a dead session; for true 24/7 operation, pair `/project-loop` with an external scheduler (cron / the `schedule` skill) that relaunches it.
+3. Wake mechanism: the orchestrator is a **single long-running Claude session**, so the only way to sleep for the backoff and then continue the **same** session is a plain **bounded foreground `sleep <backoff>`** inline in the pass (bounded because the whole point is that this session stays alive and loops). After the `sleep` returns, fall through to the next pass. A detached background bash job **cannot** wake or re-invoke a Claude session — it runs in its own process and has no channel back into the session — so it must **not** be used here; likewise there is no in-session "self-schedule" that resumes a suspended session. There is nothing to poll while idle other than `CI_WAITERS`, which are re-checked at the top of the next pass (Step C) once the `sleep` returns. **Caveat (unchanged and correct):** the orchestrator only runs while its Claude session is alive; a foreground `sleep` keeps *this* session looping but cannot survive a session restart. For true 24/7 operation across restarts, pair `/project-loop` with an external scheduler (cron / the `schedule` skill) that relaunches it.
 
 Then loop back to **Step A**.
 
@@ -214,7 +224,7 @@ Run reflection on **each idle transition** (board drained — you have the fulle
 
 ### Meta-reviewer dispatch
 
-Spawn **one** `opus` "meta-reviewer" Agent sub-agent (`subagent_type: general-purpose`, foreground) over `anomaly_log_dump` + recent `PASS_HISTORY`. Its instructions:
+Spawn **one** `sonnet` "meta-reviewer" Agent sub-agent (`subagent_type: general-purpose`, foreground) over `anomaly_log_dump` + recent `PASS_HISTORY`. `sonnet` is the right tier here: the meta-reviewer only dedupes, classifies, and files issues — no code changes and no deep code/plan reasoning — so it does not need `opus`. Its instructions:
 
 1. **Dedupe** against open issues labeled `pipeline` or `self-improvement` (`gh issue list --state open --search 'label:self-improvement,pipeline'` — the comma is OR in gh search, so this matches issues with EITHER label; multiple `--label` flags would AND them and miss `self-improvement`-only issues). For a recurrence of an already-filed finding, **comment on the existing issue** (note the new occurrence + evidence) — do **NOT** refile.
 2. **Classify** each genuine, non-duplicate finding as `trivial` (clear, low-risk fix — the pipeline can auto-implement it next pass) or `needs-design` (deeper change that warrants a full `/plan` pass). This is a *planning-depth* hint, not an operator-handoff — both classes are drained autonomously through the normal pipeline (see below).
@@ -246,5 +256,5 @@ anomaly_log_clear
 - **Self-modifying gate.** PRs that modify the pipeline's own skills/scripts (`.claude/skills/{project-loop,project-tick,plan,do,review-pr,triage}/`, `scripts/lib/*`) are **detected and flagged** by `/review-pr`'s `self-modifying` gate, which subjects them to **extra reviewer scrutiny** (skill frontmatter/markdown still parses, scripts still `bash`-source cleanly, no dispatch-table/step-numbering breakage). They are **not** held for operator approval — on triple-green (2 reviewers APPROVE + refute + CI) they merge **autonomously** via `attempt_merge`, like any other PR. The gate is adversarial-review + CI, not a separate operator hold. If a reviewer genuinely doubts the change is safe for the live pipeline, that's a `CHANGES_REQUESTED` bounce, not an escalation. Self-improvement PRs do **not** wait for the operator.
 - **Refresh skills after a self-modifying merge.** After a self-modifying PR that changes a pipeline skill or script merges, refresh the worktree/checkout the orchestrator reads its skills from, so the updated skill takes effect on the next pass — e.g. `git -C <skill-read-worktree> fetch && git -C <skill-read-worktree> reset --hard origin/main`. Without this, the loop keeps running the pre-merge skill text until its checkout is updated.
 - **Conflict-avoidance is the orchestrator's job.** Never dispatch two code-modifying sub-agents whose changes touch the same crate/script/skill concurrently — serialize them via `AREA_LOCKS` and pick the next non-conflicting issue.
-- **CI is pipelined, not blocking.** A pending PR never occupies a dispatch slot; its CI is polled in the background (`CI_WAITERS`) and the orchestrator keeps picking other work meanwhile.
+- **CI is pipelined, not blocking.** A pending PR never occupies a dispatch slot; it sits in `CI_WAITERS` and is re-checked with a cheap `gh` call at the top of each pass (Step C) — the continuous loop itself is the polling mechanism, with no separate background process — while the orchestrator keeps picking other work meanwhile.
 - **Idle is productive.** The idle backoff is when reflection runs and when new repo issues are synced onto the board — the loop never truly sleeps without first checking for self-improvement work and untracked issues.
