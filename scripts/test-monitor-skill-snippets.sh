@@ -19,7 +19,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEST_ROOT="$REPO_ROOT/data/test-monitor-snippets"
+
+# Scratch lives under a mktemp dir (same pattern as test-shell-lib-cross-shell.sh):
+# honor the #2843 ~/data session contract locally when available, else fall back
+# to a system tmp dir. Do NOT route through $REPO_ROOT/data — that's a checked-in
+# symlink to a local dev machine's ~/data and is dangling on CI runners, so
+# `mkdir -p` through it fails with EEXIST (stat() follows the dangling link and
+# reports missing, then the literal mkdir("data") collides with the symlink
+# dirent that does exist).
+if [[ -n "${CLAUDE_SESSION_ID:-}" && -d "${HOME}/data" ]]; then
+  TEST_ROOT="$(mktemp -d "${HOME}/data/${CLAUDE_SESSION_ID}/test-monitor-snippets.XXXXXX")"
+else
+  TEST_ROOT="$(mktemp -d)"
+fi
 
 # ── Source the shared libraries (single source of truth) ──────────────────────
 source "$SCRIPT_DIR/lib/monitor-decisions.sh"
@@ -41,8 +53,6 @@ cleanup() {
   rm -rf "$TEST_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
-cleanup  # ensure fresh state
-mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
 TAP_PLAN=435
