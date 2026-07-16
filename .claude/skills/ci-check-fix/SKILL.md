@@ -207,6 +207,7 @@ issue, and runs `/plan-do-review` on it:
 Agent(
   description="ci-check-fix: investigate Quickstart failure on main",
   subagent_type="general-purpose",
+  model="sonnet",
   run_in_background=true,
   prompt="""
 You are spawned by the /ci-check-fix skill to investigate and fix the
@@ -275,6 +276,7 @@ instead of /quickstart-fix:
 Agent(
   description="ci-check-fix: investigate <workflow> failure on main",
   subagent_type="general-purpose",
+  model="sonnet",
   run_in_background=true,
   prompt="""
 You are spawned by the /ci-check-fix skill to investigate and fix a
