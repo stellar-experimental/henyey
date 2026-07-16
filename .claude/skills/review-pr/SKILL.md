@@ -330,142 +330,16 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 - **Cycle 1** (no prior `## 🔍 Reviewer: <YourName>` comment on this PR): produce a COMPLETE change-list. Don't hold concerns back for later cycles. Every concern is labeled with its class. The implicit contract: a class not raised in cycle 1 should not be raised in cycle 2+.
 - **Cycle N≥2** (prior reviewer comments exist): you read your latest prior verdict, enumerate the classes you previously raised, and stick to them. Verify each prior concern is addressed; you may add new specific bullets within an existing class. If you genuinely identify a concern in a class you did NOT previously raise, you MUST flag the section with `**NEW CLASS DISCOVERED:** <class-name>` and explain why cycle 1 missed it. This becomes audit-trail evidence that cycle 1 was incomplete and signals the orchestrator/operator that the PR may be larger in scope than was understood. (It still counts as a normal bounce — the goal is transparency, not blocking.)
 
-### Reviewer A — Correctness (always)
+### Reviewer A — Correctness (always) / Reviewer B — Parity OR Risk (auto-detected)
 
-> Invoke /review on PR #$PR_NUM in stellar-experimental/henyey. Focus on:
-> correctness of the diff, test coverage, readability, error handling.
->
-> **Cycle-awareness (kills whack-a-mole bouncing) — do this BEFORE writing
-> your review:**
->
-> 1. Fetch your own prior comments on this PR:
->    \`\`\`bash
->    gh pr view $PR_NUM --repo stellar-experimental/henyey --comments \\
->      --json comments --jq '.comments[] | select(.body | startswith("## 🔍 Reviewer: Correctness")) | .body'
->    \`\`\`
-> 2. If empty → this is **cycle 1**. Produce a COMPLETE change-list. Every
->    concern must be labeled with a **concern class** (a 1–3 word category,
->    e.g. \`test-coverage\`, \`workspace-contract\`, \`regression-risk\`,
->    \`error-handling\`, \`api-shape\`, \`ci-failure\`). Group concerns by class
->    in the verdict body. Don't hold concerns back hoping the doer figures
->    them out — your cycle-1 list is the contract for the whole review arc.
-> 3. If non-empty → this is **cycle N≥2**. Read your latest prior verdict.
->    Enumerate the classes you raised. This cycle, you must:
->    - Verify each prior concern is addressed (re-evaluating within the same
->      class is fine — e.g. if you raised \`test-coverage\` and the test was
->      added but is wrong, that's still \`test-coverage\`).
->    - Stick to those classes. New specific bullets within an existing class
->      are fine.
->    - If you genuinely identify a concern in a class you did NOT raise
->      previously, you MAY add it, but you MUST flag the section
->      \`**NEW CLASS DISCOVERED:** <class-name>\` and explain in 1–2 sentences
->      why cycle 1 missed it. (This still counts as a normal bounce; the
->      flag is audit-trail evidence, not a block.)
->
-> **Test verification (REQUEST_CHANGES if any of these fails):**
->
-> **Test verification (REQUEST_CHANGES if any of these fails):**
->
-> 1. Find the linked issue's `kind:` from its `## Triage Report` comment.
-> 2. For `kind: bug-fix`:
->    - The PR must include a regression test. Find it by reading the PR body's
->      `## Regression test` section (which /do should have populated).
->    - **Verify the regression test would have caught the bug.** Walk the PR
->      commit list (\`gh pr view $PR_NUM --json commits\`). The test should
->      have been committed BEFORE the fix. Check out the parent of the fix
->      commit and run the test:
->      \`\`\`bash
->      git fetch origin pull/$PR_NUM/head:pr-$PR_NUM
->      git checkout <test-commit-sha>
->      cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
->      \`\`\`
->      Confirm the test FAILS at that point. If the test passes at the test-
->      commit, the regression test doesn't actually capture the bug → bounce.
->    - If the PR body has no \`## Regression test\` section, or the section's
->      claims don't match what's in the diff, → bounce.
-> 3. For `kind: feature`:
->    - Every new public function in the diff (search for new \`pub fn\`,
->      \`pub struct\`, etc. lines) must have at least one test exercising it.
->      Use \`gh pr diff $PR_NUM\` and grep for new public surface. Cross-check
->      against the test files in the diff. Untested new public surface →
->      bounce.
-> 4. For `kind: refactor` / `docs` / `test-only`: existing tests must still
->    pass (CI will catch this) and the plan's "Existing tests preserved" list
->    must all be green in CI.
->
-> **Visibility-narrowing / dead-code build-verify gate (CHANGES_REQUESTED):**
->
-> For ANY PR diff that narrows visibility (`pub`→`pub(crate)`/`pub(super)`/private)
-> or removes "dead" code: green CI proves the change COMPILES under this repo's
-> global `-Dwarnings`, but a green build alone is NOT enough — you MUST verify the
-> diff's per-symbol classification rationale, not rubber-stamp a grep-only
-> justification. For each affected symbol, confirm the diff's choice matches:
-> **(a)** in-crate non-test caller exists → `pub(crate)` is correct; **(b)** only
-> `#[cfg(test)]` callers or none → the symbol is DEAD and the diff must delete it
-> or keep it `pub` / `#[cfg(test)]` (a crate-root `pub use` re-export can be the
-> sole keep-alive; an integration-test-crate caller blocks `pub(crate)` with
-> E0624) — a blind `pub(crate)` on a (b)-class symbol would not have compiled, so
-> if CI is green the live question is whether the (a)/(b) classification the diff
-> assumed is actually the reason it compiles. Return **CHANGES_REQUESTED** if the
-> PR's narrowing/deletion justification rests on a caller grep with no evidence the
-> (a)/(b) classification was reasoned through. (Full worked trap: the `/plan`
-> SKILL "Examples (verdict patterns)" → "Visibility-narrowing dead-code trap",
-> the #3365 scp cfg(test) case.)
->
-> Then evaluate logic, error handling, readability per usual.
->
-> Post your verdict as a single PR-level comment using \`gh pr comment\`,
-> headed \`## 🔍 Reviewer: Correctness\`, with \`**Verdict:** APPROVE\` or
-> \`**Verdict:** CHANGES_REQUESTED\` on its own line. Inline line comments
-> via \`gh api\` are welcome for specific concerns.
+Both reviewer briefs — the full verbatim prompt text for **Reviewer A (Correctness, always)** and **Reviewer B (Parity if parity-critical, else Risk)** — live in **`reference-reviewer-briefs.md`**. Consult that file when composing each lens's verdict comment; it is a relocation of the detailed briefs with zero information loss.
 
-### Reviewer B — Parity OR Risk (auto-detected)
+The load-bearing contract stays here and is unchanged:
 
-**If parity-critical:**
+- **Reviewer A (Correctness, always):** correctness of the diff, test coverage, readability, error handling; the cycle-awareness step (fetch your own prior `## 🔍 Reviewer: Correctness` comments first — empty ⇒ cycle 1 COMPLETE class-labeled change-list, non-empty ⇒ cycle N≥2 stick to prior classes, flag any `**NEW CLASS DISCOVERED:**`); the **test-verification gate** by linked-issue `kind:` (bug-fix ⇒ regression test that provably fails at the pre-fix commit; feature ⇒ every new `pub` surface has a test; refactor/docs/test-only ⇒ existing tests still green in CI); and the **visibility-narrowing / dead-code build-verify gate** (green CI proves it compiles, but confirm the per-symbol `(a)` in-crate caller vs `(b)` dead classification was actually reasoned through — `CHANGES_REQUESTED` if the justification is a bare caller grep).
+- **Reviewer B (Parity if parity-critical, else Risk):** parity lens focuses only on the **observable/interop surface** per `docs/PARITY.md` (hashes, tx result/meta XDR, SCP/overlay wire bytes, history archive format, HTTP/RPC/CLI contracts, crypto outputs) — internal architecture/metrics/logging/perf are explicitly allowed and must not be flagged; the risk lens covers regressions, perf, API/data-format breaks, security, operational concerns. Same cycle-awareness discipline as Reviewer A, keyed on the reviewer's own header (`Parity`/`Risk`).
 
-> Invoke /spec-adhere style audit on PR #$PR_NUM in stellar-experimental/henyey.
-> Focus on parity as defined in `docs/PARITY.md`: does the change preserve the
-> **observable / interop surface** — ledger/bucket hashes, transaction result &
-> meta XDR, SCP/overlay wire bytes, history archive format, HTTP/RPC/CLI
-> contracts, crypto outputs? Consult the `stellar-core/` submodule for the
-> matching C++ implementation. Raise a CHANGES_REQUESTED concern **only** for a
-> divergence in bytes that cross the network, land in an archive, or appear in
-> hashes/XDR/API responses — i.e. something a peer, Horizon, stellar-rpc, or an
-> archive consumer could observe. Differences in internal architecture, helper
-> utilities, metrics, logging, admin/debug endpoints, or performance are
-> explicitly allowed — do NOT flag them as parity concerns. Post your verdict as
-> a single PR-level comment via `gh pr comment`, headed `## 🔍 Reviewer: Parity`,
-> with `**Verdict:**` on its own line. Reviewer A is doing correctness; you
-> focus only on observable-surface parity.
->
-> **Cycle-awareness (same discipline as Reviewer A):** Before writing your
-> review, fetch your own prior comments via
-> \`gh pr view $PR_NUM --comments --json comments --jq '.comments[] | select(.body | startswith("## 🔍 Reviewer: Parity")) | .body'\`.
-> If empty → cycle 1: produce a complete change-list with every concern
-> labeled by a concern class (e.g. \`parity-gap\`, \`spec-divergence\`,
-> \`sequencing\`, \`edge-case\`). If non-empty → cycle N≥2: stick to the
-> classes you raised before; only add a new class with an explicit
-> \`**NEW CLASS DISCOVERED:**\` flag and rationale. This stops the
-> parity-vs-correctness bounce-orbit that historically pushed PRs into
-> the lifetime cap.
-
-**If non-parity (risk lens):**
-
-> Review PR #$PR_NUM in stellar-experimental/henyey for risk: regressions in
-> existing behavior, performance impact, breaking changes to APIs or data
-> formats, security implications, operational concerns (config, migrations).
-> Reviewer A is doing correctness; you focus only on risk. Post your verdict
-> as a single PR-level comment via `gh pr comment`, headed
-> `## 🔍 Reviewer: Risk`, with `**Verdict:**` on its own line.
->
-> **Cycle-awareness (same discipline as Reviewer A):** Before writing your
-> review, fetch your own prior comments via
-> \`gh pr view $PR_NUM --comments --json comments --jq '.comments[] | select(.body | startswith("## 🔍 Reviewer: Risk")) | .body'\`.
-> Cycle 1 → complete change-list, concerns labeled by class
-> (e.g. \`regression-risk\`, \`perf-regression\`, \`api-break\`,
-> \`migration-risk\`, \`config-risk\`). Cycle N≥2 → stick to your
-> previously-raised classes; only add a new class with an explicit
-> \`**NEW CLASS DISCOVERED:**\` flag and rationale.
+Each lens posts its verdict as its **own** structured `gh pr comment` using the exact header (`## 🔍 Reviewer: Correctness` and `## 🔍 Reviewer: <Parity|Risk>`) and `**Verdict:** APPROVE | CHANGES_REQUESTED` shape defined above — never a single merged block (the Step 6.1 parser keys on the per-reviewer header).
 
 Run both lens passes and post both verdict comments (each its own separate comment) before proceeding.
 
@@ -953,83 +827,9 @@ Exit.
 
 ## Step 7-bis — Force-converge merge (lifetime cap, CI green)
 
-Only entered if Step 6's force-converge override fired. The flow is parallel to Step 7 but takes its follow-up source from the **top-level reviewer CHANGES_REQUESTED concern bullets** instead of (or in addition to) unaddressed inline comments. CI is green by precondition of this branch.
+Only entered if Step 6's force-converge override fired (lifetime bounce cap reached AND CI green). The flow is parallel to Step 7 but takes its follow-up source from the **top-level reviewer CHANGES_REQUESTED concern bullets** (in addition to unaddressed inline comments). In brief: (7-bis.1) collect the unresolved CHANGES_REQUESTED concern bullets from the latest reviewer comments plus unaddressed inline comments; (7-bis.2) file one `follow-up,force-converge`-labeled issue per concern bullet; (7-bis.3) merge with `gh pr merge --squash --admin` (on `--admin` failure, file the follow-ups but leave the PR open and post `## Review: Force-Converge Permission Gap` — never degrade to a non-admin merge); (7-bis.4) run the Step 7.4 cleanup and post the `## ⚠️ Force-Converged (Lifetime Cap)` comment listing the follow-up issues by class, then exit.
 
-#### 7-bis.1 Collect unresolved concern bullets
-
-Parse the latest `## 🔍 Reviewer: Correctness` and `## 🔍 Reviewer: <Parity|Risk>` PR comments. If a reviewer's verdict is `CHANGES_REQUESTED`, extract each bulleted concern from the `<details><summary>Full review</summary>` block. Group by the `class:` label on each bullet (or "(unlabeled)" if missing — older comments may predate the discipline). External reviewer CHANGES_REQUESTED bodies are processed the same way.
-
-Also fetch unaddressed inline comments via the Step 7.1 mechanism — those still file follow-ups too.
-
-#### 7-bis.2 File one follow-up issue per unresolved concern bullet
-
-For each concern bullet:
-
-```bash
-gh issue create --repo stellar-experimental/henyey \
-  --title "<class>: <short summary derived from concern bullet, ≤80 chars>" \
-  --body "$(cat <<EOF
-Follow-up from PR #$PR_NUM (issue #$ISSUE). PR was force-converged at the lifetime bounce cap; this concern was raised by a reviewer but not resolved before merge.
-
-## Concern class
-
-\`<class-name>\` (from reviewer cycle-1 change-list discipline)
-
-## Source
-
-[Reviewer comment](<link-to-reviewer-PR-comment>) on PR #$PR_NUM.
-
-Reviewer: <Correctness|Parity|Risk|external-username>
-Verdict: CHANGES_REQUESTED
-
-## Detail
-
-<full concern bullet body — quote the reviewer's text verbatim>
-
-## Why this is a follow-up, not a merge-blocker
-
-PR #$PR_NUM reached the lifetime bounce cap (6 cycles since last \`## Review: Reset\`) without converging. Per /review-pr force-converge policy, CI being green is sufficient to land the change and preserve unresolved concerns as backlog. Operator should triage this issue — close as won't-fix if the reviewer was over-strict, or schedule a follow-up PR if the concern is real.
-EOF
-)" \
-  --label "follow-up,force-converge"
-```
-
-Also apply any `crate:<name>` label inferred from file paths in the concern text.
-
-Collect the new issue numbers; they'll be referenced in the force-converge comment.
-
-#### 7-bis.3 Merge
-
-```bash
-gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
-```
-
-If `--admin` fails (no admin token), still file the follow-ups, but leave the PR open and post `## Review: Force-Converge Permission Gap` so the operator can land it manually. Do NOT degrade to a non-admin merge.
-
-#### 7-bis.4 Clean up + post
-
-Same cleanup as Step 7.4 (move issue to `done`, unassign, prune worktree + build cache). Then post:
-
-```markdown
-## ⚠️ Force-Converged (Lifetime Cap)
-
-**Commit:** <merge-commit-sha>
-**Lifetime bounce count at force-converge:** <N>
-**CI at merge:** green
-
-This PR cycled 6+ times across multiple code states without convergence between reviewers and `/do`. Rather than blocking indefinitely, the pipeline force-merged on the strength of green CI alone, preserving each unresolved reviewer concern as a follow-up issue for operator triage.
-
-**Unresolved concern follow-ups (by class):**
-- `<class-A>`: #N1, #N2
-- `<class-B>`: #N3
-- `(unlabeled)`: #N4 *(reviewer didn't follow cycle-1 class-labeling discipline)*
-
-**Inline-comment follow-ups (if any):** #N5, #N6
-
-To prevent this in future cycles: reviewers should produce a COMPLETE cycle-1 change-list grouped by concern class. New classes appearing in cycle N≥2 should be flagged `**NEW CLASS DISCOVERED:**` to surface incomplete cycle-1 reviews early.
-```
-
-Exit.
+**See `reference-force-converge.md` for the full worked procedure — the verbatim follow-up issue-body template, the merge command, and the complete `## ⚠️ Force-Converged (Lifetime Cap)` comment template.** Nothing was dropped; the reference file holds the exact text.
 
 ### Wait path
 
