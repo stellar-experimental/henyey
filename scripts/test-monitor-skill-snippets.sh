@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=431
+TAP_PLAN=435
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3141,6 +3141,126 @@ CANNED
   else
     tap_not_ok "quarantine-autostamp: self-resolution (merge sha == quarantined sha) is not stamped" \
       "resolved='$QUARANTINE_RESOLVED' contents='$(cat "$qdir/autostamp_self.txt")'"
+  fi
+
+  # ── Tests 78y-78ab: hold:until-#<N> sentinel (#3711) ────────────────────────
+  # A MANUAL-CLEAR-ONLY hold pins an entry to the lifecycle of a GitHub issue
+  # instead of the textual presence of the SHA's diff. The per-hunk backstop
+  # DECAYS as main drifts: once every hunk fails to reverse-apply, the gate
+  # false-cleared #3702's hold (issue #3711). The sentinel must BLOCK until
+  # the issue is verifiably CLOSED and FAIL CLOSED on any gh uncertainty.
+  #
+  # gh shim: check_quarantine_active invokes `timeout 15 gh ...`, and timeout
+  # exec()s a REAL binary from PATH — a shell-function gh mock is invisible to
+  # it. So these tests use a PATH shim script, driven by exported env:
+  #   _GH_HOLD_SHIM_STATE — the issue state to print (OPEN/CLOSED/…; empty → nothing)
+  #   _GH_HOLD_SHIM_RC    — exit code (default 0; non-zero models gh unavailable)
+  local hold_shim_dir="$qdir/hold-gh-shim"
+  mkdir -p "$hold_shim_dir"
+  cat > "$hold_shim_dir/gh" <<'SHIM'
+#!/usr/bin/env bash
+[ "${_GH_HOLD_SHIM_RC:-0}" -ne 0 ] && exit "${_GH_HOLD_SHIM_RC}"
+[ -n "${_GH_HOLD_SHIM_STATE:-}" ] && printf '%s\n' "$_GH_HOLD_SHIM_STATE"
+exit 0
+SHIM
+  chmod +x "$hold_shim_dir/gh"
+
+  # git mock for the hold tests: the quarantined SHA IS an ancestor, and its
+  # diff's only hunk NO LONGER reverse-applies (content drifted away). WITHOUT
+  # the sentinel this entry auto-CLEARS via step 3 — the exact #3711
+  # false-clear — which is what makes 78y/78aa genuinely depend on the hold.
+  _q_hold_git() {
+    case "$1" in
+      merge-base) return 0 ;;
+      diff)
+        cat <<'CANNED'
+diff --git a/f.rs b/f.rs
+index 1111111..2222222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@ mod m {
++    drifted_away
+ }
+CANNED
+        return 0 ;;
+      apply) return 1 ;;   # every hunk gone → content-check alone would CLEAR
+      *) return 0 ;;
+    esac
+  }
+
+  # ── Test 78y — hold:until + issue OPEN → blocked_active (FAILS pre-#3711) ──
+  printf '%s hold:until-#3702 restore-from-disk wedge — MANUAL-CLEAR-ONLY\n' "$sha1" \
+    > "$qdir/hold_open.txt"
+  git() { _q_hold_git "$@"; }
+  local hold_saved_path="$PATH"
+  PATH="$hold_shim_dir:$PATH"
+  export _GH_HOLD_SHIM_STATE=OPEN
+  local rc78y=0
+  check_quarantine_active "$qdir/hold_open.txt" || rc78y=$?
+  PATH="$hold_saved_path"
+  unset _GH_HOLD_SHIM_STATE
+  unset -f git
+  if [[ $rc78y -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-hold: hold:until-#N + issue OPEN blocks despite drifted diff (#3711)"
+  else
+    tap_not_ok "quarantine-hold: hold:until-#N + issue OPEN blocks despite drifted diff (#3711)" \
+      "rc=$rc78y status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78z — hold:until + issue CLOSED → sentinel released, falls through ─
+  # With the drifted-away diff (all hunks gone), the released entry CLEARs via
+  # the normal step-3 logic — proving CLOSED falls through rather than blocking.
+  printf '%s hold:until-#3702 restore-from-disk wedge — MANUAL-CLEAR-ONLY\n' "$sha1" \
+    > "$qdir/hold_closed.txt"
+  git() { _q_hold_git "$@"; }
+  PATH="$hold_shim_dir:$PATH"
+  export _GH_HOLD_SHIM_STATE=CLOSED
+  local rc78z=0
+  check_quarantine_active "$qdir/hold_closed.txt" || rc78z=$?
+  PATH="$hold_saved_path"
+  unset _GH_HOLD_SHIM_STATE
+  unset -f git
+  if [[ $rc78z -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-hold: hold:until-#N + issue CLOSED falls through to normal logic"
+  else
+    tap_not_ok "quarantine-hold: hold:until-#N + issue CLOSED falls through to normal logic" \
+      "rc=$rc78z status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78aa — hold:until + gh unavailable → blocked_active (fail-closed) ─
+  printf '%s hold:until-#3702 restore-from-disk wedge — MANUAL-CLEAR-ONLY\n' "$sha1" \
+    > "$qdir/hold_gherr.txt"
+  git() { _q_hold_git "$@"; }
+  PATH="$hold_shim_dir:$PATH"
+  export _GH_HOLD_SHIM_RC=127
+  local rc78aa=0
+  check_quarantine_active "$qdir/hold_gherr.txt" || rc78aa=$?
+  PATH="$hold_saved_path"
+  unset _GH_HOLD_SHIM_RC
+  unset -f git
+  if [[ $rc78aa -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-hold: gh unavailable blocks (fail-closed)"
+  else
+    tap_not_ok "quarantine-hold: gh unavailable blocks (fail-closed)" \
+      "rc=$rc78aa status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78ab — autostamp never stamps a hold:until entry ──────────────────
+  # The reason carries BOTH the hold sentinel AND a `regression #N` with a
+  # merged closing PR — the exact #3708 bundled-#N shape. The hold exemption
+  # must win: no resolved: stamp (manual-lifecycle-only).
+  printf '%s hold:until-#3702 regression #3238\n' "$sha1" > "$qdir/hold_autostamp.txt"
+  _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=MERGED _GH_PR_MERGESHA="$sha2"
+  gh() { _q_autostamp_gh "$@"; }
+  quarantine_autostamp "$qdir/hold_autostamp.txt" || true
+  unset -f gh
+  unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  parse_quarantine_file "$qdir/hold_autostamp.txt"
+  if [[ "$QUARANTINE_RESOLVED" == "-" ]]; then
+    tap_ok "quarantine-hold: autostamp skips hold:until entry (manual-lifecycle-only)"
+  else
+    tap_not_ok "quarantine-hold: autostamp skips hold:until entry (manual-lifecycle-only)" \
+      "resolved='$QUARANTINE_RESOLVED' contents='$(cat "$qdir/hold_autostamp.txt")'"
   fi
 
   # ── Test 79: check_quarantine_active — git error on ancestry (fail-closed) ─

@@ -163,6 +163,15 @@ jobs:
       - name: Run spec-adhere skill snippet harness
         run: bash scripts/test-spec-adhere-skill-snippets.sh
 
+  monitor-tick-skill-snippets:
+    name: Monitor-Tick Skill Snippets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run monitor-tick skill snippet harness
+        run: bash scripts/test-monitor-skill-snippets.sh
+
   project-loop-skill-snippets:
     name: Project-Loop Skill Snippets
     runs-on: ubuntu-latest
