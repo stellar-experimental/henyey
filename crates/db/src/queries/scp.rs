@@ -27,6 +27,25 @@ use super::state::StateQueries;
 
 const TX_SET_KEY_PREFIX: &str = "txset:";
 
+/// SQL for [`ScpStatePersistenceQueries::load_all_scp_slot_states`].
+///
+/// Shared with its query-plan regression test
+/// (`test_scpstate_prefix_query_uses_index_not_scan`) so the two can never
+/// drift onto different SQL.
+const LOAD_ALL_SCP_SLOT_STATES_SQL: &str =
+    "SELECT statename, state FROM storestate WHERE statename LIKE ?1 ORDER BY statename";
+
+/// SQL for [`ScpStatePersistenceQueries::load_all_tx_set_data`].
+const LOAD_ALL_TX_SET_DATA_SQL: &str =
+    "SELECT statename, state FROM storestate WHERE statename LIKE ?1";
+
+/// SQL for [`ScpStatePersistenceQueries::get_all_tx_set_hashes`].
+///
+/// Shared with its query-plan regression test
+/// (`test_txset_prefix_query_uses_index_not_scan`).
+const GET_ALL_TX_SET_HASHES_SQL: &str =
+    "SELECT statename FROM storestate WHERE statename LIKE ?1";
+
 /// Query trait for SCP consensus state operations.
 ///
 /// Provides methods for persisting and retrieving SCP envelopes and quorum sets.
@@ -379,9 +398,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
-        let mut stmt = self.prepare(
-            "SELECT statename, state FROM storestate WHERE statename LIKE ?1 ORDER BY statename",
-        )?;
+        let mut stmt = self.prepare(LOAD_ALL_SCP_SLOT_STATES_SQL)?;
         let pattern = format!("{}:%", state_keys::SCP_STATE);
         let rows = stmt.query_map(params![pattern], |row| {
             let key: String = row.get(0)?;
@@ -434,8 +451,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
-        let mut stmt =
-            self.prepare("SELECT statename, state FROM storestate WHERE statename LIKE ?1")?;
+        let mut stmt = self.prepare(LOAD_ALL_TX_SET_DATA_SQL)?;
         let pattern = format!("{TX_SET_KEY_PREFIX}%");
         let rows = stmt.query_map(params![pattern], |row| {
             let key: String = row.get(0)?;
@@ -474,7 +490,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, DbError> {
-        let mut stmt = self.prepare("SELECT statename FROM storestate WHERE statename LIKE ?1")?;
+        let mut stmt = self.prepare(GET_ALL_TX_SET_HASHES_SQL)?;
         let pattern = format!("{TX_SET_KEY_PREFIX}%");
         let rows = stmt.query_map(params![pattern], |row| {
             let key: String = row.get(0)?;
@@ -666,6 +682,52 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    /// Return the `detail` column of every `EXPLAIN QUERY PLAN` row for `sql`,
+    /// joined by newlines. Binds dummy TEXT values for any `?N` placeholders so
+    /// the statement prepares regardless of how many parameters it declares
+    /// (LIKE = 1, range = 2).
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let n = stmt.parameter_count();
+        let dummies: Vec<String> = (0..n).map(|_| String::from("txset:")).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = dummies
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The `txset:` prefix scan on `storestate` (run inside the
+    /// `BEGIN IMMEDIATE` write lock during near-tip back-fill) must resolve to
+    /// an index SEARCH, not a full-table SCAN. Regression for #3702: the
+    /// `LIKE 'txset:%'` form scanned the whole table under the WAL write lock,
+    /// starving SCP intake on the post-restart tracking path.
+    #[test]
+    fn test_txset_prefix_query_uses_index_not_scan() {
+        let conn = setup_db();
+        let plan = query_plan(&conn, GET_ALL_TX_SET_HASHES_SQL);
+        assert!(
+            plan.contains("SEARCH") && !plan.contains("SCAN storestate"),
+            "txset prefix query must use an index SEARCH, not a full-table SCAN; plan was:\n{plan}"
+        );
+    }
+
+    /// The `scpstate:` prefix scan on `storestate` (also run inside the
+    /// `BEGIN IMMEDIATE` write lock) must resolve to an index SEARCH, not a
+    /// full-table SCAN. Regression for #3702.
+    #[test]
+    fn test_scpstate_prefix_query_uses_index_not_scan() {
+        let conn = setup_db();
+        let plan = query_plan(&conn, LOAD_ALL_SCP_SLOT_STATES_SQL);
+        assert!(
+            plan.contains("SEARCH") && !plan.contains("SCAN storestate"),
+            "scpstate prefix query must use an index SEARCH, not a full-table SCAN; plan was:\n{plan}"
+        );
     }
 
     #[test]
