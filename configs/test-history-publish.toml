@@ -62,6 +62,28 @@ known_peers = [
     "core-testnet3.stellar.org:11625"
 ]
 
+[diagnostics]
+# Disable the event-loop watchdog auto-abort in this CI harness.
+#
+# The default watchdog (watchdog_abort_secs = 120) exists to recover a
+# genuinely deadlocked validator on a *supervised* host (systemd /
+# monitor-loop restarts it after the abort). This harness has no supervisor,
+# and scripts/test-history-publish.sh already bounds the run (--timeout 1500
+# plus the job's timeout-minutes: 40), so the process-level self-abort is
+# redundant here.
+#
+# Worse, it produces false positives: under legitimate heavy near-tip
+# SCP-verify load the event loop can stall >120s while still making forward
+# progress, and the watchdog would SIGABRT the node before it publishes its
+# first checkpoint — the exact ~5-min cancel seen in issue #3727. Setting 0
+# (the documented disable sentinel) removes the false-positive abort while
+# preserving all watchdog *logging* (warn >=15s / error >=30s) into the
+# artifact-uploaded validator.log, so a genuine freeze stays diagnosable.
+#
+# The underlying near-tip verify-capacity issue is tracked in #3702; this
+# suppression is scoped to the CI fixture only, not shipped validator configs.
+watchdog_abort_secs = 0
+
 [http]
 enabled = false
 

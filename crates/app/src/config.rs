@@ -4257,6 +4257,16 @@ name = "test"
             Some(format!("mkdir -p {test_history_dir}/{{0}}").as_str()),
             "local archive mkdir command mismatch"
         );
+
+        // The fixture disables the event-loop watchdog auto-abort so a
+        // slow-but-progressing near-tip sync under live-testnet SCP load is
+        // not converted into a hard SIGABRT before the first checkpoint is
+        // published. See issue #3727 (and underlying capacity issue #3702).
+        assert_eq!(
+            config.diagnostics.watchdog_abort_secs, 0,
+            "history-publish fixture must disable the watchdog auto-abort \
+             (watchdog_abort_secs = 0)"
+        );
     }
 
     /// Asserts that the shared sections between `configs/test-history-publish.toml`
