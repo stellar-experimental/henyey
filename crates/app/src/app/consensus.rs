@@ -158,6 +158,44 @@ pub(super) fn classify_timer_event(
     }
 }
 
+/// Decide whether out-of-sync recovery should escalate to a forced catchup.
+///
+/// Pure predicate extracted from `out_of_sync_recovery` (#3728). Escalation
+/// requires the attempt floor `RECOVERY_ESCALATION_CATCHUP` to be crossed, and
+/// then one of:
+///   - `ahead_no_ext` — captive-core startup (Ahead with no externalization);
+///     escalate so recovery converges instead of looping on SCP requests.
+///   - the node is `Behind` by MORE than `RECOVERY_ESCALATION_NEAR_TIP_GAP`.
+///
+/// A pure single-ledger behind gap (`Behind { gap: 1 }`) is deliberately NOT
+/// escalated: it self-recovers via the peer-SCP back-fill path. It falls
+/// through to the `gap <= TX_SET_REQUEST_WINDOW` branch in
+/// `out_of_sync_recovery`, which requests SCP state from peers
+/// (`near_tip_peer_scp_recovery`). Note the Step-2 fast-track in that branch
+/// does NOT fire for `Behind { gap: 1 }` (it requires `AtTip` or
+/// ahead-no-ext), so the fall-through lands in the request-SCP-state path, not
+/// a second hidden catchup. See `RECOVERY_ESCALATION_NEAR_TIP_GAP` for the
+/// safety argument (gap grows past 1 → escalation restored).
+///
+/// `AtTip` / `Ahead` (with externalization) are handled downstream and never
+/// escalate here.
+pub(super) fn should_escalate_to_catchup(
+    attempts: u64,
+    relation: LedgerRelation,
+    ahead_no_ext: bool,
+) -> bool {
+    if attempts < RECOVERY_ESCALATION_CATCHUP {
+        return false;
+    }
+    if ahead_no_ext {
+        return true;
+    }
+    match relation.behind_gap() {
+        Some(gap) => gap > RECOVERY_ESCALATION_NEAR_TIP_GAP,
+        None => false,
+    }
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger.
     ///
@@ -628,14 +666,20 @@ impl App {
         }
 
         // --- Escalation: after many failed attempts, force catchup ---
-        // Escalate when the node is behind consensus, OR when the node is
-        // in the "Ahead" state with no SCP externalization yet (latest_ext=0).
-        // The latter case covers captive-core in quickstart/local mode: it
-        // closes ledgers from the validator's EXTERNALIZE messages but never
-        // externalizes itself, so without this escalation the recovery loop
-        // would request SCP state forever without converging.
+        // Escalate when the node is behind consensus by MORE than a single
+        // ledger, OR when the node is in the "Ahead" state with no SCP
+        // externalization yet (latest_ext=0). The latter case covers
+        // captive-core in quickstart/local mode: it closes ledgers from the
+        // validator's EXTERNALIZE messages but never externalizes itself, so
+        // without this escalation the recovery loop would request SCP state
+        // forever without converging.
+        //
+        // A pure single-ledger behind gap (gap==1) is deliberately NOT
+        // escalated (#3728): it self-recovers via the peer-SCP back-fill path
+        // below, so a forced catchup is redundant work. See
+        // `should_escalate_to_catchup` and `RECOVERY_ESCALATION_NEAR_TIP_GAP`.
         let ahead_no_ext = relation.is_ahead_without_externalization(latest_externalized);
-        if attempts >= RECOVERY_ESCALATION_CATCHUP && (relation.is_behind() || ahead_no_ext) {
+        if should_escalate_to_catchup(attempts, relation, ahead_no_ext) {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
                 .trigger_recovery_catchup(current_ledger, latest_externalized, relation, attempts)
@@ -2275,7 +2319,57 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_cannot_apply_reason, CannotApplyReason, LedgerRelation};
+    use super::{
+        classify_cannot_apply_reason, should_escalate_to_catchup, CannotApplyReason, LedgerRelation,
+    };
+
+    // ── should_escalate_to_catchup tests (#3728) ────────────────────────
+
+    #[test]
+    fn test_should_escalate_to_catchup_suppresses_single_ledger_gap() {
+        // Exact issue #3728 scenario: attempts=8, gap==1 → no forced catchup.
+        // The node self-recovers via the peer-SCP back-fill path instead.
+        assert!(!should_escalate_to_catchup(
+            8,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_fires_on_multi_ledger_gap() {
+        // A genuine multi-ledger stall still escalates once the attempt floor
+        // is crossed.
+        assert!(should_escalate_to_catchup(
+            6,
+            LedgerRelation::Behind { gap: 2 },
+            false
+        ));
+        assert!(should_escalate_to_catchup(
+            8,
+            LedgerRelation::Behind { gap: 12 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_respects_attempt_floor() {
+        // Below the attempt threshold, never escalate regardless of gap.
+        assert!(!should_escalate_to_catchup(
+            5,
+            LedgerRelation::Behind { gap: 5 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_preserves_ahead_no_ext() {
+        // Captive-core startup path (Ahead with no externalization) must still
+        // escalate so recovery converges.
+        assert!(should_escalate_to_catchup(6, LedgerRelation::Ahead, true));
+        // AtTip never escalates here — it is handled downstream.
+        assert!(!should_escalate_to_catchup(6, LedgerRelation::AtTip, false));
+    }
 
     // ── LedgerRelation tests ────────────────────────────────────────────
 

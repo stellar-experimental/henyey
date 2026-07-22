@@ -145,6 +145,27 @@ const RECOVERY_ESCALATION_SCP_REQUEST: u64 = 6;
 /// equals ~6s.
 const RECOVERY_ESCALATION_CATCHUP: u64 = 6;
 
+/// Maximum single-ledger behind-gap that is treated as benign near-tip lag and
+/// is NOT escalated to a forced catchup (#3728).
+///
+/// A momentary `gap == 1` lag on an otherwise-healthy validator self-recovers
+/// via the peer-SCP back-fill path (`request SCP state from peers`, the
+/// `gap <= TX_SET_REQUEST_WINDOW` branch in `out_of_sync_recovery`), mirroring
+/// stellar-core's `HerderImpl::outOfSyncRecovery` — which rebroadcasts SCP and
+/// calls `getMoreSCPState()` and has NO attempt-counter-driven forced archive
+/// catchup at all. Forcing a catchup for a single-ledger tip gap is redundant
+/// work that trips the `forcing_catchup_behind` streak alarm without ever
+/// breaking real-time sync.
+///
+/// Safety: this only suppresses escalation while the gap stays at exactly 1.
+/// The externalized tip advances independently of a stuck node, so a node
+/// genuinely wedged at LCL=N while the network progresses observes
+/// `latest_externalized` climb to N+2, N+3… within seconds, flipping the
+/// relation to `Behind { gap >= 2 }` and restoring the escalation path. The
+/// only case where escalation stays suppressed is a network-wide freeze at
+/// N+1, where there is nothing to catch up to and waiting is correct.
+const RECOVERY_ESCALATION_NEAR_TIP_GAP: u64 = 1;
+
 /// Maximum slot gap between the highest observed EXTERNALIZE and our
 /// current ledger before `submit_transaction()` rejects with TryAgainLater.
 ///
