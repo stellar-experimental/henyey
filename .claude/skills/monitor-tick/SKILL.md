@@ -1391,6 +1391,23 @@ its own state machine because ratio checks are globally skipped during unsync
 states (ledger age > 30s, gap > 5, etc.), but the recovery-stalled counter fires
 precisely during recovery transitions when the node is briefly unsynced.
 
+> **#3728 firing scope (post-PR #3731):** A momentary single-ledger lag
+> (`gap == 1`) no longer increments `forcing_catchup_behind` on every recovery
+> tick — the escalation is suppressed while the gap stays momentary, so the
+> false-positive streak-3 breach that filed #3728 no longer occurs. The
+> suppression is **bounded**: a node genuinely wedged at exactly `gap == 1`
+> resumes firing `forcing_catchup_behind` once the stall persists past
+> `RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS` (12) consecutive
+> no-progress attempts, so this check still catches a truly-stuck near-tip node
+> — just after a short grace window rather than on the first tick. While the
+> gap stays suppressed, the node instead increments the distinct,
+> **non-alarming** `henyey_recovery_stalled_tick_total{reason="near_tip_gap1_suppressed"}`
+> counter. That label is **not** an alarm input (Check 12b keys only on
+> `forcing_catchup_behind`); it is a scrape-only observability signal — a
+> steadily-climbing `near_tip_gap1_suppressed` with a flat ledger indicates a
+> node parked at `gap == 1` and is worth manual investigation even before the
+> bounded backstop trips `forcing_catchup_behind`.
+
 **Data source:** Reuses the same `/metrics` scrape result (`$metrics_body` /
 `metrics/current.prom`) already fetched by check-12. Does NOT perform a
 second `/metrics` fetch.
