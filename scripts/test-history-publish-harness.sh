@@ -40,6 +40,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/test-history-publish.sh"
 WORKFLOW="$REPO_ROOT/.github/workflows/history-publish.yml"
 RUN_CMD="$REPO_ROOT/crates/app/src/run_cmd.rs"
+APP_MOD="$REPO_ROOT/crates/app/src/app/mod.rs"
+LIFECYCLE="$REPO_ROOT/crates/app/src/app/lifecycle.rs"
 
 # The exact sync marker the run loop emits when the node reaches sync. This is
 # the single source of truth shared between the classifier and the assertion
@@ -303,8 +305,160 @@ test_workflow_wires_soft_flag() {
     fi
 }
 
+# ============================================================
+# Tests 7-8: in-loop stall detector (#3741)
+#
+# Background (#3741): #3732 disabled the fixture's internal watchdog auto-abort
+# because it was killing a still-progressing node under legitimate slow-verify
+# load. That removed the only code path that turned "event loop badly stalled"
+# into a clean, script-detected process death — so now the node just keeps
+# grinding until GitHub Actions' own external job/run-level cancellation kills
+# the whole runner, which skips even if: always()-gated steps (Upload
+# logs/Summary never run), leaving zero validator.log evidence for any of the
+# four recurrences (#3280, #3707, #3727, #3741).
+#
+# is_log_stalled() (driven via the --classify-stall-only <log_file>
+# <threshold_secs> CLI seam) is a pure mtime-staleness check: if validator.log
+# has produced zero new bytes for threshold_secs while the harness's own
+# process liveness check still says the node is alive, this is a genuine stall
+# distinct from "testnet never became reachable" (SYNC-TIMEOUT) — always a hard
+# red (DISPOSITION: STALL, exit 1, never covered by --soft-on-sync-timeout), so
+# the workflow's existing `if: failure()` Upload-logs step fires and the full
+# validator.log artifact is captured.
+# ============================================================
+
+# Build a synthetic validator.log fixture with a controllable mtime.
+# Args: <name> <mtime_offset_secs>  (0 = now/fresh; >0 = that many seconds ago)
+make_stall_fixture() {
+    local name="$1"
+    local mtime_offset_secs="$2"
+    local data_dir="$TMPDIR_BASE/stall-fixture-$name"
+    local log="$data_dir/validator.log"
+
+    mkdir -p "$data_dir"
+    echo "closing ledger 1" > "$log"
+
+    if [[ "$mtime_offset_secs" -gt 0 ]]; then
+        touch -d "@$(( $(date +%s) - mtime_offset_secs ))" "$log"
+    fi
+
+    echo "$log"
+}
+
+# ------------------------------------------------------------
+# Test 7: a validator.log with a stale mtime (no forward progress for longer
+# than the threshold) is flagged as a stall — hard red, DISPOSITION: STALL.
+# FAILS on origin/main: --classify-stall-only does not exist (the script hits
+# the `*) echo "Unknown arg: $1"; exit 1 ;;` branch, exit code happens to be 1
+# for the wrong reason, and NO "DISPOSITION: STALL" marker is ever printed).
+# ------------------------------------------------------------
+test_stall_detector_flags_stale_log() {
+    local log
+    log=$(make_stall_fixture "stale" 600)  # mtime 10 minutes in the past
+
+    local out="$TMPDIR_BASE/out-stall-stale.txt"
+    local exit_code=0
+    "$SCRIPT" --classify-stall-only "$log" 180 >"$out" 2>&1 || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        tap_ok "stale_log_stall_detector_exits_nonzero"
+    else
+        tap_not_ok "stale_log_stall_detector_exits_nonzero" "exit=$exit_code (expected 1, stalled)"
+    fi
+
+    if grep -q 'DISPOSITION: STALL' "$out"; then
+        tap_ok "stale_log_stall_detector_emits_disposition_stall"
+    else
+        tap_not_ok "stale_log_stall_detector_emits_disposition_stall" \
+            "no DISPOSITION: STALL marker in output: $(cat "$out")"
+    fi
+}
+
+# ------------------------------------------------------------
+# Test 8: a validator.log with a fresh mtime (progress within the threshold)
+# is NOT flagged — exit 0, no STALL marker. Same origin/main failure mode as
+# test 7 (flag doesn't exist yet).
+# ------------------------------------------------------------
+test_stall_detector_ignores_fresh_log() {
+    local log
+    log=$(make_stall_fixture "fresh" 0)
+
+    local out="$TMPDIR_BASE/out-stall-fresh.txt"
+    local exit_code=0
+    "$SCRIPT" --classify-stall-only "$log" 180 >"$out" 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "fresh_log_stall_detector_exits_zero"
+    else
+        tap_not_ok "fresh_log_stall_detector_exits_zero" "exit=$exit_code (expected 0, not stalled)"
+    fi
+
+    if ! grep -q 'DISPOSITION: STALL' "$out"; then
+        tap_ok "fresh_log_stall_detector_no_stall_marker"
+    else
+        tap_not_ok "fresh_log_stall_detector_no_stall_marker" \
+            "unexpected DISPOSITION: STALL marker for a fresh log"
+    fi
+}
+
+# ============================================================
+# Test 9: the live-tail diagnostic grep filter is pinned to real signal names
+#
+# The script's incremental live-tail (new validator.log lines echoed into the
+# step's own GitHub-captured stdout every poll iteration) is filtered through a
+# grep for known diagnostic families, so it doesn't flood CI log volume. This
+# pins those family tokens to (a) their presence in the script's filter, and
+# (b) the actual strings still emitted by the Rust source that produced them
+# (crates/app/src/app/mod.rs's "WATCHDOG: ..." events, #3727/#3732; and
+# crates/app/src/app/lifecycle.rs's db_write_ctx = "peer-record-update",
+# #3702/#3704) — mirroring test_sync_marker_matches_run_loop_log's "pin the
+# string so wording drift breaks loudly" pattern.
+# ============================================================
+test_diagnostic_grep_pins_known_signal_names() {
+    if [[ ! -f "$APP_MOD" ]] || [[ ! -f "$LIFECYCLE" ]]; then
+        tap_not_ok "diagnostic_filter_pins_all_known_families" "source files not found"
+        tap_not_ok "watchdog_marker_present_in_app_mod" "source files not found"
+        tap_not_ok "db_write_ctx_marker_present_in_lifecycle" "source files not found"
+        return
+    fi
+
+    # (a) The script's live-tail filter must reference each known diagnostic
+    # family token established by #3727's root-cause capture and the #3702
+    # db_write_ctx instrumentation.
+    local families=("WATCHDOG" "maxtps_scp" "database is locked" "straggler timeout" "db_write_ctx")
+    local missing=""
+    for f in "${families[@]}"; do
+        if ! grep -qF "$f" "$SCRIPT"; then
+            missing="$missing [$f]"
+        fi
+    done
+    if [[ -z "$missing" ]]; then
+        tap_ok "diagnostic_filter_pins_all_known_families"
+    else
+        tap_not_ok "diagnostic_filter_pins_all_known_families" \
+            "test-history-publish.sh live-tail filter missing:$missing"
+    fi
+
+    # (b) Cross-check those tokens are still emitted by the real source, so a
+    # future wording change breaks this harness loudly instead of silently
+    # rotting the live-tail filter into a no-op for that family.
+    if grep -qF "WATCHDOG:" "$APP_MOD"; then
+        tap_ok "watchdog_marker_present_in_app_mod"
+    else
+        tap_not_ok "watchdog_marker_present_in_app_mod" \
+            "crates/app/src/app/mod.rs no longer emits a WATCHDOG: marker"
+    fi
+
+    if grep -qF 'db_write_ctx = "peer-record-update"' "$LIFECYCLE"; then
+        tap_ok "db_write_ctx_marker_present_in_lifecycle"
+    else
+        tap_not_ok "db_write_ctx_marker_present_in_lifecycle" \
+            "crates/app/src/app/lifecycle.rs no longer emits db_write_ctx = \"peer-record-update\""
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 14
+tap_plan 21
 
 test_never_synced_soft_skip
 test_synced_no_publish_hard_red
@@ -312,6 +466,9 @@ test_never_synced_default_red
 test_published_proceeds
 test_sync_marker_matches_run_loop_log
 test_workflow_wires_soft_flag
+test_stall_detector_flags_stale_log
+test_stall_detector_ignores_fresh_log
+test_diagnostic_grep_pins_known_signal_names
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
