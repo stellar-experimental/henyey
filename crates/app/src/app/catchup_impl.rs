@@ -1564,24 +1564,53 @@ impl App {
             return None;
         }
 
-        // Defense-in-depth (#2664): skip hard reset when the node is at-tip
-        // (latest_ext == current_ledger, both non-zero). There is nothing to
-        // catch up to — any spawned catchup would fail with "archive not
-        // ahead of min_ledger." Clear coupled stale state so callers don't
-        // immediately retry. Excludes startup (latest_ext == 0) where
-        // Ahead-no-ext semantics require escalation.
+        // Defense-in-depth (#2664, widened #3733): skip hard reset when the
+        // node is at-tip. There is nothing to catch up to — any spawned
+        // catchup would fail with "archive not ahead of min_ledger." Clear
+        // coupled stale state so callers don't immediately retry.
+        //
+        // Two at-tip signals fire the skip (both exclude startup latest_ext==0,
+        // where Ahead-no-ext semantics require escalation):
+        //   1. Exact equality latest_ext == current_ledger (the original #2664
+        //      steady-state tip).
+        //   2. #3733: latest_ext is transiently 1–2 AHEAD of current_ledger
+        //      (within the near-tip band, <= TX_SET_REQUEST_WINDOW) yet
+        //      verified peers are NOT ahead (effective_peer_gap == 0). This is
+        //      the inbound-flap transient: EXTERNALIZE envelopes for slots
+        //      > current_ledger+1 briefly arm sync_recovery_pending; by the time
+        //      this runs the node has closed those ledgers and is glued to the
+        //      tip (max_verified_scp_slot == current_ledger), but
+        //      herder.latest_externalized_slot() lags one tick behind and reads
+        //      current+1..2. The strict-equality guard let that slip past into a
+        //      doomed ProbeAhead ("checkpoint N not ahead of min_ledger M"). The
+        //      verified peer gap is the authoritative near-tip signal (same
+        //      evidence the heartbeat reports as peer_gap=0). Genuine
+        //      behind-the-network escalation (peer_gap >= 3) is untouched — it
+        //      falls through to the #2713/#3262 suppression and the real reset.
+        //      The near-tip band bound (<= TX_SET_REQUEST_WINDOW) is what keeps
+        //      a genuine large local behind (e.g. latest_ext = current + 50 with
+        //      stale-low max_verified_scp_slot) from being mis-suppressed — such
+        //      a gap is never a near-tip blip. Mirrors is_spurious_near_tip_behind
+        //      at the consensus.rs emit site.
         //
         // Positioned before the livelock breaker: spurious resets should not
         // contribute to the fatal-shutdown timeout.
-        if latest_ext > 0 && latest_ext == current_ledger as u64 {
+        let local_gap = latest_ext.saturating_sub(current_ledger as u64);
+        let at_tip_exact = latest_ext == current_ledger as u64;
+        let near_tip_peers_not_ahead =
+            local_gap <= TX_SET_REQUEST_WINDOW && self.effective_peer_gap(current_ledger) == 0;
+        if latest_ext > 0 && (at_tip_exact || near_tip_peers_not_ahead) {
             self.clear_archive_recovery_state(ArchiveRecoveryClear::DefenseSkip)
                 .await;
             tracing::debug!(
                 current_ledger,
                 latest_externalized = latest_ext,
+                peer_gap = self.effective_peer_gap(current_ledger),
+                at_tip_exact,
+                near_tip_peers_not_ahead,
                 ?reason,
-                "Hard reset skipped: node is at-tip (latest_ext == current_ledger > 0), \
-                 cleared stale recovery state (#2664)"
+                "Hard reset skipped: node is at-tip (exact equality or near-tip with \
+                 verified peer_gap==0), cleared stale recovery state (#2664/#3733)"
             );
             return None;
         }
@@ -6864,6 +6893,150 @@ mod tests {
         assert!(
             !app.archive_checkpoint_cache.is_urgent(),
             "urgent polling must be disarmed"
+        );
+    }
+
+    /// #3733: when the node is near-tip — `latest_ext` is transiently 1
+    /// ahead of `current_ledger` (NOT equal, so the exact-equality #2664
+    /// guard does not match) but verified peers are NOT ahead
+    /// (`effective_peer_gap == 0`) — the widened guard must still skip the
+    /// hard reset and clear the same coupled stale state. On origin/main the
+    /// strict `latest_ext == current_ledger` guard does not match
+    /// `latest_ext = 5_001`, so the fn proceeds to `spawn_catchup(ProbeAhead)`
+    /// which fails with "archive not ahead of min_ledger."
+    #[tokio::test]
+    async fn test_hard_reset_skipped_near_tip_peer_gap_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // latest_externalized is transiently ONE ahead of current_ledger
+        // (5_001 != 5_000) — the exact-equality #2664 guard does NOT match.
+        app.herder.scp_driver().record_externalized(
+            current_ledger as u64 + 1,
+            Default::default(),
+            None,
+        );
+        app.herder
+            .scp_driver()
+            .publish_externalized(current_ledger as u64 + 1);
+
+        // Verified peers are NOT ahead: max_verified_scp_slot <= current_ledger
+        // → effective_peer_gap == 0. This is the authoritative near-tip signal.
+        app.max_verified_scp_slot
+            .store(current_ledger as u64, Ordering::Relaxed);
+
+        // Arm stale archive-behind state.
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            };
+        }
+        app.archive_checkpoint_cache.set_urgent(true);
+        app.hard_reset_livelock_start.store(42, Ordering::Relaxed);
+
+        // Backdate start_instant so cooldown doesn't block.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Should return None (near-tip guard fired).
+        assert!(
+            result.is_none(),
+            "near-tip peer_gap==0 guard should return None"
+        );
+
+        // Counter should NOT have incremented.
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before,
+            "counter must not increment when near-tip guard fires"
+        );
+
+        // All coupled state should be cleared identically to the at-tip path.
+        assert!(
+            matches!(
+                *app.archive_recovery_status.read().await,
+                ArchiveRecoveryStatus::Unknown
+            ),
+            "archive_recovery_status must be cleared"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock_start must be cleared"
+        );
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "urgent polling must be disarmed"
+        );
+    }
+
+    /// #3733 negative: when the node is genuinely behind the network — peers
+    /// verifiably ahead (`effective_peer_gap >= 3`) even though `latest_ext`
+    /// is only 1 ahead — the widened near-tip guard must NOT fire; the hard
+    /// reset must proceed to escalation.
+    #[tokio::test]
+    async fn test_hard_reset_not_skipped_near_tip_when_peers_ahead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder.scp_driver().record_externalized(
+            current_ledger as u64 + 1,
+            Default::default(),
+            None,
+        );
+        app.herder
+            .scp_driver()
+            .publish_externalized(current_ledger as u64 + 1);
+
+        // Peers verifiably ahead: peer_gap = 50 (>= HARD_RESET_GAP_ESCALATION).
+        app.max_verified_scp_slot
+            .store(current_ledger as u64 + 50, Ordering::Relaxed);
+
+        // Seed a known-ahead archive checkpoint so the #2713/#3262 tip
+        // suppression does not swallow the reset — this test isolates the
+        // #3733 near-tip guard, which must NOT fire when peers are ahead.
+        app.archive_checkpoint_cache.seed(current_ledger + 50);
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // On the test harness `spawn_catchup` returns None even when the
+        // reset proceeds, so the authoritative signal that no guard swallowed
+        // it is the counter increment (mirrors test_hard_reset_proceeds_when_behind).
+        let _ = result;
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before + 1,
+            "hard reset must proceed (counter increments) when peers are verifiably ahead"
         );
     }
 
