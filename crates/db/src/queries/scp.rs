@@ -38,16 +38,32 @@ const TX_SET_KEY_PREFIX: &str = "txset:";
 const LOAD_ALL_SCP_SLOT_STATES_SQL: &str =
     "SELECT statename, state FROM storestate WHERE statename >= ?1 AND statename < ?2 ORDER BY statename";
 
+/// Open-upper-bound variant of [`LOAD_ALL_SCP_SLOT_STATES_SQL`], used when
+/// [`prefix_range`] returns `None` (no finite successor — an all-`char::MAX`
+/// prefix). Selects everything `>= ?1` with no upper clause.
+const LOAD_ALL_SCP_SLOT_STATES_OPEN_SQL: &str =
+    "SELECT statename, state FROM storestate WHERE statename >= ?1 ORDER BY statename";
+
 /// SQL for [`ScpStatePersistenceQueries::load_all_tx_set_data`]. Range-bound
 /// (see [`LOAD_ALL_SCP_SLOT_STATES_SQL`]).
 const LOAD_ALL_TX_SET_DATA_SQL: &str =
     "SELECT statename, state FROM storestate WHERE statename >= ?1 AND statename < ?2";
+
+/// Open-upper-bound variant of [`LOAD_ALL_TX_SET_DATA_SQL`] (see
+/// [`LOAD_ALL_SCP_SLOT_STATES_OPEN_SQL`]).
+const LOAD_ALL_TX_SET_DATA_OPEN_SQL: &str =
+    "SELECT statename, state FROM storestate WHERE statename >= ?1";
 
 /// SQL for [`ScpStatePersistenceQueries::get_all_tx_set_hashes`]. Range-bound
 /// (see [`LOAD_ALL_SCP_SLOT_STATES_SQL`]). Shared with its query-plan
 /// regression test (`test_txset_prefix_query_uses_index_not_scan`).
 const GET_ALL_TX_SET_HASHES_SQL: &str =
     "SELECT statename FROM storestate WHERE statename >= ?1 AND statename < ?2";
+
+/// Open-upper-bound variant of [`GET_ALL_TX_SET_HASHES_SQL`] (see
+/// [`LOAD_ALL_SCP_SLOT_STATES_OPEN_SQL`]).
+const GET_ALL_TX_SET_HASHES_OPEN_SQL: &str =
+    "SELECT statename FROM storestate WHERE statename >= ?1";
 
 /// Query trait for SCP consensus state operations.
 ///
@@ -324,11 +340,24 @@ fn tx_set_key(hash: &Hash) -> String {
     format!("{TX_SET_KEY_PREFIX}{}", hex::encode(hash.0))
 }
 
-/// Compute the half-open BINARY range `[lower, upper)` that matches exactly the
-/// keys beginning with `prefix`, for use as `statename >= lower AND statename <
-/// upper`. `lower` is `prefix` verbatim; `upper` is `prefix` with its final byte
-/// incremented by one, giving an exclusive upper bound that excludes adjacent
-/// prefixes (`txset:` -> `[txset:, txset;)`).
+/// Compute the half-open BINARY range `[lower, Some(upper))` that matches
+/// exactly the keys beginning with `prefix`, for use as `statename >= lower AND
+/// statename < upper`. `lower` is `prefix` verbatim; `upper` is `Some(s)` where
+/// `s` replaces the final Unicode scalar of `prefix` with its successor —
+/// carrying past any trailing `char::MAX` scalars — giving an exclusive upper
+/// bound that excludes adjacent prefixes (`txset:` -> `[txset:, Some(txset;))`).
+/// `upper` is `None` when `prefix` has no finite successor (every scalar is
+/// `char::MAX`), signalling an open upper bound — the range is then
+/// `statename >= lower` with no upper clause.
+///
+/// Working at the Unicode-scalar level (rather than incrementing the final
+/// byte) is what makes this total: UTF-8 byte ordering is identical to Unicode
+/// scalar ordering, so a scalar-level successor is a correct exclusive upper
+/// bound under the BINARY (bytewise) `storestate` primary-key collation, and it
+/// always re-encodes to valid UTF-8. The old byte-level increment panicked in
+/// `String::from_utf8` for any prefix ending in a `0xFF` byte or a multi-byte
+/// trailing codepoint (e.g. `U+07FF` = `DF BF` -> `DF C0`, invalid) — see
+/// #3735.
 ///
 /// This range is index-usable against the BINARY `storestate` primary-key
 /// autoindex (an index SEARCH), unlike a case-insensitive `LIKE 'prefix%'`,
@@ -340,16 +369,46 @@ fn tx_set_key(hash: &Hash) -> String {
 /// changes results.
 ///
 /// The two call sites pass `txset:` and `scpstate:`, both ending in `:` (0x3A),
-/// so the increment is `:` -> `;` (0x3B) with no carry and stays valid ASCII.
-fn prefix_range(prefix: &str) -> (String, String) {
-    let mut upper = prefix.as_bytes().to_vec();
-    let last = upper
-        .last_mut()
-        .expect("prefix_range requires a non-empty prefix");
-    // Callers pass ':'-terminated prefixes; the increment never carries.
-    *last += 1;
-    let upper = String::from_utf8(upper).expect("incremented prefix stays valid UTF-8");
+/// so the successor is `:` -> `;` (0x3B) with no carry and stays valid ASCII —
+/// byte-identical to the previous implementation.
+fn prefix_range(prefix: &str) -> (String, Option<String>) {
+    assert!(
+        !prefix.is_empty(),
+        "prefix_range requires a non-empty prefix"
+    );
+
+    // Walk scalars from the end, carrying past trailing `char::MAX` scalars.
+    // `head` is everything before the scalar we successfully incremented.
+    let mut upper: Option<String> = None;
+    for (idx, c) in prefix.char_indices().rev() {
+        if let Some(next) = char_successor(c) {
+            let mut s = String::with_capacity(prefix.len());
+            s.push_str(&prefix[..idx]);
+            s.push(next);
+            upper = Some(s);
+            break;
+        }
+        // c == char::MAX: it carries — drop it and try the preceding scalar.
+    }
+
     (prefix.to_string(), upper)
+}
+
+/// Smallest Unicode scalar strictly greater than `c`, or `None` when `c` is
+/// `char::MAX` (no successor). Skips the surrogate gap `U+D800..=U+DFFF`, which
+/// is not a valid scalar value, so the result is always a valid `char`.
+fn char_successor(c: char) -> Option<char> {
+    // Surrogate range is not encodable as a char; step over it.
+    const SURROGATE_START: u32 = 0xD800;
+    const SURROGATE_END: u32 = 0xDFFF;
+
+    let next = c as u32 + 1;
+    let next = if next == SURROGATE_START {
+        SURROGATE_END + 1
+    } else {
+        next
+    };
+    char::from_u32(next)
 }
 
 fn parse_slot_key(key: &str) -> Option<u64> {
@@ -429,9 +488,15 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
-        let mut stmt = self.prepare(LOAD_ALL_SCP_SLOT_STATES_SQL)?;
         let (lower, upper) = prefix_range(&format!("{}:", state_keys::SCP_STATE));
-        let rows = stmt.query_map(params![lower, upper], |row| {
+        // Select bounded vs. open-upper-bound SQL by the successor's presence.
+        // Keep `lower`/`upper` owned so the borrowed params outlive `query_map`.
+        let (sql, sql_params): (&str, Vec<&dyn rusqlite::types::ToSql>) = match &upper {
+            Some(u) => (LOAD_ALL_SCP_SLOT_STATES_SQL, vec![&lower, u]),
+            None => (LOAD_ALL_SCP_SLOT_STATES_OPEN_SQL, vec![&lower]),
+        };
+        let mut stmt = self.prepare(sql)?;
+        let rows = stmt.query_map(sql_params.as_slice(), |row| {
             let key: String = row.get(0)?;
             let state: String = row.get(1)?;
             Ok((key, state))
@@ -482,9 +547,13 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
-        let mut stmt = self.prepare(LOAD_ALL_TX_SET_DATA_SQL)?;
         let (lower, upper) = prefix_range(TX_SET_KEY_PREFIX);
-        let rows = stmt.query_map(params![lower, upper], |row| {
+        let (sql, sql_params): (&str, Vec<&dyn rusqlite::types::ToSql>) = match &upper {
+            Some(u) => (LOAD_ALL_TX_SET_DATA_SQL, vec![&lower, u]),
+            None => (LOAD_ALL_TX_SET_DATA_OPEN_SQL, vec![&lower]),
+        };
+        let mut stmt = self.prepare(sql)?;
+        let rows = stmt.query_map(sql_params.as_slice(), |row| {
             let key: String = row.get(0)?;
             let state: String = row.get(1)?;
             Ok((key, state))
@@ -521,9 +590,13 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, DbError> {
-        let mut stmt = self.prepare(GET_ALL_TX_SET_HASHES_SQL)?;
         let (lower, upper) = prefix_range(TX_SET_KEY_PREFIX);
-        let rows = stmt.query_map(params![lower, upper], |row| {
+        let (sql, sql_params): (&str, Vec<&dyn rusqlite::types::ToSql>) = match &upper {
+            Some(u) => (GET_ALL_TX_SET_HASHES_SQL, vec![&lower, u]),
+            None => (GET_ALL_TX_SET_HASHES_OPEN_SQL, vec![&lower]),
+        };
+        let mut stmt = self.prepare(sql)?;
+        let rows = stmt.query_map(sql_params.as_slice(), |row| {
             let key: String = row.get(0)?;
             Ok(key)
         })?;
@@ -766,22 +839,57 @@ mod tests {
     /// turns `U+07FF` (`DF BF`) into `DF C0` — invalid UTF-8 — so the
     /// `String::from_utf8().expect()` panics. The char-level successor yields
     /// `U+0800` instead.
+    /// Regression for #3735: a prefix ending in a multi-byte UTF-8 trailing
+    /// codepoint must not panic. On `origin/main` the naive last-byte increment
+    /// turns `U+07FF` (`DF BF`) into `DF C0` — invalid UTF-8 — so the
+    /// `String::from_utf8().expect()` panics. The char-level successor yields
+    /// `U+0800` instead. Also covers ASCII `U+007F` -> `U+0080` (a 1-byte to
+    /// 2-byte transition the byte increment likewise botched into `0x80`).
     #[test]
     fn test_prefix_range_multibyte_utf8_trailing() {
-        let (lower, upper) = prefix_range("a\u{07FF}");
-        assert_eq!(lower, "a\u{07FF}");
-        assert_eq!(upper, "a\u{0800}");
+        assert_eq!(
+            prefix_range("a\u{07FF}"),
+            ("a\u{07FF}".to_string(), Some("a\u{0800}".to_string()))
+        );
+        assert_eq!(
+            prefix_range("a\u{007F}"),
+            ("a\u{007F}".to_string(), Some("a\u{0080}".to_string()))
+        );
+    }
+
+    /// The successor must step over the surrogate gap `U+D800..=U+DFFF`, which
+    /// is not a valid Unicode scalar: `U+D7FF`'s successor is `U+E000`.
+    #[test]
+    fn test_prefix_range_surrogate_gap() {
+        assert_eq!(
+            prefix_range("a\u{D7FF}"),
+            ("a\u{D7FF}".to_string(), Some("a\u{E000}".to_string()))
+        );
+    }
+
+    /// A trailing `char::MAX` (`U+10FFFF`) has no finite successor, so the carry
+    /// propagates: an all-`char::MAX` prefix yields an open upper bound
+    /// (`None`), while a prefix whose last scalar is `char::MAX` but whose
+    /// earlier scalar has a successor increments that earlier scalar and drops
+    /// the trailing `char::MAX` (`a\u{10FFFF}` -> `b`).
+    #[test]
+    fn test_prefix_range_open_upper_bound() {
+        assert_eq!(prefix_range("\u{10FFFF}"), ("\u{10FFFF}".to_string(), None));
+        assert_eq!(
+            prefix_range("a\u{10FFFF}"),
+            ("a\u{10FFFF}".to_string(), Some("b".to_string()))
+        );
     }
 
     #[test]
     fn test_prefix_range_upper_bound() {
         assert_eq!(
             prefix_range("txset:"),
-            ("txset:".to_string(), "txset;".to_string())
+            ("txset:".to_string(), Some("txset;".to_string()))
         );
         assert_eq!(
             prefix_range("scpstate:"),
-            ("scpstate:".to_string(), "scpstate;".to_string())
+            ("scpstate:".to_string(), Some("scpstate;".to_string()))
         );
     }
 
@@ -801,6 +909,7 @@ mod tests {
         }
 
         let (lower, upper) = prefix_range(TX_SET_KEY_PREFIX);
+        let upper = upper.expect("txset: has a finite successor");
         let mut stmt = conn
             .prepare("SELECT statename FROM storestate WHERE statename >= ?1 AND statename < ?2 ORDER BY statename")
             .unwrap();
@@ -814,6 +923,41 @@ mod tests {
             matched,
             vec!["txset:00".to_string(), "txset:ff".to_string()]
         );
+    }
+
+    /// DB-level: the half-open range for a prefix ending in a multi-byte UTF-8
+    /// codepoint selects exactly the keys under that prefix and excludes an
+    /// adjacent-prefix key. Guards the end-to-end correctness of the
+    /// scalar-successor upper bound under the BINARY primary-key collation
+    /// (#3735) — the case the old byte increment could not even compute.
+    #[test]
+    fn test_prefix_range_membership_multibyte() {
+        let conn = setup_db();
+        // Prefix "k\u{07FF}"; members share it, "k\u{0800}..." is the adjacent
+        // prefix that must be excluded by the exclusive upper bound.
+        let member_a = "k\u{07FF}a";
+        let member_b = "k\u{07FF}z";
+        let adjacent = "k\u{0800}a";
+        for key in [member_a, member_b, adjacent] {
+            conn.execute(
+                "INSERT INTO storestate (statename, state) VALUES (?1, 'x')",
+                params![key],
+            )
+            .unwrap();
+        }
+
+        let (lower, upper) = prefix_range("k\u{07FF}");
+        let upper = upper.expect("k\u{07FF} has a finite successor");
+        let mut stmt = conn
+            .prepare("SELECT statename FROM storestate WHERE statename >= ?1 AND statename < ?2 ORDER BY statename")
+            .unwrap();
+        let matched: Vec<String> = stmt
+            .query_map(params![lower, upper], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(matched, vec![member_a.to_string(), member_b.to_string()]);
     }
 
     #[test]
