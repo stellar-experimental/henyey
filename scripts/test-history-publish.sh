@@ -11,12 +11,48 @@
 #   ./scripts/test-history-publish.sh --data-dir /tmp/x # use specific data directory
 #   ./scripts/test-history-publish.sh --soft-on-sync-timeout  # neutral skip if testnet never synced
 #   ./scripts/test-history-publish.sh --classify-only /path/to/data-dir  # offline classifier (tests)
+#   ./scripts/test-history-publish.sh --stall-threshold 180   # in-loop stall detector threshold
+#   ./scripts/test-history-publish.sh --classify-stall-only /path/to/validator.log 180  # offline stall classifier (tests)
 #
 # Exit codes:
 #   0 = checkpoint matches SDF archive (or an environmental sync-timeout was
 #       soft-skipped under --soft-on-sync-timeout)
 #   1 = mismatch, real error, or a genuine publish regression (synced but no
 #       checkpoint published; see the disposition taxonomy below)
+#
+# --- In-loop stall detector + live diagnostic tail (#3741) ---
+# #3732 disabled this fixture's internal watchdog auto-abort, which correctly
+# stopped a still-progressing node from self-SIGABRTing under legitimate
+# slow-verify load — but it also removed the only code path that turned "event
+# loop badly stalled" into a clean, script-detected process death. Without it,
+# a genuinely stalled-but-alive node just keeps grinding until GitHub Actions'
+# own external job/run-level cancellation kills the whole runner — which skips
+# even if: always()-gated steps, so Upload logs/Summary never run and NO
+# validator.log evidence survives (confirmed on all 4 recurrences of this
+# fixture's "waiting for first published checkpoint" symptom: #3280, #3707,
+# #3727, #3741).
+#
+# Two independent, complementary mitigations (neither fixes the underlying
+# SCP-verify/WAL-contention capacity problem — that stays #3702/#3266's scope):
+#   1. Live diagnostic tail: every ~5s poll iteration, new validator.log lines
+#      are grep-filtered (WATCHDOG|maxtps_scp|database is locked|straggler
+#      timeout|db_write_ctx) and echoed into the step's own stdout, which
+#      GitHub Actions captures even under an external job-level cancellation
+#      (unlike the artifact upload, which does not survive it).
+#   2. Stall-based clean exit: is_log_stalled() checks validator.log's mtime
+#      against --stall-threshold (default 180s). If the node is still alive
+#      (kill -0 succeeds) but the log has produced zero new bytes for that
+#      long, this is treated as a genuine stall — DISPOSITION: STALL, always a
+#      hard red (exit 1, never covered by --soft-on-sync-timeout), so the
+#      workflow's own `if: failure()` Upload-logs step fires and the full
+#      validator.log artifact is captured too.
+#
+# 180s was chosen against two observed external-cancellation timings for this
+# fixture (~287s and ~1437s) and against the periodic progress-logging cadence
+# already present during healthy-but-slow catchup (bucket-download progress,
+# ledger-prefetch progress, and the watchdog's own 15s/30s warn/error tiers) —
+# none of which leave a genuine 180s silent gap. Configurable via
+# --stall-threshold without a code change if real-world tuning is needed.
 #
 # --- Phase-1 deadline disposition taxonomy (#3280) ---
 # The test has two phases: phase 1 waits up to --timeout for the node to sync
@@ -72,6 +108,18 @@ SOFT_ON_SYNC_TIMEOUT=false
 # classified disposition — no validator/build/testnet required. Used by
 # scripts/test-history-publish-harness.sh.
 CLASSIFY_ONLY_DIR=""
+# In-loop stall detector (#3741): if validator.log produces zero new bytes for
+# this many seconds while the node process is still alive, the poll loop treats
+# it as a genuine stall — DISPOSITION: STALL, always a hard red (never covered
+# by --soft-on-sync-timeout; see the header comment above). Overridable via
+# --stall-threshold.
+STALL_THRESHOLD_SECS=180
+# Offline test seam: when set (via --classify-stall-only <log_file>
+# <threshold_secs>), run only is_log_stalled() against an existing log file and
+# exit with the classified disposition — no validator/build/testnet required.
+# Used by scripts/test-history-publish-harness.sh.
+CLASSIFY_STALL_LOG=""
+CLASSIFY_STALL_THRESHOLD=""
 
 # The exact run-loop sync marker (crates/app/src/run_cmd.rs::wait_for_sync logs
 # tracing::info!(..., "Node is synced") once on reaching Synced/Validating). This
@@ -92,6 +140,8 @@ while [[ $# -gt 0 ]]; do
     --data-dir)             DATA_DIR_OVERRIDE="$2"; KEEP_DATA=true; shift 2 ;;
     --soft-on-sync-timeout) SOFT_ON_SYNC_TIMEOUT=true; shift ;;
     --classify-only)        CLASSIFY_ONLY_DIR="$2"; shift 2 ;;
+    --stall-threshold)      STALL_THRESHOLD_SECS="$2"; shift 2 ;;
+    --classify-stall-only)  CLASSIFY_STALL_LOG="$2"; CLASSIFY_STALL_THRESHOLD="$3"; shift 3 ;;
     -h|--help)
       sed -n '3,14p' "$0" | sed 's/^# \?//'
       exit 0 ;;
@@ -153,6 +203,56 @@ if [[ -n "$CLASSIFY_ONLY_DIR" ]]; then
   CLASSIFY_EXIT=0
   classify_deadline "$CLASSIFY_ONLY_DIR" || CLASSIFY_EXIT=$?
   exit $CLASSIFY_EXIT
+fi
+
+# --- In-loop stall detector (#3741) ---
+# Pure mtime-staleness check: has <log_file> produced zero new bytes for at
+# least <threshold_secs>? No side effects beyond the return code, so the
+# harness can drive it offline via --classify-stall-only against a synthetic
+# fixture with a manipulated mtime (`touch -d`).
+#
+# Return convention (bash truthiness: 0 = success = "true"):
+#   0 -> stalled     (log_file missing its mtime freshness bar)
+#   1 -> not stalled (log_file updated within threshold_secs, or unreadable)
+# The CLI seam below and the poll-loop call site both treat a 0 return as "the
+# node is stalled" and act accordingly (DISPOSITION: STALL, hard exit 1).
+is_log_stalled() {
+  local log_file="$1"
+  local now_epoch="$2"
+  local threshold_secs="$3"
+
+  if [[ ! -f "$log_file" ]]; then
+    # No log yet at all — not a "stall" in the sense this detector cares
+    # about; the pre-existing process-liveness and HAS-file checks in the
+    # poll loop handle "nothing has happened yet" separately.
+    return 1
+  fi
+
+  local mtime
+  mtime=$(stat -c %Y "$log_file" 2>/dev/null) || return 1
+
+  local age=$(( now_epoch - mtime ))
+  if [[ $age -ge $threshold_secs ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Offline test seam: classify a single validator.log for staleness and exit.
+# --classify-stall-only <log_file> <threshold_secs>
+#   exit 0 -> not stalled
+#   exit 1 -> stalled (DISPOSITION: STALL, tail printed)
+# No build/validator required.
+if [[ -n "$CLASSIFY_STALL_LOG" ]]; then
+  if is_log_stalled "$CLASSIFY_STALL_LOG" "$(date +%s)" "$CLASSIFY_STALL_THRESHOLD"; then
+    echo "Last 200 lines of $CLASSIFY_STALL_LOG:"
+    tail -200 "$CLASSIFY_STALL_LOG" 2>/dev/null || true
+    echo
+    echo "DISPOSITION: STALL — validator.log produced no new output for >= ${CLASSIFY_STALL_THRESHOLD}s (hard red, #3741)"
+    exit 1
+  fi
+  echo "DISPOSITION: not stalled — validator.log updated within ${CLASSIFY_STALL_THRESHOLD}s"
+  exit 0
 fi
 
 # --- Data dirs ---
@@ -277,7 +377,18 @@ echo
 
 # --- Poll for published checkpoint ---
 HAS_FILE="$HISTORY_DIR/.well-known/stellar-history.json"
-echo "Waiting for first published checkpoint (timeout: ${TIMEOUT}s)..."
+echo "Waiting for first published checkpoint (timeout: ${TIMEOUT}s, stall threshold: ${STALL_THRESHOLD_SECS}s)..."
+
+# Live diagnostic tail (#3741): grep filter for the known diagnostic families
+# already root-caused for this exact fixture (#3727: SCP-verify falling behind
+# under load) and the #3702 db_write_ctx/WAL-contention instrumentation.
+# Grep-filtered (not a full firehose) so it doesn't meaningfully add to CI log
+# volume or runner I/O load. Pinned by
+# scripts/test-history-publish-harness.sh::test_diagnostic_grep_pins_known_signal_names
+# so a future wording change in the Rust source breaks that test loudly instead
+# of silently rotting this filter into a no-op.
+DIAG_GREP_PATTERN='WATCHDOG|maxtps_scp|database is locked|straggler timeout|db_write_ctx'
+LAST_LOG_LINE=0
 
 START_TIME=$(date +%s)
 while true; do
@@ -303,6 +414,34 @@ while true; do
     echo "Last 50 lines of validator log:"
     tail -50 "$LOG_FILE"
     exit 1
+  fi
+
+  # In-loop stall detector (#3741): the node process is alive (checked above)
+  # but validator.log has produced zero new bytes for >= $STALL_THRESHOLD_SECS.
+  # This is a genuine, previously-invisible stall (the class of failure that
+  # used to end in an artifact-less external GitHub Actions cancellation) —
+  # always a hard red, never covered by --soft-on-sync-timeout (a stalled-but-
+  # alive process is meaningfully different from "testnet never became
+  # reachable"). Exiting here (rather than letting the job run to an external
+  # cancellation) makes the workflow's own `if: failure()` Upload-logs step
+  # fire, so the full validator.log artifact is captured too.
+  if is_log_stalled "$LOG_FILE" "$(date +%s)" "$STALL_THRESHOLD_SECS"; then
+    echo "Last 200 lines of validator log:"
+    tail -200 "$LOG_FILE"
+    echo
+    echo "DISPOSITION: STALL — validator.log produced no new output for >= ${STALL_THRESHOLD_SECS}s while the validator process was still alive (hard red, #3741)"
+    exit 1
+  fi
+
+  # Incremental live-tail (#3741): echo any new validator.log lines matching
+  # the diagnostic filter into this step's own stdout, which GitHub Actions
+  # captures even under an external job-level cancellation (unlike the
+  # artifact upload). No background process/PID cleanup needed — this stays
+  # inside the existing single-threaded 5s poll loop.
+  CURRENT_LOG_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+  if [[ "$CURRENT_LOG_LINES" -gt "$LAST_LOG_LINE" ]]; then
+    tail -n "+$(( LAST_LOG_LINE + 1 ))" "$LOG_FILE" | grep -E "$DIAG_GREP_PATTERN" || true
+    LAST_LOG_LINE="$CURRENT_LOG_LINES"
   fi
 
   # Check for published HAS
