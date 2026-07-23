@@ -231,6 +231,30 @@ pub(super) fn is_near_tip_gap_suppressed(
         && !should_escalate_to_catchup(attempts, relation, ahead_no_ext)
 }
 
+/// Whether an `is_behind()` relation at the emit site of `trigger_recovery_catchup`
+/// is a *spurious near-tip blip* rather than a genuine fall-behind (#3733).
+///
+/// When inbound peers authenticate-then-drop, EXTERNALIZE envelopes for slots
+/// `> current_ledger + 1` briefly arm `sync_recovery_pending`; by the time the
+/// consensus tick runs, the node has closed those ledgers and is glued to the
+/// tip with `effective_peer_gap == 0` (verified `max_verified_scp_slot ==
+/// current_ledger`). But `herder.latest_externalized_slot()` can still be
+/// transiently 1–2 ahead of `current_ledger`, so `LedgerRelation` reports
+/// `Behind { gap: 1..2 }`. That transient must NOT be counted as
+/// `forcing_catchup_behind` (the +81/+431 alarm bursts) — the authoritative
+/// near-tip signal is the verified peer gap, exactly what the heartbeat reports
+/// as `peer_gap=0`.
+///
+/// The predicate is deliberately stricter than a bare `behind_gap <= N` test:
+/// it additionally requires `peer_gap == 0`, so a node that is genuinely behind
+/// the network (peers verifiably ahead, `peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD`)
+/// is never mis-classified as near-tip. The `behind_gap <= TX_SET_REQUEST_WINDOW`
+/// bound keeps the carve-out to the near-tip band; a large local behind gap is
+/// never spurious even at `peer_gap == 0`.
+pub(super) fn is_spurious_near_tip_behind(behind_gap: u64, peer_gap: u64) -> bool {
+    behind_gap <= TX_SET_REQUEST_WINDOW && peer_gap == 0
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger.
     ///
@@ -1820,6 +1844,28 @@ impl App {
                     urgent,
                     "Recovery stalled for too long — forcing catchup"
                 );
+            } else if is_spurious_near_tip_behind(
+                relation.behind_gap().unwrap_or(0),
+                self.effective_peer_gap(current_ledger),
+            ) {
+                // #3733: latest_externalized is transiently 1–2 ahead of
+                // current_ledger (LedgerRelation reports Behind) but verified
+                // peers are NOT ahead (effective_peer_gap == 0) — the
+                // inbound-peer-flap near-tip blip, not a genuine fall-behind.
+                // Count it in the benign bucket and log at debug so it does not
+                // inflate the forcing_catchup_behind alarm (the +81/+431 bursts).
+                crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                    .increment("forcing_catchup_near_tip", 1);
+                tracing::debug!(
+                    current_ledger,
+                    latest_externalized,
+                    gap = relation.behind_gap().unwrap_or(0),
+                    peer_gap = self.effective_peer_gap(current_ledger),
+                    attempts,
+                    ?cache_age_secs,
+                    urgent,
+                    "Recovery stalled near tip (verified peer_gap==0) — forcing catchup (#3733)"
+                );
             } else {
                 crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("forcing_catchup_behind", 1);
                 tracing::info!(
@@ -2369,9 +2415,42 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_cannot_apply_reason, is_near_tip_gap_suppressed, should_escalate_to_catchup,
-        CannotApplyReason, LedgerRelation, RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
+        classify_cannot_apply_reason, is_near_tip_gap_suppressed, is_spurious_near_tip_behind,
+        should_escalate_to_catchup, CannotApplyReason, LedgerRelation,
+        RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
     };
+
+    // ── is_spurious_near_tip_behind tests (#3733) ───────────────────────
+
+    #[test]
+    fn test_near_tip_behind_not_counted_as_forcing_catchup_behind() {
+        // #3733: when herder.latest_externalized is transiently 1–2 ahead of
+        // current_ledger BUT verified peers are NOT ahead (peer_gap == 0), the
+        // `is_behind()` relation is a spurious near-tip blip caused by
+        // inbound-peer flapping — not a genuine fall-behind. It must NOT be
+        // counted as `forcing_catchup_behind`.
+        assert!(
+            is_spurious_near_tip_behind(1, 0),
+            "gap=1, peer_gap=0 is a spurious near-tip blip"
+        );
+        assert!(
+            is_spurious_near_tip_behind(2, 0),
+            "gap=2, peer_gap=0 is a spurious near-tip blip"
+        );
+        // Genuine behind-the-network: peers ARE ahead → not spurious, must
+        // still fire forcing_catchup_behind and escalate.
+        assert!(
+            !is_spurious_near_tip_behind(1, 3),
+            "gap=1 but peer_gap=3 is genuine behind — peers are ahead"
+        );
+        // Large local behind gap: even with peer_gap==0 this exceeds the
+        // near-tip window (TX_SET_REQUEST_WINDOW=12) → not treated as a
+        // near-tip blip.
+        assert!(
+            !is_spurious_near_tip_behind(15, 0),
+            "gap=15 exceeds the near-tip window — not spurious"
+        );
+    }
 
     // ── should_escalate_to_catchup tests (#3728) ────────────────────────
 
