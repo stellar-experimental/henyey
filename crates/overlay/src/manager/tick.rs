@@ -1004,6 +1004,129 @@ mod tests {
         );
     }
 
+    /// Regression for #3736 / #3710: `connect_preferred_peers` must NOT dial a
+    /// preferred peer for which a live INBOUND connection already exists. Under
+    /// the pre-#3710 outbound-only predicate (`has_outbound_connection_to`) the
+    /// inbound-connected peer was re-dialed every tick — the churn engine that
+    /// produced the observed inbound authenticate-then-drop flap-to-0. Under
+    /// `has_connection_to` (any direction) the peer is skipped and
+    /// `factory.dialed()` stays empty.
+    #[tokio::test]
+    async fn test_connect_preferred_does_not_redial_live_inbound_peer() {
+        let preferred_addr = PeerAddress::new("10.0.0.5", 11625);
+        let mut config = OverlayConfig::default();
+        config.preferred_peers = vec![preferred_addr.clone()];
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let factory = Arc::new(RecordingConnectionFactory::default());
+        let manager = OverlayManager::new_with_connection_factory(
+            config,
+            local_node.clone(),
+            factory.clone(),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        // A live authenticated INBOUND peer whose advertised listening address
+        // is the preferred dial target 10.0.0.5:11625.
+        let mut info = make_peer_info(ConnectionDirection::Inbound, 11625);
+        info.address = "10.0.0.5:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, info);
+
+        let preferred_set =
+            PreferredPeerSet::from_config(vec![preferred_addr.clone()], HashSet::new());
+        let mut retry_after = HashMap::new();
+        let ctx = TickConnectCtx {
+            local_node,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 8,
+            connection_factory: factory.clone(),
+        };
+
+        // Non-zero budget: the only reason not to dial is the live inbound conn.
+        let remaining = OverlayManager::connect_preferred_peers(
+            &preferred_set,
+            &mut retry_after,
+            Instant::now(),
+            8,
+            8,
+            &manager.outbound_pool,
+            &shared,
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            factory.dialed().is_empty(),
+            "must NOT re-dial a preferred peer we already hold via a live inbound \
+             connection (pre-#3710 churn engine); got {:?}",
+            factory.dialed()
+        );
+        assert_eq!(
+            remaining, 8,
+            "skipping the already-connected peer must not consume budget"
+        );
+    }
+
+    /// Regression for #3736 / #3710: `fill_outbound_slots` (the general
+    /// known-peer outbound pass, distinct from the preferred pass) must NOT dial
+    /// a known peer for which a live INBOUND connection already exists. This
+    /// pass had NO test coverage before #3736. Under the pre-#3710 outbound-only
+    /// predicate it re-dialed the inbound-connected peer; under
+    /// `has_connection_to` it is skipped.
+    #[tokio::test]
+    async fn test_fill_outbound_does_not_redial_live_inbound_peer() {
+        let known_addr = PeerAddress::new("10.0.0.6", 11625);
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let factory = Arc::new(RecordingConnectionFactory::default());
+        let manager = OverlayManager::new_with_connection_factory(
+            OverlayConfig::default(),
+            local_node.clone(),
+            factory.clone(),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        // A live authenticated INBOUND peer at the known dial target
+        // 10.0.0.6:11625. count_outbound_peers() is therefore 0, so the
+        // target_outbound gate does not short-circuit the pass.
+        let mut info = make_peer_info(ConnectionDirection::Inbound, 11625);
+        info.address = "10.0.0.6:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, info);
+
+        let known_peers = RwLock::new(super::super::KnownPeerSet::from_config(vec![known_addr]));
+        let mut retry_after = HashMap::new();
+        let ctx = TickConnectCtx {
+            local_node,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 8,
+            connection_factory: factory.clone(),
+        };
+
+        OverlayManager::fill_outbound_slots(
+            &known_peers,
+            &mut retry_after,
+            Instant::now(),
+            8,
+            &manager.outbound_pool,
+            &shared,
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            factory.dialed().is_empty(),
+            "must NOT re-dial a known peer we already hold via a live inbound \
+             connection (pre-#3710 churn engine); got {:?}",
+            factory.dialed()
+        );
+    }
+
     #[tokio::test]
     async fn test_promote_inbound_skips_existing_outbound() {
         let factory = Arc::new(RecordingConnectionFactory::default());
