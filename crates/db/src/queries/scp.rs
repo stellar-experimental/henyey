@@ -761,6 +761,18 @@ mod tests {
         );
     }
 
+    /// Regression for #3735: a prefix ending in a multi-byte UTF-8 trailing
+    /// codepoint must not panic. On `origin/main` the naive last-byte increment
+    /// turns `U+07FF` (`DF BF`) into `DF C0` — invalid UTF-8 — so the
+    /// `String::from_utf8().expect()` panics. The char-level successor yields
+    /// `U+0800` instead.
+    #[test]
+    fn test_prefix_range_multibyte_utf8_trailing() {
+        let (lower, upper) = prefix_range("a\u{07FF}");
+        assert_eq!(lower, "a\u{07FF}");
+        assert_eq!(upper, "a\u{0800}");
+    }
+
     #[test]
     fn test_prefix_range_upper_bound() {
         assert_eq!(
