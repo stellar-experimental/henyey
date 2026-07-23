@@ -145,6 +145,54 @@ const RECOVERY_ESCALATION_SCP_REQUEST: u64 = 6;
 /// equals ~6s.
 const RECOVERY_ESCALATION_CATCHUP: u64 = 6;
 
+/// Maximum single-ledger behind-gap that is treated as benign near-tip lag and
+/// is NOT escalated to a forced catchup (#3728).
+///
+/// A momentary `gap == 1` lag on an otherwise-healthy validator self-recovers
+/// via the peer-SCP back-fill path (`request SCP state from peers`, the
+/// `gap <= TX_SET_REQUEST_WINDOW` branch in `out_of_sync_recovery`), mirroring
+/// stellar-core's `HerderImpl::outOfSyncRecovery` — which rebroadcasts SCP and
+/// calls `getMoreSCPState()` and has NO attempt-counter-driven forced archive
+/// catchup at all. Forcing a catchup for a single-ledger tip gap is redundant
+/// work that trips the `forcing_catchup_behind` streak alarm without ever
+/// breaking real-time sync.
+///
+/// Safety: this only suppresses escalation while the gap stays at exactly 1.
+/// The externalized tip advances independently of a stuck node, so a node
+/// genuinely wedged at LCL=N while the network progresses observes
+/// `latest_externalized` climb to N+2, N+3… within seconds, flipping the
+/// relation to `Behind { gap >= 2 }` and restoring the escalation path. The
+/// only case where escalation stays suppressed is a network-wide freeze at
+/// N+1, where there is nothing to catch up to and waiting is correct.
+const RECOVERY_ESCALATION_NEAR_TIP_GAP: u64 = 1;
+
+/// Attempt count past which a *persistently* stuck single-ledger near-tip gap
+/// (`Behind { gap: 1 }`) resumes catchup escalation (#3728 review follow-up).
+///
+/// The `RECOVERY_ESCALATION_NEAR_TIP_GAP` carve-out suppresses escalation for a
+/// momentary `gap == 1` blip, which self-recovers via the peer-SCP back-fill
+/// path within a single recovery interval. But suppressing escalation
+/// *unconditionally* removes the peer-connectivity-independent archive-catchup
+/// backstop and the `forcing_catchup_behind` metric signal for a node that is
+/// genuinely wedged at exactly `gap == 1` — e.g. one whose own SCP/externalize
+/// visibility has itself stalled so the tip never climbs to `N+2` to flip the
+/// relation. That failure mode would otherwise stay invisible to monitor-tick
+/// Check 12b (which keys on `forcing_catchup_behind`) and to the ratio checks
+/// (`gap == 1` is far below their `gap > 5` threshold) until the much narrower
+/// `RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP` (=17) backstop happens to
+/// coincide with a verified peer-ahead gap and a confirmed-behind archive.
+///
+/// So the suppression is *bounded*: once a `gap == 1` has persisted for this
+/// many consecutive no-progress recovery attempts (well beyond any observed
+/// self-healing blip — recovery ticks at ~1s and production blips cleared by
+/// `attempts=8`), escalation resumes and `trigger_recovery_catchup` fires
+/// again, restoring both the archive fallback and the `forcing_catchup_behind`
+/// alarm coverage for a truly-stuck node. Set below
+/// `RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP` (=17) so the peer-SCP
+/// back-fill path gets a fair window first, but the archive backstop still
+/// engages before the hard-reset escalation.
+const RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS: u64 = 12;
+
 /// Maximum slot gap between the highest observed EXTERNALIZE and our
 /// current ledger before `submit_transaction()` rejects with TryAgainLater.
 ///
@@ -12312,6 +12360,20 @@ mod tests {
         // recovery (no archive HardReset), so there is no longer a near-tip-
         // specific escalation threshold. The band-detection threshold
         // (PEER_AHEAD_ESCALATION_THRESHOLD) is retained above.
+
+        // #3728 review follow-up: the bounded gap==1 stall backstop must sit
+        // above the escalation floor (so a momentary blip is suppressed) and at
+        // or below the no-SCP hard-reset threshold (so the peer-independent
+        // archive catchup engages BEFORE the much narrower hard-reset path).
+        assert!(
+            RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS > RECOVERY_ESCALATION_CATCHUP,
+            "gap==1 stall backstop must be above the escalation floor"
+        );
+        assert!(
+            RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS
+                <= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP,
+            "gap==1 archive backstop must engage no later than the no-SCP hard reset"
+        );
     }
 
     #[tokio::test]

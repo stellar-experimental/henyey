@@ -158,6 +158,79 @@ pub(super) fn classify_timer_event(
     }
 }
 
+/// Decide whether out-of-sync recovery should escalate to a forced catchup.
+///
+/// Pure predicate extracted from `out_of_sync_recovery` (#3728). Escalation
+/// requires the attempt floor `RECOVERY_ESCALATION_CATCHUP` to be crossed, and
+/// then one of:
+///   - `ahead_no_ext` — captive-core startup (Ahead with no externalization);
+///     escalate so recovery converges instead of looping on SCP requests.
+///   - the node is `Behind` by MORE than `RECOVERY_ESCALATION_NEAR_TIP_GAP`.
+///
+/// A pure single-ledger behind gap (`Behind { gap: 1 }`) is deliberately NOT
+/// escalated *while it stays momentary*: it self-recovers via the peer-SCP
+/// back-fill path. It falls through to the `gap <= TX_SET_REQUEST_WINDOW`
+/// branch in `out_of_sync_recovery`, which requests SCP state from peers.
+/// Note the Step-2 fast-track in that branch does NOT fire for
+/// `Behind { gap: 1 }` (it requires `AtTip` or ahead-no-ext), so the
+/// fall-through lands in the request-SCP-state path, not a second hidden
+/// catchup. See `RECOVERY_ESCALATION_NEAR_TIP_GAP` for the safety argument
+/// (gap grows past 1 → escalation restored).
+///
+/// The `gap == 1` suppression is *bounded*, not unconditional (#3728 review
+/// follow-up): once such a gap has persisted for
+/// `RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS` consecutive no-progress
+/// attempts, escalation resumes. This restores the peer-independent
+/// archive-catchup backstop and the `forcing_catchup_behind` alarm coverage for
+/// a node genuinely wedged at exactly `gap == 1` (one whose SCP visibility has
+/// itself stalled, so the tip never climbs to `N+2` to flip the relation). The
+/// momentary blip (cleared by `attempts=8` in production) is still suppressed.
+///
+/// `AtTip` / `Ahead` (with externalization) are handled downstream and never
+/// escalate here.
+pub(super) fn should_escalate_to_catchup(
+    attempts: u64,
+    relation: LedgerRelation,
+    ahead_no_ext: bool,
+) -> bool {
+    if attempts < RECOVERY_ESCALATION_CATCHUP {
+        return false;
+    }
+    if ahead_no_ext {
+        return true;
+    }
+    match relation.behind_gap() {
+        // Multi-ledger behind gap — escalate immediately (unchanged).
+        Some(gap) if gap > RECOVERY_ESCALATION_NEAR_TIP_GAP => true,
+        // Single-ledger near-tip gap — suppress only while momentary; resume
+        // escalation once it persists past the stall threshold so a genuinely
+        // wedged node keeps its archive backstop + alarm coverage.
+        Some(_) => attempts >= RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
+        None => false,
+    }
+}
+
+/// Whether this recovery tick is suppressing catchup escalation *solely*
+/// because of the momentary single-ledger near-tip carve-out (#3728).
+///
+/// True iff the attempt floor is crossed, the node is `Behind` by exactly a
+/// near-tip gap (`<= RECOVERY_ESCALATION_NEAR_TIP_GAP`), and the persistent-stall
+/// threshold has not yet been reached — i.e. the exact tick where the old code
+/// would have fired `forcing_catchup_behind` but the carve-out holds it back.
+/// The call site increments the non-alarming `near_tip_gap1_suppressed` metric
+/// on these ticks so operators retain visibility into a node parked at `gap==1`
+/// without re-tripping the `forcing_catchup_behind` streak-3 alarm.
+pub(super) fn is_near_tip_gap_suppressed(
+    attempts: u64,
+    relation: LedgerRelation,
+    ahead_no_ext: bool,
+) -> bool {
+    attempts >= RECOVERY_ESCALATION_CATCHUP
+        && !ahead_no_ext
+        && matches!(relation.behind_gap(), Some(gap) if gap <= RECOVERY_ESCALATION_NEAR_TIP_GAP)
+        && !should_escalate_to_catchup(attempts, relation, ahead_no_ext)
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger.
     ///
@@ -628,18 +701,38 @@ impl App {
         }
 
         // --- Escalation: after many failed attempts, force catchup ---
-        // Escalate when the node is behind consensus, OR when the node is
-        // in the "Ahead" state with no SCP externalization yet (latest_ext=0).
-        // The latter case covers captive-core in quickstart/local mode: it
-        // closes ledgers from the validator's EXTERNALIZE messages but never
-        // externalizes itself, so without this escalation the recovery loop
-        // would request SCP state forever without converging.
+        // Escalate when the node is behind consensus by MORE than a single
+        // ledger, OR when the node is in the "Ahead" state with no SCP
+        // externalization yet (latest_ext=0). The latter case covers
+        // captive-core in quickstart/local mode: it closes ledgers from the
+        // validator's EXTERNALIZE messages but never externalizes itself, so
+        // without this escalation the recovery loop would request SCP state
+        // forever without converging.
+        //
+        // A pure single-ledger behind gap (gap==1) is deliberately NOT
+        // escalated (#3728) *while it stays momentary*: it self-recovers via
+        // the peer-SCP back-fill path below, so a forced catchup is redundant
+        // work. The suppression is bounded — once the gap==1 persists past
+        // RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS, escalation resumes so
+        // a genuinely wedged node keeps its archive backstop + alarm coverage.
+        // See `should_escalate_to_catchup` and `RECOVERY_ESCALATION_NEAR_TIP_GAP`.
         let ahead_no_ext = relation.is_ahead_without_externalization(latest_externalized);
-        if attempts >= RECOVERY_ESCALATION_CATCHUP && (relation.is_behind() || ahead_no_ext) {
+        if should_escalate_to_catchup(attempts, relation, ahead_no_ext) {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
                 .trigger_recovery_catchup(current_ledger, latest_externalized, relation, attempts)
                 .await;
+        }
+        // Observability for the suppressed near-tip carve-out (#3728 review
+        // follow-up): on the exact ticks where the old code would have fired
+        // `forcing_catchup_behind` but the gap==1 carve-out holds escalation
+        // back, emit a distinct non-alarming counter. This keeps a node parked
+        // at gap==1 visible to operators (and monitor-tick can scrape it)
+        // WITHOUT re-tripping the `forcing_catchup_behind` streak-3 alarm that
+        // Check 12b keys on. A genuinely wedged node still crosses the stall
+        // threshold above and re-fires `forcing_catchup_behind`.
+        if is_near_tip_gap_suppressed(attempts, relation, ahead_no_ext) {
+            crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("near_tip_gap1_suppressed", 1);
         }
 
         // When the node is essentially caught up (small or zero gap), the
@@ -2275,7 +2368,120 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_cannot_apply_reason, CannotApplyReason, LedgerRelation};
+    use super::{
+        classify_cannot_apply_reason, is_near_tip_gap_suppressed, should_escalate_to_catchup,
+        CannotApplyReason, LedgerRelation, RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
+    };
+
+    // ── should_escalate_to_catchup tests (#3728) ────────────────────────
+
+    #[test]
+    fn test_should_escalate_to_catchup_suppresses_single_ledger_gap() {
+        // Exact issue #3728 scenario: attempts=8, gap==1 → no forced catchup.
+        // The node self-recovers via the peer-SCP back-fill path instead.
+        // attempts=8 is below the persistent-stall threshold (12), so the
+        // momentary-blip carve-out holds.
+        assert!(!should_escalate_to_catchup(
+            8,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_resumes_on_persistent_single_ledger_stall() {
+        // #3728 review follow-up: a gap==1 that persists past the stall
+        // threshold must RESUME escalation so a genuinely-wedged node keeps its
+        // peer-independent archive backstop + forcing_catchup_behind alarm.
+        let stall = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
+        // Just below the threshold: still suppressed.
+        assert!(!should_escalate_to_catchup(
+            stall - 1,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+        // At and above the threshold: escalation resumes.
+        assert!(should_escalate_to_catchup(
+            stall,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+        assert!(should_escalate_to_catchup(
+            stall + 5,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_is_near_tip_gap_suppressed_identifies_carveout_ticks() {
+        let stall = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
+        // The exact #3728 tick: attempt floor crossed, gap==1, below stall
+        // threshold → suppressed (observability metric fires here).
+        assert!(is_near_tip_gap_suppressed(
+            8,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+        // Below the attempt floor: not a suppression tick (no escalation would
+        // have fired anyway).
+        assert!(!is_near_tip_gap_suppressed(
+            5,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+        // At/above the stall threshold: escalation resumes, so this is NOT a
+        // suppressed tick — forcing_catchup_behind fires instead.
+        assert!(!is_near_tip_gap_suppressed(
+            stall,
+            LedgerRelation::Behind { gap: 1 },
+            false
+        ));
+        // Multi-ledger gap escalates directly — never a suppression tick.
+        assert!(!is_near_tip_gap_suppressed(
+            8,
+            LedgerRelation::Behind { gap: 2 },
+            false
+        ));
+        // AtTip / ahead-no-ext are not near-tip-behind suppressions.
+        assert!(!is_near_tip_gap_suppressed(8, LedgerRelation::AtTip, false));
+        assert!(!is_near_tip_gap_suppressed(8, LedgerRelation::Ahead, true));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_fires_on_multi_ledger_gap() {
+        // A genuine multi-ledger stall still escalates once the attempt floor
+        // is crossed.
+        assert!(should_escalate_to_catchup(
+            6,
+            LedgerRelation::Behind { gap: 2 },
+            false
+        ));
+        assert!(should_escalate_to_catchup(
+            8,
+            LedgerRelation::Behind { gap: 12 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_respects_attempt_floor() {
+        // Below the attempt threshold, never escalate regardless of gap.
+        assert!(!should_escalate_to_catchup(
+            5,
+            LedgerRelation::Behind { gap: 5 },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_escalate_to_catchup_preserves_ahead_no_ext() {
+        // Captive-core startup path (Ahead with no externalization) must still
+        // escalate so recovery converges.
+        assert!(should_escalate_to_catchup(6, LedgerRelation::Ahead, true));
+        // AtTip never escalates here — it is handled downstream.
+        assert!(!should_escalate_to_catchup(6, LedgerRelation::AtTip, false));
+    }
 
     // ── LedgerRelation tests ────────────────────────────────────────────
 
