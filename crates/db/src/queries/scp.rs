@@ -27,6 +27,28 @@ use super::state::StateQueries;
 
 const TX_SET_KEY_PREFIX: &str = "txset:";
 
+/// SQL for [`ScpStatePersistenceQueries::load_all_scp_slot_states`].
+///
+/// Uses a half-open BINARY range (`statename >= ?1 AND statename < ?2`, bounds
+/// from [`prefix_range`]) rather than `LIKE 'prefix%'` so the `storestate`
+/// BINARY primary-key autoindex resolves it as an index SEARCH instead of a
+/// full-table SCAN (#3702). Shared with its query-plan regression test
+/// (`test_scpstate_prefix_query_uses_index_not_scan`) so the two can never
+/// drift onto different SQL.
+const LOAD_ALL_SCP_SLOT_STATES_SQL: &str =
+    "SELECT statename, state FROM storestate WHERE statename >= ?1 AND statename < ?2 ORDER BY statename";
+
+/// SQL for [`ScpStatePersistenceQueries::load_all_tx_set_data`]. Range-bound
+/// (see [`LOAD_ALL_SCP_SLOT_STATES_SQL`]).
+const LOAD_ALL_TX_SET_DATA_SQL: &str =
+    "SELECT statename, state FROM storestate WHERE statename >= ?1 AND statename < ?2";
+
+/// SQL for [`ScpStatePersistenceQueries::get_all_tx_set_hashes`]. Range-bound
+/// (see [`LOAD_ALL_SCP_SLOT_STATES_SQL`]). Shared with its query-plan
+/// regression test (`test_txset_prefix_query_uses_index_not_scan`).
+const GET_ALL_TX_SET_HASHES_SQL: &str =
+    "SELECT statename FROM storestate WHERE statename >= ?1 AND statename < ?2";
+
 /// Query trait for SCP consensus state operations.
 ///
 /// Provides methods for persisting and retrieving SCP envelopes and quorum sets.
@@ -302,6 +324,34 @@ fn tx_set_key(hash: &Hash) -> String {
     format!("{TX_SET_KEY_PREFIX}{}", hex::encode(hash.0))
 }
 
+/// Compute the half-open BINARY range `[lower, upper)` that matches exactly the
+/// keys beginning with `prefix`, for use as `statename >= lower AND statename <
+/// upper`. `lower` is `prefix` verbatim; `upper` is `prefix` with its final byte
+/// incremented by one, giving an exclusive upper bound that excludes adjacent
+/// prefixes (`txset:` -> `[txset:, txset;)`).
+///
+/// This range is index-usable against the BINARY `storestate` primary-key
+/// autoindex (an index SEARCH), unlike a case-insensitive `LIKE 'prefix%'`,
+/// which forces a full-table SCAN and holds the WAL write lock far longer under
+/// the SCP-purge `BEGIN IMMEDIATE` during near-tip back-fill (#3702). Row
+/// membership is identical to the old `LIKE` for the call sites' prefixes: all
+/// stored keys are the literal lowercase prefix followed by lowercase hex or a
+/// decimal slot, so dropping `LIKE`'s (default-on) case-insensitivity never
+/// changes results.
+///
+/// The two call sites pass `txset:` and `scpstate:`, both ending in `:` (0x3A),
+/// so the increment is `:` -> `;` (0x3B) with no carry and stays valid ASCII.
+fn prefix_range(prefix: &str) -> (String, String) {
+    let mut upper = prefix.as_bytes().to_vec();
+    let last = upper
+        .last_mut()
+        .expect("prefix_range requires a non-empty prefix");
+    // Callers pass ':'-terminated prefixes; the increment never carries.
+    *last += 1;
+    let upper = String::from_utf8(upper).expect("incremented prefix stays valid UTF-8");
+    (prefix.to_string(), upper)
+}
+
 fn parse_slot_key(key: &str) -> Option<u64> {
     key.strip_prefix(&format!("{}:", state_keys::SCP_STATE))?
         .parse()
@@ -379,11 +429,9 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
-        let mut stmt = self.prepare(
-            "SELECT statename, state FROM storestate WHERE statename LIKE ?1 ORDER BY statename",
-        )?;
-        let pattern = format!("{}:%", state_keys::SCP_STATE);
-        let rows = stmt.query_map(params![pattern], |row| {
+        let mut stmt = self.prepare(LOAD_ALL_SCP_SLOT_STATES_SQL)?;
+        let (lower, upper) = prefix_range(&format!("{}:", state_keys::SCP_STATE));
+        let rows = stmt.query_map(params![lower, upper], |row| {
             let key: String = row.get(0)?;
             let state: String = row.get(1)?;
             Ok((key, state))
@@ -434,10 +482,9 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
-        let mut stmt =
-            self.prepare("SELECT statename, state FROM storestate WHERE statename LIKE ?1")?;
-        let pattern = format!("{TX_SET_KEY_PREFIX}%");
-        let rows = stmt.query_map(params![pattern], |row| {
+        let mut stmt = self.prepare(LOAD_ALL_TX_SET_DATA_SQL)?;
+        let (lower, upper) = prefix_range(TX_SET_KEY_PREFIX);
+        let rows = stmt.query_map(params![lower, upper], |row| {
             let key: String = row.get(0)?;
             let state: String = row.get(1)?;
             Ok((key, state))
@@ -474,9 +521,9 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, DbError> {
-        let mut stmt = self.prepare("SELECT statename FROM storestate WHERE statename LIKE ?1")?;
-        let pattern = format!("{TX_SET_KEY_PREFIX}%");
-        let rows = stmt.query_map(params![pattern], |row| {
+        let mut stmt = self.prepare(GET_ALL_TX_SET_HASHES_SQL)?;
+        let (lower, upper) = prefix_range(TX_SET_KEY_PREFIX);
+        let rows = stmt.query_map(params![lower, upper], |row| {
             let key: String = row.get(0)?;
             Ok(key)
         })?;
@@ -666,6 +713,95 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    /// Return the `detail` column of every `EXPLAIN QUERY PLAN` row for `sql`,
+    /// joined by newlines. Binds dummy TEXT values for any `?N` placeholders so
+    /// the statement prepares regardless of how many parameters it declares
+    /// (LIKE = 1, range = 2).
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let n = stmt.parameter_count();
+        let dummies: Vec<String> = (0..n).map(|_| String::from("txset:")).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = dummies
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The `txset:` prefix scan on `storestate` (run inside the
+    /// `BEGIN IMMEDIATE` write lock during near-tip back-fill) must resolve to
+    /// an index SEARCH, not a full-table SCAN. Regression for #3702: the
+    /// `LIKE 'txset:%'` form scanned the whole table under the WAL write lock,
+    /// starving SCP intake on the post-restart tracking path.
+    #[test]
+    fn test_txset_prefix_query_uses_index_not_scan() {
+        let conn = setup_db();
+        let plan = query_plan(&conn, GET_ALL_TX_SET_HASHES_SQL);
+        assert!(
+            plan.contains("SEARCH") && !plan.contains("SCAN storestate"),
+            "txset prefix query must use an index SEARCH, not a full-table SCAN; plan was:\n{plan}"
+        );
+    }
+
+    /// The `scpstate:` prefix scan on `storestate` (also run inside the
+    /// `BEGIN IMMEDIATE` write lock) must resolve to an index SEARCH, not a
+    /// full-table SCAN. Regression for #3702.
+    #[test]
+    fn test_scpstate_prefix_query_uses_index_not_scan() {
+        let conn = setup_db();
+        let plan = query_plan(&conn, LOAD_ALL_SCP_SLOT_STATES_SQL);
+        assert!(
+            plan.contains("SEARCH") && !plan.contains("SCAN storestate"),
+            "scpstate prefix query must use an index SEARCH, not a full-table SCAN; plan was:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn test_prefix_range_upper_bound() {
+        assert_eq!(
+            prefix_range("txset:"),
+            ("txset:".to_string(), "txset;".to_string())
+        );
+        assert_eq!(
+            prefix_range("scpstate:"),
+            ("scpstate:".to_string(), "scpstate;".to_string())
+        );
+    }
+
+    /// The half-open range must return exactly the keys under the prefix and
+    /// exclude adjacent-prefix keys (the exclusive upper bound `txset;` and the
+    /// next-prefix `txseu`). Guards the membership equivalence of the range
+    /// rewrite vs. the old `LIKE 'txset:%'`.
+    #[test]
+    fn test_prefix_range_membership_excludes_adjacent() {
+        let conn = setup_db();
+        for key in ["txset:00", "txset:ff", "txset;", "txseu"] {
+            conn.execute(
+                "INSERT INTO storestate (statename, state) VALUES (?1, 'x')",
+                params![key],
+            )
+            .unwrap();
+        }
+
+        let (lower, upper) = prefix_range(TX_SET_KEY_PREFIX);
+        let mut stmt = conn
+            .prepare("SELECT statename FROM storestate WHERE statename >= ?1 AND statename < ?2 ORDER BY statename")
+            .unwrap();
+        let matched: Vec<String> = stmt
+            .query_map(params![lower, upper], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            matched,
+            vec!["txset:00".to_string(), "txset:ff".to_string()]
+        );
     }
 
     #[test]
