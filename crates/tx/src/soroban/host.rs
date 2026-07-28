@@ -1566,7 +1566,7 @@ fn execute_host_function_p25(
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_idx = i,
                         event_hex = hex::encode(&encoded),
                         "P25: Diagnostic event"
@@ -1966,7 +1966,7 @@ fn execute_host_function_p26(
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host26::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host26::xdr::Limits::none()) {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_idx = i,
                         event_hex = hex::encode(&encoded),
                         "P26: Diagnostic event"
@@ -2226,7 +2226,7 @@ fn execute_host_function_p27(
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host27::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host27::xdr::Limits::none()) {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_idx = i,
                         event_hex = hex::encode(&encoded),
                         "P27: Diagnostic event"
