@@ -582,6 +582,74 @@ mod tests {
         assert_eq!(checkpoint_frequency(), 64);
     }
 
+    /// Regression test for #3754: the warn threshold must scale with the
+    /// configured maintenance period rather than a flat 10s. At the
+    /// mainnet-rpc `period_secs=900` config, this yields 300s.
+    #[test]
+    fn test_maintenance_warn_threshold_scales_with_period() {
+        assert_eq!(
+            maintenance_warn_threshold(Duration::from_secs(900)),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// Regression test for #3754: guards the formula against the crate's
+    /// default 4-hour maintenance period.
+    #[test]
+    fn test_maintenance_warn_threshold_uses_default_period() {
+        assert_eq!(
+            maintenance_warn_threshold(DEFAULT_MAINTENANCE_PERIOD),
+            DEFAULT_MAINTENANCE_PERIOD / 3
+        );
+    }
+
+    /// Regression test for #3754: a degenerate/misconfigured zero `period`
+    /// (not rejected by the type system) must not drive the threshold to
+    /// zero and make the warning fire unconditionally. Clamped to the
+    /// previous flat 10s floor.
+    #[test]
+    fn test_maintenance_warn_threshold_zero_period_is_clamped() {
+        assert_eq!(
+            maintenance_warn_threshold(Duration::ZERO),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// Regression test for #3754: converts the plan's hand-verified
+    /// structural-sleep-floor arithmetic into a CI guardrail. Computes the
+    /// theoretical worst-case sleep floor from the crate's own real
+    /// chunking constants (5 tables, each walked in
+    /// `ceil(period_ledgers / MAINTENANCE_CHUNK_LEDGERS)` chunks separated
+    /// by `MAINTENANCE_CHUNK_PAUSE`) for the mainnet-rpc `period_secs=900`
+    /// scenario from the issue (~5s/ledger -> ~180 ledgers/cycle), and
+    /// asserts it stays strictly under `maintenance_warn_threshold(period)`.
+    /// This fails loudly if `MAINTENANCE_CHUNK_LEDGERS`/`MAINTENANCE_CHUNK_PAUSE`
+    /// are ever retuned enough to threaten the invariant this fix relies on.
+    #[test]
+    fn test_maintenance_warn_threshold_exceeds_structural_sleep_floor() {
+        let period = Duration::from_secs(900);
+
+        // Ledgers accrued per maintenance cycle, assuming ~5s/ledger close
+        // time (matches the `ledgers_per_period` estimate in `start()`).
+        let ledgers_per_period = period.as_secs() / 5;
+
+        // Each of the 5 tables walked by `run_maintenance` (SCP, ledger
+        // headers, tx history, events, ledger close meta) is deleted in
+        // chunks of at most `MAINTENANCE_CHUNK_LEDGERS` ledgers.
+        const TABLES: u64 = 5;
+        let chunks_per_table = ledgers_per_period.div_ceil(MAINTENANCE_CHUNK_LEDGERS as u64);
+        let structural_floor = MAINTENANCE_CHUNK_PAUSE * (TABLES * chunks_per_table) as u32;
+
+        let threshold = maintenance_warn_threshold(period);
+        assert!(
+            structural_floor < threshold,
+            "structural sleep floor {structural_floor:?} must stay strictly below the warn \
+             threshold {threshold:?} (period={period:?}); if this fails, \
+             MAINTENANCE_CHUNK_LEDGERS/MAINTENANCE_CHUNK_PAUSE have been retuned enough to \
+             threaten the fix in #3754"
+        );
+    }
+
     #[tokio::test]
     async fn test_maintainer_creation() {
         let db = henyey_db::Database::open_in_memory().unwrap();
