@@ -535,6 +535,18 @@ impl App {
         // `dispatch_peer_maintenance`, which keeps rounds strictly serial (skip a
         // tick if a prior round is still running) and is aborted on shutdown.
         let mut peer_maintenance_task: Option<tokio::task::JoinHandle<()>> = None;
+        // Loop-local in-flight handle for offloaded known-peers refresh
+        // (phase=29, #3756 — recurrence of #3582/#3689 through the sibling
+        // `peer_refresh_interval` arm the #3689 fix did not cover).
+        // `refresh_known_peers` awaits `tokio::net::lookup_host` DNS resolution
+        // plus `db_blocking("refresh-known-peers")`; under contention (e.g. the
+        // periodic tx-set GC holding a SQLite write lock) the latter retries up
+        // to busy_timeout, and running it inline inside the `select!` arm froze
+        // the loop for 13-29s once per minute. It is offloaded via
+        // `tick_peer_refresh` / `dispatch_peer_maintenance`, which keeps rounds
+        // strictly serial (skip a tick if a prior round is still running) and
+        // is aborted on shutdown.
+        let mut peer_refresh_task: Option<tokio::task::JoinHandle<()>> = None;
 
         // In-flight guard for the offloaded batched tx-advert flush (maxtps
         // iter 6). Same coalesced serial pattern as peer maintenance above:
@@ -1393,12 +1405,24 @@ impl App {
                     }
                 }
 
-                // Refresh known peers from config + SQLite cache
+                // Refresh known peers from config + SQLite cache. Offloaded off
+                // the event loop (#3756, recurrence of #3582/#3689): this arm
+                // used to await `refresh_known_peers` inline, which awaits DNS
+                // resolution plus `db_blocking("refresh-known-peers")` — a
+                // production node observed the loop parked 13-29s once per
+                // minute (28% duty-cycle loss) while that call contended with
+                // the periodic tx-set GC's SQLite write lock. The growing
+                // contention duration itself traces to the deployed binary
+                // missing already-merged #3722 (a storestate slot-state trim);
+                // that is a pending-deploy issue outside this fix's control.
+                // This offload is the independent mitigation layer: it caps
+                // the loop's time in phase=29 to a `tokio::spawn` dispatch
+                // (sub-millisecond) regardless of how long the contended work
+                // takes, mirroring `dispatch_peer_maintenance`'s use for
+                // phase=28 (#3689).
                 _ = peer_refresh_interval.tick() => {
                     self.set_phase(29); // 29 = peer_refresh
-                    if let Some(overlay) = self.overlay().await {
-                        let _ = self.refresh_known_peers(&overlay).await;
-                    }
+                    self.tick_peer_refresh(&mut peer_refresh_task).await;
                 }
 
                 // Herder cleanup - evict expired data
@@ -1444,6 +1468,13 @@ impl App {
                     // and best-effort reconnects, so an abort mid-flight is
                     // harmless — a skipped round simply re-runs on next startup.
                     if let Some(h) = peer_maintenance_task.take() {
+                        h.abort();
+                    }
+                    // Abort any in-flight known-peers refresh (#3756). Its only
+                    // side effects are idempotent upserts (`store_peer`/
+                    // `load_peer`), so an abort mid-flight is harmless — a
+                    // skipped refresh simply re-runs on the next 60s tick.
+                    if let Some(h) = peer_refresh_task.take() {
                         h.abort();
                     }
                     // Abort any in-flight advert flush (maxtps iter 6) — the
@@ -1662,6 +1693,33 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Dispatches the periodic known-peers refresh off the event-loop thread,
+    /// mirroring dispatch_peer_maintenance's use for phase 28 (#3689).
+    ///
+    /// Fixes #3756: `refresh_known_peers` awaits `tokio::net::lookup_host` DNS
+    /// resolution plus `db_blocking("refresh-known-peers")`, which retries
+    /// under SQLite write-lock contention. Running it inline in the
+    /// `peer_refresh_interval.tick()` `select!` arm parked the whole event
+    /// loop for 13-29s once per minute on a production validator, starving
+    /// SCP and other timers (recurrence of #3582 through the sibling code path
+    /// the #3689 fix did not cover). `task_slot` is the loop-local in-flight
+    /// handle: `dispatch_peer_maintenance` keeps rounds strictly serial (skip
+    /// this tick if a prior round is still running) and the caller aborts the
+    /// handle on shutdown.
+    async fn tick_peer_refresh(&self, task_slot: &mut Option<tokio::task::JoinHandle<()>>) {
+        let app = self.self_arc.read().await.upgrade();
+        if let Some(app) = app {
+            dispatch_peer_maintenance(
+                async move {
+                    if let Some(overlay) = app.overlay().await {
+                        let _ = app.refresh_known_peers(&overlay).await;
+                    }
+                },
+                task_slot,
+            );
+        }
     }
 
     /// Reset state after a rapid close cycle ends (no more closes or persists pending).
