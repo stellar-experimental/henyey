@@ -212,7 +212,9 @@ mod tests {
         call: Option<String>,
         elapsed_ms: Option<u64>,
         total_ms: Option<u64>,
+        inline_ms: Option<u64>,
         phases: Option<String>,
+        message: Option<String>,
     }
 
     impl Visit for CapturedEvent {
@@ -226,6 +228,8 @@ mod tests {
                 self.elapsed_ms = Some(value);
             } else if field.name() == "total_ms" {
                 self.total_ms = Some(value);
+            } else if field.name() == "inline_ms" {
+                self.inline_ms = Some(value);
             }
         }
         fn record_i64(&mut self, field: &Field, value: i64) {
@@ -238,6 +242,13 @@ mod tests {
             // assert on the formatted phase-breakdown string.
             if field.name() == "phases" {
                 self.phases = Some(format!("{:?}", value).trim_matches('"').to_string());
+            } else if field.name() == "message" {
+                // The macro's format-string/args are recorded as the
+                // implicit "message" field, routed through
+                // `record_debug` (`std::fmt::Arguments`'s `Debug` impl
+                // delegates to `Display`). Capture it so tests can
+                // assert on the human-readable WARN text itself.
+                self.message = Some(format!("{:?}", value).trim_matches('"').to_string());
             }
         }
     }
@@ -410,5 +421,116 @@ mod tests {
         // Durations are non-negative (no wall-clock assertions)
         assert!(phases[0].1 >= Duration::ZERO);
         assert!(phases[1].1 >= Duration::ZERO);
+    }
+
+    /// Regression test for #3755: a `PhaseTimer` whose only recorded
+    /// phase is *cooperative* (an `.await` where the event loop was
+    /// free to run other tasks) must not trigger the slow-call WARN,
+    /// even though the wall-clock total comfortably exceeds
+    /// [`LOCK_SLOW_THRESHOLD`]. This mirrors mainnet
+    /// `herder.receive_tx_set`, whose entire slow-call time was the
+    /// cooperative await of a `spawn_blocking` drain.
+    #[test]
+    fn phase_timer_cooperative_only_does_not_warn() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+
+        with_default(sub, || {
+            let mut timer = PhaseTimer::start();
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark_cooperative("cooperative_wait_ms");
+            timer.finish("common.test_cooperative_only");
+        });
+
+        let evs = events.lock().unwrap();
+        let call_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.call.as_deref() == Some("common.test_cooperative_only"))
+            .collect();
+        assert_eq!(
+            call_events.len(),
+            0,
+            "a cooperative-only phase must not trigger the slow-call WARN; saw: {:?}",
+            *evs
+        );
+    }
+
+    /// Regression test for #3755: a genuine inline (event-loop-blocking)
+    /// phase must still trigger the WARN even when a cooperative phase
+    /// also elapsed in the same call, and the reported `inline_ms` must
+    /// reflect only the inline phase — strictly less than `total_ms`.
+    #[test]
+    fn phase_timer_inline_still_warns_alongside_cooperative() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+
+        with_default(sub, || {
+            let mut timer = PhaseTimer::start();
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark("inline_phase_ms");
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark_cooperative("cooperative_phase_ms");
+            timer.finish("common.test_inline_and_cooperative");
+        });
+
+        let evs = events.lock().unwrap();
+        let call_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.call.as_deref() == Some("common.test_inline_and_cooperative"))
+            .collect();
+        assert_eq!(
+            call_events.len(),
+            1,
+            "expected exactly one slow-call WARN; saw: {:?}",
+            *evs
+        );
+        assert_eq!(call_events[0].level, "WARN");
+        let total = call_events[0].total_ms.expect("total_ms missing");
+        let inline = call_events[0].inline_ms.expect("inline_ms missing");
+        assert!(
+            inline >= TEST_SLOW_DURATION.as_millis() as u64,
+            "inline_ms ({inline}) should reflect the inline phase alone"
+        );
+        assert!(
+            inline < total,
+            "inline_ms ({inline}) must be strictly less than total_ms ({total}) \
+             since a cooperative phase also elapsed"
+        );
+    }
+
+    /// Regression test for #3755: the slow-call WARN message must not
+    /// cite the now-closed #1759/#1772 issues. The message is
+    /// label-agnostic, so a stale reference on any label is a defect —
+    /// this exercises `PhaseTimer::finish` directly.
+    #[test]
+    fn phase_timer_message_omits_stale_issue_reference() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+
+        with_default(sub, || {
+            let mut timer = PhaseTimer::start();
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark("phase_one_ms");
+            timer.finish("common.test_message_text");
+        });
+
+        let evs = events.lock().unwrap();
+        let call_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.call.as_deref() == Some("common.test_message_text"))
+            .collect();
+        assert_eq!(call_events.len(), 1);
+        let message = call_events[0]
+            .message
+            .as_deref()
+            .expect("message field missing");
+        assert!(
+            !message.contains("#1759"),
+            "message must not cite closed #1759: {message:?}"
+        );
+        assert!(
+            !message.contains("#1772"),
+            "message must not cite closed #1772: {message:?}"
+        );
     }
 }
