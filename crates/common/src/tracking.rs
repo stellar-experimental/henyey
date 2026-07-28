@@ -19,11 +19,17 @@
 //!   point (e.g. `herder.receive_tx_set`).
 //!
 //! - [`PhaseTimer`] — record a sequence of named phase durations
-//!   between `mark` points. On `finish`, emit a single structured
-//!   `WARN` with every phase as a `<name>=<ms>` field plus a
-//!   `total_ms=<sum>` field, iff total >= [`LOCK_SLOW_THRESHOLD`].
-//!   Intended for breaking a slow `time_call`ed function into its
-//!   sub-phases so the next freeze log names the dominant phase.
+//!   between `mark` points. Each phase is classified as **inline**
+//!   (event-loop-blocking, recorded via [`PhaseTimer::mark`]) or
+//!   **cooperative** (an `.await` where the event loop is free to run
+//!   other tasks, recorded via [`PhaseTimer::mark_cooperative`]). On
+//!   `finish`, emit a single structured `WARN` with every phase as a
+//!   `<name>=<ms>` field plus `total_ms=<sum>` and `inline_ms=<inline
+//!   sum>` fields, iff the **inline** sum reaches
+//!   [`LOCK_SLOW_THRESHOLD`]. Intended for breaking a slow
+//!   `time_call`ed function into its sub-phases so the next freeze log
+//!   names the dominant *blocking* phase, without firing on off-loaded
+//!   work that the event loop was free to ignore.
 //!
 //! ## Fast-path cost
 //!
@@ -114,6 +120,14 @@ pub struct PhaseTimer {
     start: Instant,
     last_mark: Instant,
     phases: Vec<(&'static str, Duration)>,
+    /// Sum of durations recorded via [`mark`](Self::mark) (inline,
+    /// event-loop-blocking phases) only. Durations recorded via
+    /// [`mark_cooperative`](Self::mark_cooperative) are excluded.
+    /// [`finish`](Self::finish) thresholds on this sum, not on the
+    /// full wall-clock total, so cooperative `.await`s on off-loaded
+    /// work (e.g. `spawn_blocking`) don't trigger the slow-call WARN
+    /// on their own.
+    inline_total: Duration,
 }
 
 impl PhaseTimer {
@@ -125,19 +139,43 @@ impl PhaseTimer {
             start: now,
             last_mark: now,
             phases: Vec::with_capacity(8),
+            inline_total: Duration::ZERO,
         }
     }
 
     /// Record the elapsed time since the previous `mark` (or since
-    /// `start` for the first call) under `name`.
+    /// `start` for the first call) under `name`, as an **inline**
+    /// (event-loop-blocking) phase. Counts toward the
+    /// [`finish`](Self::finish) slow-call threshold.
     ///
     /// `name` is a `&'static str` by design: phase names live in the
     /// call-site source, not in per-call allocations, and the WARN
     /// line below reads them cheaply.
     pub fn mark(&mut self, name: &'static str) {
+        self.mark_impl(name, true);
+    }
+
+    /// Record the elapsed time since the previous `mark` (or since
+    /// `start` for the first call) under `name`, as a **cooperative**
+    /// phase — an `.await` (e.g. of a `spawn_blocking` `JoinHandle`)
+    /// during which the event loop is free to run other tasks.
+    /// Recorded in `phases()`/`total_ms` exactly like [`mark`](Self::mark),
+    /// but excluded from the [`finish`](Self::finish) slow-call
+    /// threshold, since this time does not represent event-loop
+    /// blockage.
+    pub fn mark_cooperative(&mut self, name: &'static str) {
+        self.mark_impl(name, false);
+    }
+
+    /// Shared implementation backing [`mark`](Self::mark) and
+    /// [`mark_cooperative`](Self::mark_cooperative).
+    fn mark_impl(&mut self, name: &'static str, inline: bool) {
         let now = Instant::now();
         let phase = now.saturating_duration_since(self.last_mark);
         self.phases.push((name, phase));
+        if inline {
+            self.inline_total += phase;
+        }
         self.last_mark = now;
     }
 
@@ -153,15 +191,22 @@ impl PhaseTimer {
         &self.phases
     }
 
-    /// Finish the timer. If the total wall time since `start` reaches
-    /// [`LOCK_SLOW_THRESHOLD`], emit a single structured `WARN` line
-    /// with every phase as a field plus `total_ms` and `call`.
+    /// Finish the timer. If the **inline** (event-loop-blocking) phase
+    /// sum reaches [`LOCK_SLOW_THRESHOLD`], emit a single structured
+    /// `WARN` line with every phase as a field plus `total_ms`,
+    /// `inline_ms`, and `call`.
+    ///
+    /// Thresholding on `inline_ms` rather than `total_ms` means a call
+    /// dominated by a cooperative `.await` (e.g. awaiting a
+    /// `spawn_blocking` `JoinHandle`) does not trigger the WARN on its
+    /// own — the event loop was free to run other tasks during that
+    /// time. `total_ms` is still reported for full-wall-clock context.
     ///
     /// The WARN is emitted exactly once per `finish` call; the timer
     /// is consumed (`self`) to prevent accidental double emission.
     pub fn finish(self, label: &'static str) {
         let total = self.start.elapsed();
-        if total < LOCK_SLOW_THRESHOLD {
+        if self.inline_total < LOCK_SLOW_THRESHOLD {
             return;
         }
 
@@ -183,9 +228,10 @@ impl PhaseTimer {
         tracing::warn!(
             call = label,
             total_ms = total.as_millis() as u64,
+            inline_ms = self.inline_total.as_millis() as u64,
             threshold_ms = LOCK_SLOW_THRESHOLD.as_millis() as u64,
             phases = %phases_field,
-            "Slow call (>= {}ms) phase breakdown — possible #1759/#1772 contributor",
+            "Slow call (>= {}ms) phase breakdown",
             LOCK_SLOW_THRESHOLD.as_millis()
         );
     }

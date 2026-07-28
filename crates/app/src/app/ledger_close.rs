@@ -2664,6 +2664,24 @@ impl App {
                 tracing::warn!("{}", warning);
             }
         }
+        // Test-only: simulate additional inline (event-loop-blocking) work
+        // immediately before the `overlay_bookkeeping_ms` mark below, so
+        // tests can force this phase over the `PhaseTimer` inline-sum
+        // threshold (#3755) without depending on real overlay/survey/drift
+        // timing. Mirrors `close_complete_inject_blocking_ms` (which
+        // injects into the off-loaded `spawn_blocking` phase below) but
+        // targets the INLINE phase instead — placement matters: this must
+        // land here, before `overlay_bookkeeping_ms`, not before the later
+        // `spawn_blocking_setup_ms` mark, or the delay would be
+        // misattributed.
+        #[cfg(test)]
+        {
+            let inject_inline_ms = self.close_complete_inject_inline_ms.load(Ordering::Relaxed);
+            if inject_inline_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(inject_inline_ms));
+            }
+        }
+
         // Mark end of the inline overlay/survey/drift bookkeeping window.
         // This brackets lines that touch tokio RwLocks (overlay, survey_state)
         // and the std::Mutex drift tracker. Each internal operation is
@@ -3079,7 +3097,7 @@ impl App {
                 );
             }
         }
-        timer.mark("tx_queue_background_wait_ms");
+        timer.mark_cooperative("tx_queue_background_wait_ms");
         record_phase_histogram(crate::metrics::CLOSE_COMPLETE_TX_QUEUE_SECONDS, &timer);
 
         // Update current ledger tracking.
