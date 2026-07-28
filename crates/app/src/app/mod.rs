@@ -988,6 +988,23 @@ pub struct App {
     #[cfg(test)]
     pub(crate) close_complete_inject_blocking_ms: AtomicU64,
 
+    /// Test-only: injects a synthetic **inline** (event-loop-blocking)
+    /// sleep (in milliseconds), immediately before the
+    /// `overlay_bookkeeping_ms` `PhaseTimer` mark inside
+    /// `handle_close_complete_inner`. Mirrors
+    /// `close_complete_inject_blocking_ms` above, but targets the
+    /// INLINE phase instead of the `spawn_blocking`-off-loaded phase.
+    ///
+    /// Needed because `PhaseTimer::finish` (#3755) thresholds its
+    /// slow-call WARN on the inline phase sum only, and
+    /// `tx_queue_background_wait_ms` (the phase
+    /// `close_complete_inject_blocking_ms` lands in) is now recorded via
+    /// `mark_cooperative`, so it no longer counts toward that threshold
+    /// on its own. When set to 0 (the default), the inline preamble
+    /// behaves exactly as in production.
+    #[cfg(test)]
+    pub(crate) close_complete_inject_inline_ms: AtomicU64,
+
     /// Regression-only hook for testing that `process_externalized_slots`
     /// does NOT hold `syncing_ledgers` write lock during the iteration phase.
     /// Set by tests that need deterministic synchronization; `None` otherwise.
@@ -1665,6 +1682,8 @@ impl App {
             close_cycle_last_start: parking_lot::Mutex::new(None),
             #[cfg(test)]
             close_complete_inject_blocking_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            close_complete_inject_inline_ms: AtomicU64::new(0),
             #[cfg(test)]
             pes_iteration_gate: None,
             sync_recovery_pending: AtomicBool::new(false),
@@ -8499,11 +8518,13 @@ mod tests {
     ///    attributing inline preamble work to labels that named the
     ///    off-loaded work).
     ///
-    /// 2. **Event-loop blocking time**: the sum of the two pre-spawn marks
-    ///    (`overlay_bookkeeping_ms + spawn_blocking_setup_ms`) is < 50 ms.
-    ///    These brackets span only inline overlay/survey/drift bookkeeping
-    ///    plus the preamble that moves fields into the spawn_blocking
-    ///    closure — pure sync CPU + a handful of tokio RwLock reads.
+    /// 2. **Inline event-loop-blocking time (#3755)**: `overlay_bookkeeping_ms`
+    ///    reflects the 260 ms inline delay injected via
+    ///    `close_complete_inject_inline_ms` (one-sided `>= 260 ms` — no tight
+    ///    upper bound, matching this test's own jitter-tolerant style used
+    ///    below for `tx_queue_background_wait_ms`), while
+    ///    `spawn_blocking_setup_ms` remains `< 50 ms` (pure capture-list
+    ///    moves, unaffected by the inline injection).
     ///
     /// 3. **Spawn-blocking wait visibility (#1775)**:
     ///    `tx_queue_background_wait_ms >= 300 ms`, confirming the injected
@@ -8524,6 +8545,12 @@ mod tests {
         // is always emitted regardless of preamble timing jitter on slow CI.
         app.close_complete_inject_blocking_ms
             .store(400, Ordering::Relaxed);
+        // Also inject 260 ms of synthetic inline work (lands in
+        // `overlay_bookkeeping_ms`) so the WARN still fires post-#3755, now
+        // that `tx_queue_background_wait_ms` is `mark_cooperative` and no
+        // longer counts toward the inline-sum threshold on its own.
+        app.close_complete_inject_inline_ms
+            .store(260, Ordering::Relaxed);
         app.set_applying_ledger(true);
 
         // Capture tracing output to inspect PhaseTimer WARN emissions.
@@ -8667,16 +8694,27 @@ mod tests {
             "WARN line should contain tx_queue_background_wait_ms field (new in #1775 Phase 2)",
         );
 
-        // Assertion (2): Event-loop blocking time < 50 ms. The two pre-spawn
-        // marks bracket only inline overlay/survey/drift bookkeeping plus
-        // the preamble that moves fields into the spawn_blocking closure.
-        // Post-fix this is microseconds of real CPU cost; pre-#1778 (misnamed
-        // marks) this window used to read ~200 ms because the marks fired
-        // AFTER work that had moved off-thread in #1775 Phase 2.
+        // Assertion (2a): `overlay_bookkeeping_ms` reflects the 260 ms
+        // inline delay injected via `close_complete_inject_inline_ms`
+        // (#3755). One-sided lower bound only — no tight upper bound —
+        // matching this same test's jitter-tolerant style for
+        // `tx_queue_background_wait_ms` below.
         assert!(
-            overlay_ms + setup_ms < 50,
-            "overlay_bookkeeping_ms ({overlay_ms}) + spawn_blocking_setup_ms \
-             ({setup_ms}) must be < 50 ms post-fix; WARN line was: {phase_line}"
+            overlay_ms >= 260,
+            "overlay_bookkeeping_ms ({overlay_ms}) should reflect the 260 ms \
+             injected inline delay; WARN line was: {phase_line}"
+        );
+        // Assertion (2b): `spawn_blocking_setup_ms` < 50 ms. This bracket
+        // spans only the preamble that moves fields into the spawn_blocking
+        // closure — pure sync CPU + a handful of tokio RwLock reads, and is
+        // unaffected by the inline injection above. Post-fix this is
+        // microseconds of real CPU cost; pre-#1778 (misnamed marks) this
+        // window used to read ~200 ms because the marks fired AFTER work
+        // that had moved off-thread in #1775 Phase 2.
+        assert!(
+            setup_ms < 50,
+            "spawn_blocking_setup_ms ({setup_ms}) must be < 50 ms post-fix; \
+             WARN line was: {phase_line}"
         );
 
         // Assertion (3): The 400 ms injected work must show up under
@@ -8695,13 +8733,21 @@ mod tests {
     /// observed pre-fix on mainnet binary `3a6388b9`.
     ///
     /// Unlike `test_close_complete_event_loop_marks_correctly_attributed`,
-    /// this test injects NO synthetic blocking work. It exercises the
+    /// this test injects no work inside `spawn_blocking`. It exercises the
     /// smallest possible close (empty tx_set, no meta), so the WARN line
     /// may not fire at the 250 ms PhaseTimer threshold; the assertion
-    /// uses the DEBUG-level "start" / "finish" path by triggering the
-    /// WARN unconditionally via a tiny 260 ms injection (comfortably above
-    /// the 250 ms gate but small enough that it does not mask a
-    /// setup-window regression).
+    /// triggers the WARN unconditionally via a tiny 260 ms **inline**
+    /// injection (`close_complete_inject_inline_ms`), which lands in
+    /// `overlay_bookkeeping_ms` immediately before that mark — NOT inside
+    /// `spawn_blocking`. This is comfortably above the 250 ms gate but
+    /// small enough that it does not mask a setup-window regression.
+    ///
+    /// The injection must be inline rather than inside `spawn_blocking`:
+    /// since #3755, `PhaseTimer::finish` thresholds its slow-call WARN on
+    /// the **inline** phase sum only, and `tx_queue_background_wait_ms`
+    /// (the phase `close_complete_inject_blocking_ms` — used by the
+    /// sibling test above — lands in) is recorded via `mark_cooperative`,
+    /// so it no longer counts toward that threshold on its own.
     ///
     /// **Assertions**:
     ///
@@ -8730,14 +8776,13 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Inject 260 ms of synthetic blocking work INSIDE the spawn_blocking
-        // closure (just above the PhaseTimer's 250 ms WARN gate) so the
-        // WARN line always fires and the sub-phase numbers can be parsed.
-        // The injection sits inside `spawn_blocking`, so it shows up under
-        // `tx_queue_background_wait_ms`, NOT under
-        // `spawn_blocking_setup_ms`. Any value leaking into
-        // `spawn_blocking_setup_ms` is the real regression.
-        app.close_complete_inject_blocking_ms
+        // Inject 260 ms of synthetic inline work (just above the
+        // PhaseTimer's 250 ms WARN gate) so the WARN line always fires and
+        // the sub-phase numbers can be parsed. The injection lands in
+        // `overlay_bookkeeping_ms`, NOT under `spawn_blocking_setup_ms`.
+        // Any value leaking into `spawn_blocking_setup_ms` is the real
+        // regression.
+        app.close_complete_inject_inline_ms
             .store(260, Ordering::Relaxed);
         app.set_applying_ledger(true);
 

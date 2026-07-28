@@ -4551,7 +4551,7 @@ impl Herder {
                 "envelope drain after tx-set receive"
             );
         }
-        timer.mark("process_ready_spawn_blocking_ms");
+        timer.mark_cooperative("process_ready_spawn_blocking_ms");
 
         timer.finish("herder.receive_tx_set");
         slot

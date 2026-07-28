@@ -19,11 +19,17 @@
 //!   point (e.g. `herder.receive_tx_set`).
 //!
 //! - [`PhaseTimer`] — record a sequence of named phase durations
-//!   between `mark` points. On `finish`, emit a single structured
-//!   `WARN` with every phase as a `<name>=<ms>` field plus a
-//!   `total_ms=<sum>` field, iff total >= [`LOCK_SLOW_THRESHOLD`].
-//!   Intended for breaking a slow `time_call`ed function into its
-//!   sub-phases so the next freeze log names the dominant phase.
+//!   between `mark` points. Each phase is classified as **inline**
+//!   (event-loop-blocking, recorded via [`PhaseTimer::mark`]) or
+//!   **cooperative** (an `.await` where the event loop is free to run
+//!   other tasks, recorded via [`PhaseTimer::mark_cooperative`]). On
+//!   `finish`, emit a single structured `WARN` with every phase as a
+//!   `<name>=<ms>` field plus `total_ms=<sum>` and `inline_ms=<inline
+//!   sum>` fields, iff the **inline** sum reaches
+//!   [`LOCK_SLOW_THRESHOLD`]. Intended for breaking a slow
+//!   `time_call`ed function into its sub-phases so the next freeze log
+//!   names the dominant *blocking* phase, without firing on off-loaded
+//!   work that the event loop was free to ignore.
 //!
 //! ## Fast-path cost
 //!
@@ -114,6 +120,14 @@ pub struct PhaseTimer {
     start: Instant,
     last_mark: Instant,
     phases: Vec<(&'static str, Duration)>,
+    /// Sum of durations recorded via [`mark`](Self::mark) (inline,
+    /// event-loop-blocking phases) only. Durations recorded via
+    /// [`mark_cooperative`](Self::mark_cooperative) are excluded.
+    /// [`finish`](Self::finish) thresholds on this sum, not on the
+    /// full wall-clock total, so cooperative `.await`s on off-loaded
+    /// work (e.g. `spawn_blocking`) don't trigger the slow-call WARN
+    /// on their own.
+    inline_total: Duration,
 }
 
 impl PhaseTimer {
@@ -125,19 +139,43 @@ impl PhaseTimer {
             start: now,
             last_mark: now,
             phases: Vec::with_capacity(8),
+            inline_total: Duration::ZERO,
         }
     }
 
     /// Record the elapsed time since the previous `mark` (or since
-    /// `start` for the first call) under `name`.
+    /// `start` for the first call) under `name`, as an **inline**
+    /// (event-loop-blocking) phase. Counts toward the
+    /// [`finish`](Self::finish) slow-call threshold.
     ///
     /// `name` is a `&'static str` by design: phase names live in the
     /// call-site source, not in per-call allocations, and the WARN
     /// line below reads them cheaply.
     pub fn mark(&mut self, name: &'static str) {
+        self.mark_impl(name, true);
+    }
+
+    /// Record the elapsed time since the previous `mark` (or since
+    /// `start` for the first call) under `name`, as a **cooperative**
+    /// phase — an `.await` (e.g. of a `spawn_blocking` `JoinHandle`)
+    /// during which the event loop is free to run other tasks.
+    /// Recorded in `phases()`/`total_ms` exactly like [`mark`](Self::mark),
+    /// but excluded from the [`finish`](Self::finish) slow-call
+    /// threshold, since this time does not represent event-loop
+    /// blockage.
+    pub fn mark_cooperative(&mut self, name: &'static str) {
+        self.mark_impl(name, false);
+    }
+
+    /// Shared implementation backing [`mark`](Self::mark) and
+    /// [`mark_cooperative`](Self::mark_cooperative).
+    fn mark_impl(&mut self, name: &'static str, inline: bool) {
         let now = Instant::now();
         let phase = now.saturating_duration_since(self.last_mark);
         self.phases.push((name, phase));
+        if inline {
+            self.inline_total += phase;
+        }
         self.last_mark = now;
     }
 
@@ -153,15 +191,22 @@ impl PhaseTimer {
         &self.phases
     }
 
-    /// Finish the timer. If the total wall time since `start` reaches
-    /// [`LOCK_SLOW_THRESHOLD`], emit a single structured `WARN` line
-    /// with every phase as a field plus `total_ms` and `call`.
+    /// Finish the timer. If the **inline** (event-loop-blocking) phase
+    /// sum reaches [`LOCK_SLOW_THRESHOLD`], emit a single structured
+    /// `WARN` line with every phase as a field plus `total_ms`,
+    /// `inline_ms`, and `call`.
+    ///
+    /// Thresholding on `inline_ms` rather than `total_ms` means a call
+    /// dominated by a cooperative `.await` (e.g. awaiting a
+    /// `spawn_blocking` `JoinHandle`) does not trigger the WARN on its
+    /// own — the event loop was free to run other tasks during that
+    /// time. `total_ms` is still reported for full-wall-clock context.
     ///
     /// The WARN is emitted exactly once per `finish` call; the timer
     /// is consumed (`self`) to prevent accidental double emission.
     pub fn finish(self, label: &'static str) {
         let total = self.start.elapsed();
-        if total < LOCK_SLOW_THRESHOLD {
+        if self.inline_total < LOCK_SLOW_THRESHOLD {
             return;
         }
 
@@ -183,9 +228,10 @@ impl PhaseTimer {
         tracing::warn!(
             call = label,
             total_ms = total.as_millis() as u64,
+            inline_ms = self.inline_total.as_millis() as u64,
             threshold_ms = LOCK_SLOW_THRESHOLD.as_millis() as u64,
             phases = %phases_field,
-            "Slow call (>= {}ms) phase breakdown — possible #1759/#1772 contributor",
+            "Slow call (>= {}ms) phase breakdown",
             LOCK_SLOW_THRESHOLD.as_millis()
         );
     }
@@ -212,7 +258,9 @@ mod tests {
         call: Option<String>,
         elapsed_ms: Option<u64>,
         total_ms: Option<u64>,
+        inline_ms: Option<u64>,
         phases: Option<String>,
+        message: Option<String>,
     }
 
     impl Visit for CapturedEvent {
@@ -226,6 +274,8 @@ mod tests {
                 self.elapsed_ms = Some(value);
             } else if field.name() == "total_ms" {
                 self.total_ms = Some(value);
+            } else if field.name() == "inline_ms" {
+                self.inline_ms = Some(value);
             }
         }
         fn record_i64(&mut self, field: &Field, value: i64) {
@@ -238,6 +288,13 @@ mod tests {
             // assert on the formatted phase-breakdown string.
             if field.name() == "phases" {
                 self.phases = Some(format!("{:?}", value).trim_matches('"').to_string());
+            } else if field.name() == "message" {
+                // The macro's format-string/args are recorded as the
+                // implicit "message" field, routed through
+                // `record_debug` (`std::fmt::Arguments`'s `Debug` impl
+                // delegates to `Display`). Capture it so tests can
+                // assert on the human-readable WARN text itself.
+                self.message = Some(format!("{:?}", value).trim_matches('"').to_string());
             }
         }
     }
@@ -410,5 +467,116 @@ mod tests {
         // Durations are non-negative (no wall-clock assertions)
         assert!(phases[0].1 >= Duration::ZERO);
         assert!(phases[1].1 >= Duration::ZERO);
+    }
+
+    /// Regression test for #3755: a `PhaseTimer` whose only recorded
+    /// phase is *cooperative* (an `.await` where the event loop was
+    /// free to run other tasks) must not trigger the slow-call WARN,
+    /// even though the wall-clock total comfortably exceeds
+    /// [`LOCK_SLOW_THRESHOLD`]. This mirrors mainnet
+    /// `herder.receive_tx_set`, whose entire slow-call time was the
+    /// cooperative await of a `spawn_blocking` drain.
+    #[test]
+    fn phase_timer_cooperative_only_does_not_warn() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+
+        with_default(sub, || {
+            let mut timer = PhaseTimer::start();
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark_cooperative("cooperative_wait_ms");
+            timer.finish("common.test_cooperative_only");
+        });
+
+        let evs = events.lock().unwrap();
+        let call_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.call.as_deref() == Some("common.test_cooperative_only"))
+            .collect();
+        assert_eq!(
+            call_events.len(),
+            0,
+            "a cooperative-only phase must not trigger the slow-call WARN; saw: {:?}",
+            *evs
+        );
+    }
+
+    /// Regression test for #3755: a genuine inline (event-loop-blocking)
+    /// phase must still trigger the WARN even when a cooperative phase
+    /// also elapsed in the same call, and the reported `inline_ms` must
+    /// reflect only the inline phase — strictly less than `total_ms`.
+    #[test]
+    fn phase_timer_inline_still_warns_alongside_cooperative() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+
+        with_default(sub, || {
+            let mut timer = PhaseTimer::start();
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark("inline_phase_ms");
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark_cooperative("cooperative_phase_ms");
+            timer.finish("common.test_inline_and_cooperative");
+        });
+
+        let evs = events.lock().unwrap();
+        let call_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.call.as_deref() == Some("common.test_inline_and_cooperative"))
+            .collect();
+        assert_eq!(
+            call_events.len(),
+            1,
+            "expected exactly one slow-call WARN; saw: {:?}",
+            *evs
+        );
+        assert_eq!(call_events[0].level, "WARN");
+        let total = call_events[0].total_ms.expect("total_ms missing");
+        let inline = call_events[0].inline_ms.expect("inline_ms missing");
+        assert!(
+            inline >= TEST_SLOW_DURATION.as_millis() as u64,
+            "inline_ms ({inline}) should reflect the inline phase alone"
+        );
+        assert!(
+            inline < total,
+            "inline_ms ({inline}) must be strictly less than total_ms ({total}) \
+             since a cooperative phase also elapsed"
+        );
+    }
+
+    /// Regression test for #3755: the slow-call WARN message must not
+    /// cite the now-closed #1759/#1772 issues. The message is
+    /// label-agnostic, so a stale reference on any label is a defect —
+    /// this exercises `PhaseTimer::finish` directly.
+    #[test]
+    fn phase_timer_message_omits_stale_issue_reference() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+
+        with_default(sub, || {
+            let mut timer = PhaseTimer::start();
+            std::thread::sleep(TEST_SLOW_DURATION);
+            timer.mark("phase_one_ms");
+            timer.finish("common.test_message_text");
+        });
+
+        let evs = events.lock().unwrap();
+        let call_events: Vec<_> = evs
+            .iter()
+            .filter(|e| e.call.as_deref() == Some("common.test_message_text"))
+            .collect();
+        assert_eq!(call_events.len(), 1);
+        let message = call_events[0]
+            .message
+            .as_deref()
+            .expect("message field missing");
+        assert!(
+            !message.contains("#1759"),
+            "message must not cite closed #1759: {message:?}"
+        );
+        assert!(
+            !message.contains("#1772"),
+            "message must not cite closed #1772: {message:?}"
+        );
     }
 }
