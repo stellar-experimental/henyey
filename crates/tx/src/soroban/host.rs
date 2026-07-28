@@ -3125,4 +3125,83 @@ mod tests {
             "With key in previously_restored_keys, hot archive must be skipped"
         );
     }
+
+    /// Regression test for #3761: the per-event diagnostic dump on a failed
+    /// Soroban invocation must log at `debug!`, matching the sibling
+    /// failure-summary/success statements at the same call site. Failed
+    /// contract invocations are routine on mainnet (ordinary contract
+    /// reverts); logging each diagnostic event at `warn!` produced 21.5k
+    /// WARN lines over 26 days (30% of WARN volume) for a non-actionable
+    /// condition. This test inspects the crate's own source rather than
+    /// invoking the (deep, private, version-gated) dispatch functions
+    /// end-to-end, since constructing full footprint/budget/ledger-info
+    /// fixtures per protocol version is disproportionate for a log-level
+    /// change.
+    #[test]
+    fn test_p25_p26_p27_diagnostic_event_logs_are_debug_not_warn() {
+        const SRC: &str = include_str!("host.rs");
+
+        // Truncate the haystack at the `#[cfg(test)] mod tests` boundary.
+        // Without this, the string literals declared a few lines below
+        // (used to state what we're searching for) would themselves appear
+        // in `SRC` once `include_str!` pulls in this very file, and could
+        // be mistaken for production call sites. Restricting the search to
+        // production code makes plain first-occurrence `str::find` (not
+        // `matches().count()`, which would double-count across production
+        // + test code) both correct and sufficient -- not incidental.
+        let boundary = SRC
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("expected a `#[cfg(test)] mod tests` boundary in host.rs");
+        let production_src = &SRC[..boundary];
+
+        let messages = [
+            "\"P25: Diagnostic event\"",
+            "\"P26: Diagnostic event\"",
+            "\"P27: Diagnostic event\"",
+        ];
+
+        let mut sites_found = 0;
+        for message in messages {
+            // First-occurrence search: each message literal names exactly
+            // one call site (one per protocol version) in production code.
+            let msg_pos = production_src
+                .find(message)
+                .unwrap_or_else(|| panic!("expected to find {message} in production code"));
+
+            // Find the line containing the literal, then scan backward up
+            // to 6 lines for the nearest `tracing::` macro invocation that
+            // opens this log statement.
+            let line_idx = production_src[..msg_pos].matches('\n').count();
+            let lines: Vec<&str> = production_src.lines().collect();
+            let start = line_idx.saturating_sub(6);
+            let macro_line = lines[start..=line_idx]
+                .iter()
+                .rev()
+                .find(|l| l.contains("tracing::"))
+                .unwrap_or_else(|| {
+                    panic!("expected a `tracing::` macro within 6 lines above {message}")
+                });
+
+            assert!(
+                macro_line.contains("tracing::debug!"),
+                "{message} must log at debug!, not warn! (found: {})",
+                macro_line.trim()
+            );
+            assert!(
+                !macro_line.contains("tracing::warn!"),
+                "{message} must not log at warn! (found: {})",
+                macro_line.trim()
+            );
+
+            sites_found += 1;
+        }
+
+        // Guards against a future rename silently making the search above
+        // find nothing (each iteration would panic before reaching here,
+        // but this makes the "exactly 3 sites" invariant explicit).
+        assert_eq!(
+            sites_found, 3,
+            "expected exactly 3 diagnostic-event log sites (P25/P26/P27)"
+        );
+    }
 }
