@@ -199,6 +199,7 @@ impl Maintainer {
                     let db = Arc::clone(&self.database);
                     let config_count = self.config.count;
                     let rpc_retention_window = self.config.rpc_retention_window;
+                    let period = self.config.period;
                     let get_bounds = Arc::clone(&self.get_ledger_bounds);
 
                     match henyey_common::spawn_blocking_logged(
@@ -217,10 +218,11 @@ impl Maintainer {
                             );
 
                             let elapsed = start.elapsed();
-                            if elapsed > Duration::from_secs(10) {
+                            if elapsed > maintenance_warn_threshold(period) {
                                 warn!(
                                     elapsed_ms = elapsed.as_millis(),
-                                    "Maintenance took too long; consider increasing AUTOMATIC_MAINTENANCE_COUNT \
+                                    "Maintenance cycle exceeded its expected-relative-to-period threshold; if \
+                                     consistently slow, consider tuning MAINTENANCE_CHUNK_LEDGERS/MAINTENANCE_CHUNK_PAUSE \
                                      or performing manual database maintenance"
                                 );
                             } else {
@@ -266,10 +268,11 @@ impl Maintainer {
         );
 
         let elapsed = start.elapsed();
-        if elapsed > Duration::from_secs(10) {
+        if elapsed > maintenance_warn_threshold(self.config.period) {
             warn!(
                 elapsed_ms = elapsed.as_millis(),
-                "Maintenance took too long; consider increasing AUTOMATIC_MAINTENANCE_COUNT \
+                "Maintenance cycle exceeded its expected-relative-to-period threshold; if \
+                 consistently slow, consider tuning MAINTENANCE_CHUNK_LEDGERS/MAINTENANCE_CHUNK_PAUSE \
                  or performing manual database maintenance"
             );
         } else {
@@ -346,6 +349,23 @@ const MAINTENANCE_CHUNK_LEDGERS: u32 = 2;
 /// transaction (and other writers) a window to acquire the WAL write lock
 /// between chunks.
 const MAINTENANCE_CHUNK_PAUSE: Duration = Duration::from_millis(25);
+
+/// Warn threshold for a maintenance cycle's elapsed time.
+///
+/// A flat threshold predates the per-chunk WAL-lock-yielding pauses added
+/// for #3702 (`MAINTENANCE_CHUNK_PAUSE` between chunks, across up to 5
+/// tables in `run_maintenance`), whose structural floor alone can exceed a
+/// few seconds on short periods — firing this warning in steady state
+/// rather than signaling genuine slowness. Instead, warn only when a cycle
+/// risks not keeping up with its own configured period: a cycle longer than
+/// a third of the period is the operationally meaningful risk, independent
+/// of how many tables/chunks the current build happens to have. Clamped to
+/// a 10s floor (the previous flat threshold) so a misconfigured/degenerate
+/// `period` (e.g. zero, not rejected by the type system) cannot make this
+/// warning fire unconditionally by driving the threshold itself to zero.
+fn maintenance_warn_threshold(period: Duration) -> Duration {
+    (period / 3).max(Duration::from_secs(10))
+}
 
 /// Run one table's maintenance deletion in bounded chunks.
 ///
