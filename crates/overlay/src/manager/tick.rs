@@ -9,6 +9,7 @@ use crate::{connection::ConnectionPool, peer::PeerInfo, DialKey, PeerAddress, Pe
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -39,8 +40,25 @@ pub(super) const PEER_IP_RESOLVE_DELAY: Duration = Duration::from_secs(600);
 /// Matches stellar-core `PEER_IP_RESOLVE_RETRY_DELAY`.
 pub(super) const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Delay before retrying a failed outbound connection attempt.
-const OUTBOUND_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// Compute a jittered, escalating backoff delay for a failed outbound
+/// connect attempt, given the consecutive failure count for that peer.
+///
+/// Mirrors stellar-core's actual connect-retry backoff
+/// (`PeerManager::computeBackoff`, `PeerManager.cpp:365-410`): a random delay
+/// in `[1, 2^min(num_failures, MAX_BACKOFF_EXPONENT) * SECONDS_PER_BACKOFF]`
+/// seconds, doubling the ceiling per consecutive failure and capped at
+/// exponent 10 (~2.84h ceiling), with jitter to avoid synchronized retry
+/// bursts across many peers/nodes.
+///
+/// Replaces the old flat `OUTBOUND_CONNECT_RETRY_DELAY` (10s forever), which
+/// re-dialed dead preferred peers every ~20s indefinitely (#3770).
+fn compute_connect_backoff(num_failures: u32) -> Duration {
+    const SECONDS_PER_BACKOFF: u32 = 10;
+    const MAX_BACKOFF_EXPONENT: u32 = 10;
+    let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
+    let ceiling_secs = (1u32 << backoff_count) * SECONDS_PER_BACKOFF;
+    Duration::from_secs(rand::thread_rng().gen_range(1..=ceiling_secs) as u64)
+}
 
 /// Result of a background DNS resolution of configured peers.
 struct ResolvedPeers {
@@ -227,7 +245,10 @@ impl OverlayManager {
         };
 
         let handle = tokio::spawn(async move {
-            let mut retry_after: HashMap<DialKey, Instant> = HashMap::new();
+            // Value is (next-allowed-instant, consecutive-failure-count). The
+            // failure count persists across ticks so backoff escalates for a
+            // peer that keeps failing, and resets on the next success (#3770).
+            let mut retry_after: HashMap<DialKey, (Instant, u32)> = HashMap::new();
             // Delay the first tick by one full interval. This matches
             // stellar-core's timer semantics (timers fire AFTER the interval,
             // not at T=0) and prevents simultaneous outbound dials during
@@ -457,7 +478,7 @@ impl OverlayManager {
     #[allow(clippy::too_many_arguments)]
     async fn connect_preferred_peers(
         preferred_set: &PreferredPeerSet,
-        retry_after: &mut HashMap<DialKey, Instant>,
+        retry_after: &mut HashMap<DialKey, (Instant, u32)>,
         now: Instant,
         mut remaining: usize,
         _max_outbound: usize,
@@ -474,7 +495,7 @@ impl OverlayManager {
             }
 
             let key = addr.dial_key();
-            if let Some(next) = retry_after.get(&key) {
+            if let Some((next, _)) = retry_after.get(&key) {
                 if *next > now {
                     continue;
                 }
@@ -514,7 +535,11 @@ impl OverlayManager {
                 }
                 Err(e) => {
                     warn!("Failed to connect to preferred peer {}: {}", addr, e);
-                    retry_after.insert(key, now + OUTBOUND_CONNECT_RETRY_DELAY);
+                    let num_failures = retry_after.get(&key).map_or(0, |(_, count)| *count) + 1;
+                    retry_after.insert(
+                        key,
+                        (now + compute_connect_backoff(num_failures), num_failures),
+                    );
                 }
             }
         }
@@ -524,7 +549,7 @@ impl OverlayManager {
     /// Fill remaining outbound slots from the shuffled known-peer list.
     async fn fill_outbound_slots(
         known_peers: &RwLock<super::KnownPeerSet>,
-        retry_after: &mut HashMap<DialKey, Instant>,
+        retry_after: &mut HashMap<DialKey, (Instant, u32)>,
         now: Instant,
         mut remaining: usize,
         pool: &Arc<ConnectionPool>,
@@ -546,7 +571,7 @@ impl OverlayManager {
             }
 
             let key = addr.dial_key();
-            if let Some(next) = retry_after.get(&key) {
+            if let Some((next, _)) = retry_after.get(&key) {
                 if *next > now {
                     continue;
                 }
@@ -586,7 +611,11 @@ impl OverlayManager {
                 }
                 Err(e) => {
                     debug!("Failed to connect to peer {}: {}", addr, e);
-                    retry_after.insert(key, now + OUTBOUND_CONNECT_RETRY_DELAY);
+                    let num_failures = retry_after.get(&key).map_or(0, |(_, count)| *count) + 1;
+                    retry_after.insert(
+                        key,
+                        (now + compute_connect_backoff(num_failures), num_failures),
+                    );
                 }
             }
         }
