@@ -531,8 +531,9 @@ run_tests() {
   mock_proc_entry "$proc" "1001" "$data/$session_id/cargo-target/release/henyey" "henyey --mainnet run --validator"
   mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
-  if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "yes" && -d "$data/$session_id/logs" ]]; then
+  local exit_code1=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code1=$?
+  if [[ "$exit_code1" -eq 0 && "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "yes" && -d "$data/$session_id/logs" ]]; then
     tap_ok "session-wipe: process alive (exact binary)"
   else
     tap_not_ok "session-wipe: process alive (exact binary)" "WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE"
@@ -547,8 +548,9 @@ run_tests() {
   mock_proc_entry "$proc" "2001" "$data/$session_id/cargo-target/release/henyey (deleted)" "henyey --mainnet run --validator"
   mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
-  if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "yes" && -d "$data/$session_id/metrics" ]]; then
+  local exit_code2=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code2=$?
+  if [[ "$exit_code2" -eq 0 && "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "yes" && -d "$data/$session_id/metrics" ]]; then
     tap_ok "session-wipe: process alive (deleted binary)"
   else
     tap_not_ok "session-wipe: process alive (deleted binary)" "WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE"
@@ -565,8 +567,9 @@ run_tests() {
   # Create env file so freshness check passes
   mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
-  if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" && -d "$data/$session_id/logs" ]]; then
+  local exit_code3=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code3=$?
+  if [[ "$exit_code3" -eq 0 && "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" && -d "$data/$session_id/logs" ]]; then
     tap_ok "session-wipe: different binary not matched"
   else
     tap_not_ok "session-wipe: different binary not matched" "WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE"
@@ -580,8 +583,9 @@ run_tests() {
   mkdir -p "$data" "$proc"
   mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
-  if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" && -d "$data/$session_id/cargo-target" ]]; then
+  local exit_code4=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code4=$?
+  if [[ "$exit_code4" -eq 0 && "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" && -d "$data/$session_id/cargo-target" ]]; then
     tap_ok "session-wipe: dead process, env fresh"
   else
     tap_not_ok "session-wipe: dead process, env fresh" "WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE"
@@ -603,19 +607,28 @@ run_tests() {
     tap_not_ok "session-wipe: dead process, env stale (7201s)" "expected return 1, got $exit_code"
   fi
 
-  # ── Test 6: Process dead + env at boundary (7200s) ─────────────────────
-  # Source: scripts/lib/monitor-decisions.sh — -gt 7200 means 7200 passes
+  # ── Test 6: Process dead + env on fresh side of boundary (7199s) ────────
+  # Source: scripts/lib/monitor-decisions.sh — freshness predicate is
+  # `env_age -gt <boundary>`, so anything at or below the boundary is fresh.
+  # Mock 7199 (not the exact boundary): the age is recomputed from the wall
+  # clock inside the check, so mocking the exact boundary races the clock — a
+  # single second between mock and check flips the env to stale. 7199 stays
+  # fresh across two integer-second advances, making the assertion
+  # deterministic while still exercising the fresh side of the boundary.
+  # The call is guarded (Test-5 pattern) so a stale-path `return 1` can never
+  # abort the harness under `set -e` (see #3766).
   data="$TEST_ROOT/t6/data"
   proc="$TEST_ROOT/t6/proc"
   session_id="sess6666"
   mkdir -p "$data" "$proc"
-  mock_env_file "$data/monitor-loop.env" 7200
+  mock_env_file "$data/monitor-loop.env" 7199
 
-  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
-  if [[ "$SESSION_WIPED" == "yes" && -d "$data/$session_id/logs" ]]; then
-    tap_ok "session-wipe: env at boundary (7200s passes)"
+  local exit_code6=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code6=$?
+  if [[ "$exit_code6" -eq 0 && "$SESSION_WIPED" == "yes" && -d "$data/$session_id/logs" ]]; then
+    tap_ok "session-wipe: env on fresh side of boundary (7199s)"
   else
-    tap_not_ok "session-wipe: env at boundary (7200s passes)" "WIPED=$SESSION_WIPED dirs=$(ls "$data/$session_id" 2>/dev/null || echo missing)"
+    tap_not_ok "session-wipe: env on fresh side of boundary (7199s)" "rc=$exit_code6 WIPED=$SESSION_WIPED dirs=$(ls "$data/$session_id" 2>/dev/null || echo missing)"
   fi
 
   # ── Test 7: Process dead + env file missing ────────────────────────────
