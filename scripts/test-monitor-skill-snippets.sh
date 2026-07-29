@@ -11052,9 +11052,39 @@ Cargo.toml"
   else
     tap_not_ok "structural: monitor-tick/SKILL.md advances BUILD_SHA_FILE on confirmed skip" "not found"
   fi
+
+  # ── Structural self-test: Test 6 boundary check is deterministic + guarded ──
+  # Regression guard for #3766. Test 6 pins the `-gt 7200` fresh side of the
+  # boundary, but two failure modes must never come back:
+  #   1. Mocking the EXACT boundary (7200) races the wall clock — a single tick
+  #      between `mock_env_file` and the check flips the env to 7201 (stale).
+  #   2. A BARE `check_session_wiped` call aborts the whole harness under the
+  #      script's `set -e` when it legitimately returns 1 (stale path).
+  # Scope the assertion to Test 6's own block (sess6666 .. Test 7) — 7200 and
+  # check_session_wiped both appear legitimately elsewhere in this file.
+  local self_src="$REPO_ROOT/scripts/test-monitor-skill-snippets.sh"
+  local t6_block
+  t6_block=$(awk '/session_id="sess6666"/{f=1} f{print} /Test 7:/{if(f)exit}' "$self_src")
+  if [[ -n "$t6_block" ]] \
+     && ! grep -q '7200' <<<"$t6_block" \
+     && grep -q 'exit_code6' <<<"$t6_block"; then
+    tap_ok "structural: Test 6 boundary check is deterministic and guarded (#3766)"
+  else
+    tap_not_ok "structural: Test 6 boundary check is deterministic and guarded (#3766)" \
+      "Test 6 must mock 7199 (not the exact 7200 boundary) and guard its check_session_wiped call via exit_code6"
+  fi
 }
 check_skill_structure
 run_tests
+
+# End-of-run plan/actual reconciliation (#3766): if the number of emitted TAP
+# results does not match the announced plan (early abort, or a stale off-by-one
+# TAP_PLAN), surface it as a diagnosed failure through the existing gate instead
+# of a silent short-count or bare `exit 1`.
+if [[ "$TAP_CURRENT" -ne "$TAP_PLAN" ]]; then
+  echo "# PLAN MISMATCH: planned $TAP_PLAN, emitted $TAP_CURRENT" >&2
+  TAP_FAILURES=$((TAP_FAILURES + 1))
+fi
 
 if [[ "$TAP_FAILURES" -gt 0 ]]; then
   echo "# $TAP_FAILURES test(s) failed" >&2
