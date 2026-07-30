@@ -369,12 +369,51 @@ pub mod helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::{AuthenticatedMessageV0, HmacSha256Mac, StellarMessage, VecM};
+    use stellar_xdr::{
+        AuthenticatedMessageV0, BytesM, HmacSha256Mac, NodeId, PublicKey, ScpBallot, ScpEnvelope,
+        ScpStatement, ScpStatementPledges, ScpStatementPrepare, Signature, StellarMessage, Uint256,
+        Value, VecM,
+    };
 
     fn make_test_message() -> AuthenticatedMessage {
         AuthenticatedMessage::V0(AuthenticatedMessageV0 {
             sequence: 0,
             message: StellarMessage::Peers(VecM::default()),
+            mac: HmacSha256Mac { mac: [0u8; 32] },
+        })
+    }
+
+    /// Constructs a real, well-formed `AuthenticatedMessage` whose XDR
+    /// serialization exceeds `MAX_MESSAGE_SIZE`. The oversized bytes live in
+    /// the unbounded `ScpBallot.value` opaque blob (`Value(BytesM)`), reachable
+    /// via `StellarMessage::ScpMessage`. This is a genuine send-path message,
+    /// not a synthetic byte buffer — it exercises `encode_message` end to end.
+    fn make_oversized_message() -> AuthenticatedMessage {
+        let oversized_value = Value(
+            BytesM::try_from(vec![0u8; MAX_MESSAGE_SIZE + 1])
+                .expect("Value is an unbounded opaque blob"),
+        );
+        let statement = ScpStatement {
+            node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            slot_index: 0,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
+                ballot: ScpBallot {
+                    counter: 0,
+                    value: oversized_value,
+                },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+        AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 0,
+            message: StellarMessage::ScpMessage(ScpEnvelope {
+                statement,
+                signature: Signature(BytesM::default()),
+            }),
             mac: HmacSha256Mac { mac: [0u8; 32] },
         })
     }
@@ -688,16 +727,23 @@ mod tests {
     }
 
     #[test]
-    fn test_encoder_rejects_oversized_message() {
-        // Encoding a message that exceeds MAX_MESSAGE_SIZE should fail in XDR
-        // serialization or length check. We test indirectly: encode a normal message
-        // and verify it works, then check the size limit constant.
-        let mut codec = MessageCodec::new();
-        let mut buf = BytesMut::new();
-        let msg = make_test_message();
-        assert!(codec.encode(msg, &mut buf).is_ok());
+    fn test_encode_message_rejects_oversized_message() {
+        // Regression for #3774: the real send-path encoder `encode_message`
+        // (called by Connection::send / Peer::send_batch) must reject a frame
+        // whose XDR body exceeds MAX_MESSAGE_SIZE, matching stellar-core's
+        // receive-side rejection (TCPPeer.cpp:690-701). Before the fix,
+        // encode_message had no size check and returned Ok for this message.
+        let oversized = make_oversized_message();
+        let result = MessageCodec::encode_message(&oversized);
+        assert!(
+            result.is_err(),
+            "encode_message must reject a message larger than MAX_MESSAGE_SIZE"
+        );
 
-        // Verify the constant matches the spec
+        // A normally-sized message still encodes successfully.
+        assert!(MessageCodec::encode_message(&make_test_message()).is_ok());
+
+        // Fold in the spec-constant assertion from the old weak test.
         assert_eq!(
             MAX_MESSAGE_SIZE,
             16 * 1024 * 1024,
