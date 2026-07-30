@@ -38,6 +38,44 @@ impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 type BoxedIo = Pin<Box<dyn AsyncIo>>;
 
+/// Number of leading XDR-body bytes retained per outbound frame in the
+/// per-peer diagnostic ring (#3773). 32 bytes covers the
+/// `AuthenticatedMessage` discriminant + sequence + the `StellarMessage`
+/// discriminant and the first fields of the body — enough to fingerprint the
+/// frame type/shape a peer rejected without retaining whole messages.
+pub(crate) const SEND_PREFIX_LEN: usize = 32;
+
+/// Outcome of a single [`Connection::send`] (#3773).
+///
+/// Carries the on-the-wire body size and a fixed-size prefix of the encoded
+/// XDR body, both read from the buffer already materialized for the socket
+/// write (no extra encode pass, no wire mutation). Callers feed the prefix
+/// into their per-peer outbound diagnostic ring so that, when a peer reports
+/// `ERR_DATA "received corrupt XDR"`, the bytes we sent just before are known.
+#[derive(Debug, Clone, Copy)]
+pub struct SendOutcome {
+    /// On-the-wire body size in bytes (excludes the 4-byte length prefix).
+    pub wire_size: u64,
+    /// First [`SEND_PREFIX_LEN`] bytes of the encoded XDR body, zero-padded if
+    /// the body is shorter.
+    pub prefix: [u8; SEND_PREFIX_LEN],
+}
+
+/// Extract the fixed-size diagnostic prefix (#3773) from an already-encoded,
+/// length-prefixed overlay frame.
+///
+/// `encoded` is `[len_prefix(4) | xdr_body]`; this returns the first
+/// [`SEND_PREFIX_LEN`] bytes of `xdr_body` (`encoded[4..]`), zero-padded if the
+/// body is shorter. Reads already-materialized bytes into local diagnostic
+/// state only — never alters what is written to the socket.
+pub(crate) fn encoded_body_prefix(encoded: &[u8]) -> [u8; SEND_PREFIX_LEN] {
+    let mut prefix = [0u8; SEND_PREFIX_LEN];
+    let body = encoded.get(4..).unwrap_or(&[]);
+    let n = body.len().min(SEND_PREFIX_LEN);
+    prefix[..n].copy_from_slice(&body[..n]);
+    prefix
+}
+
 /// Direction of a peer connection.
 ///
 /// Used to determine the initiator/acceptor roles during key derivation
@@ -181,15 +219,18 @@ impl Connection {
 
     /// Sends an authenticated message to the peer.
     ///
-    /// On success, returns the on-the-wire frame size in bytes (the XDR-encoded
-    /// message body length, NOT including the 4-byte length prefix). Callers
-    /// use this to update wire-byte metrics without re-encoding the message.
+    /// On success, returns a [`SendOutcome`] carrying the on-the-wire frame
+    /// size in bytes (the XDR-encoded message body length, NOT including the
+    /// 4-byte length prefix) and a fixed-size prefix of the encoded body
+    /// (#3773). Both are read from the buffer already materialized for the
+    /// write — no extra encode pass. Callers use the size for wire-byte
+    /// metrics and the prefix for the per-peer outbound diagnostic ring.
     ///
     /// # Errors
     ///
     /// Returns `PeerDisconnected` if the connection is already closed,
     /// or a codec error if encoding fails.
-    pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<u64> {
+    pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<SendOutcome> {
         if self.closed {
             return Err(OverlayError::PeerDisconnected(
                 "connection closed".to_string(),
@@ -205,6 +246,9 @@ impl Connection {
         // `encoded` is `[len_prefix(4) | xdr_body]`; the wire body size is
         // `encoded.len() - 4`.
         let wire_size = (encoded.len() - 4) as u64;
+        // #3773: capture the leading body bytes before the write, from the
+        // same buffer — diagnostic-only, does not alter the wire.
+        let prefix = encoded_body_prefix(&encoded);
 
         // Add timeout to prevent blocking indefinitely on TCP backpressure
         const SEND_TIMEOUT_SECS: u64 = 10;
@@ -214,7 +258,7 @@ impl Connection {
         )
         .await
         {
-            Ok(Ok(())) => Ok(wire_size),
+            Ok(Ok(())) => Ok(SendOutcome { wire_size, prefix }),
             Ok(Err(e)) => {
                 self.closed = true;
                 Err(OverlayError::Io(e))

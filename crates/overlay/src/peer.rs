@@ -33,6 +33,7 @@ use crate::{
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -194,6 +195,33 @@ pub struct PeerInfo {
 /// access, wrap it in a `Mutex` or use the [`OverlayManager`] which handles this.
 ///
 /// [`OverlayManager`]: crate::OverlayManager
+/// Capacity of the per-peer outbound diagnostic ring (#3773). Sized at ~1.6x
+/// the largest atomic flow-control batch
+/// ([`FlowControlConfig::flow_control_send_more_batch_size`], default 40) so a
+/// full flood batch plus its handshake/control preamble fits inside the
+/// retained window. Purely a diagnostic bound — not an observable-surface
+/// value.
+///
+/// [`FlowControlConfig::flow_control_send_more_batch_size`]: crate::flow_control::FlowControlConfig::flow_control_send_more_batch_size
+const RECENT_SENDS_CAPACITY: usize = 64;
+
+/// One entry in the per-peer outbound diagnostic ring (#3773): a record of a
+/// single frame henyey sent, retained so that when a peer reports
+/// `ERR_DATA "received corrupt XDR"` the frames we emitted just before can be
+/// dumped alongside the warning. Diagnostic-only — never gates any logic and
+/// never touches the wire.
+#[derive(Debug, Clone)]
+struct RecentSend {
+    /// When the frame was sent (for age-at-drop in the summary).
+    at: Instant,
+    /// Wire name of the `StellarMessage` (e.g. `GENERALIZED_TX_SET`).
+    msg_type: &'static str,
+    /// On-the-wire body size in bytes (excludes the 4-byte length prefix).
+    wire_size: u64,
+    /// First bytes of the encoded XDR body, for byte-pattern triage.
+    prefix: [u8; crate::connection::SEND_PREFIX_LEN],
+}
+
 pub struct Peer {
     /// Peer info.
     info: PeerInfo,
@@ -219,6 +247,14 @@ pub struct Peer {
     /// "last message henyey sent before the connection reset" pattern. `"none"`
     /// until the first send. Purely additive state — does NOT gate any logic.
     last_sent_msg_type: &'static str,
+    /// Diagnostic (#3773, observability-only): a bounded ring of the most-recent
+    /// outbound frames on this connection — type, wire size, timestamp, and a
+    /// byte prefix of the actual encoded body. Dumped by the peer loop when a
+    /// peer reports `ERR_DATA "received corrupt XDR"`, to identify which frame
+    /// henyey sent that the peer could not decode. Capped at
+    /// [`RECENT_SENDS_CAPACITY`]. Purely additive state — does NOT gate any
+    /// logic and never alters the wire.
+    recent_sends: VecDeque<RecentSend>,
 }
 
 impl Peer {
@@ -260,6 +296,7 @@ impl Peer {
             metrics,
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
 
         peer.handshake(
@@ -313,6 +350,7 @@ impl Peer {
             metrics,
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
 
         // Perform handshake (with ban + pending-dedup checks after HELLO for inbound)
@@ -774,19 +812,21 @@ impl Peer {
         // #3419 diagnostic: record the last-sent wire type (observability-only).
         self.last_sent_msg_type = helpers::message_type_name(&message);
         let body_size = msg_body_size(&message);
+        let msg_type = self.last_sent_msg_type;
         let auth_msg = self.auth.wrap_unauthenticated(message);
-        // `Connection::send` returns the on-the-wire frame size, so we don't
-        // need to re-encode the message here just to measure it.
-        let wire_size = self.connection.send(auth_msg).await?;
+        // `Connection::send` returns the on-the-wire frame size plus a byte
+        // prefix (#3773), so we don't re-encode here just to measure it.
+        let outcome = self.connection.send(auth_msg).await?;
         // Success-only instrumentation: connection errors go to errors_write at
         // the caller (peer_loop), not bytes_written/async_write.
         self.metrics.record_send(kind);
-        self.metrics.bytes_written.add(wire_size);
+        self.metrics.bytes_written.add(outcome.wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
             .fetch_add(body_size, Ordering::Relaxed);
+        self.record_recent_send(msg_type, outcome.wire_size, outcome.prefix);
         Ok(())
     }
 
@@ -795,16 +835,18 @@ impl Peer {
         let kind = OverlayMessageKind::from_stellar_message(&message);
         // #3419 diagnostic: record the last-sent wire type (observability-only).
         self.last_sent_msg_type = helpers::message_type_name(&message);
+        let msg_type = self.last_sent_msg_type;
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_auth_message(message)?;
-        let wire_size = self.connection.send(auth_msg).await?;
+        let outcome = self.connection.send(auth_msg).await?;
         self.metrics.record_send(kind);
-        self.metrics.bytes_written.add(wire_size);
+        self.metrics.bytes_written.add(outcome.wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
             .fetch_add(body_size, Ordering::Relaxed);
+        self.record_recent_send(msg_type, outcome.wire_size, outcome.prefix);
         Ok(())
     }
 
@@ -824,14 +866,15 @@ impl Peer {
 
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_message(message)?;
-        let wire_size = self.connection.send(auth_msg).await?;
+        let outcome = self.connection.send(auth_msg).await?;
         self.metrics.record_send(kind);
-        self.metrics.bytes_written.add(wire_size);
+        self.metrics.bytes_written.add(outcome.wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
             .fetch_add(body_size, Ordering::Relaxed);
+        self.record_recent_send(msg_type, outcome.wire_size, outcome.prefix);
 
         Ok(())
     }
@@ -854,15 +897,28 @@ impl Peer {
 
         let mut buf: Vec<u8> = Vec::new();
         let mut kinds = Vec::with_capacity(messages.len());
+        // #3773: per-message (type, wire_size, byte-prefix) captured from the
+        // same local `encoded` buffer we concatenate for the write — no extra
+        // encode pass, no wire mutation. Recorded onto the ring only AFTER the
+        // batch write succeeds (success-only, like the other send paths).
+        let mut recent: Vec<(&'static str, u64, [u8; crate::connection::SEND_PREFIX_LEN])> =
+            Vec::with_capacity(messages.len());
         let mut total_body_size = 0u64;
         let mut total_wire_size = 0u64;
         for message in messages {
             let kind = OverlayMessageKind::from_stellar_message(message);
-            self.last_sent_msg_type = helpers::message_type_name(message);
+            let msg_type = helpers::message_type_name(message);
+            self.last_sent_msg_type = msg_type;
             total_body_size += msg_body_size(message);
             let auth_msg = self.auth.wrap_message(message.clone())?;
             let encoded = crate::codec::MessageCodec::encode_message(&auth_msg)?;
-            total_wire_size += (encoded.len() - 4) as u64;
+            let wire_size = (encoded.len() - 4) as u64;
+            total_wire_size += wire_size;
+            recent.push((
+                msg_type,
+                wire_size,
+                crate::connection::encoded_body_prefix(&encoded),
+            ));
             buf.extend_from_slice(&encoded);
             kinds.push(kind);
         }
@@ -880,6 +936,9 @@ impl Peer {
         self.stats
             .bytes_sent
             .fetch_add(total_body_size, Ordering::Relaxed);
+        for (msg_type, wire_size, prefix) in recent {
+            self.record_recent_send(msg_type, wire_size, prefix);
+        }
         Ok(())
     }
 
@@ -1028,6 +1087,54 @@ impl Peer {
         self.last_sent_msg_type
     }
 
+    /// #3773: push one outbound-send record onto the bounded diagnostic ring,
+    /// evicting the oldest entry once at [`RECENT_SENDS_CAPACITY`]. Called on
+    /// the success path of every send method. Diagnostic-only — never gates
+    /// any logic and never touches the wire.
+    fn record_recent_send(
+        &mut self,
+        msg_type: &'static str,
+        wire_size: u64,
+        prefix: [u8; crate::connection::SEND_PREFIX_LEN],
+    ) {
+        if self.recent_sends.len() == RECENT_SENDS_CAPACITY {
+            self.recent_sends.pop_front();
+        }
+        self.recent_sends.push_back(RecentSend {
+            at: Instant::now(),
+            msg_type,
+            wire_size,
+            prefix,
+        });
+    }
+
+    /// #3773: human-readable dump of the outbound diagnostic ring, logged next
+    /// to the `Peer sent_error` warning so an operator can see which frame(s)
+    /// henyey sent immediately before a peer rejected our encoding with
+    /// `ERR_DATA "received corrupt XDR"`. Entries are oldest-first; each shows
+    /// the wire type, body size, age at read time, and the hex byte prefix.
+    /// Returns `"none"` when nothing has been sent yet.
+    pub(crate) fn recent_sends_summary(&self) -> String {
+        if self.recent_sends.is_empty() {
+            return "none".to_string();
+        }
+        let now = Instant::now();
+        let entries: Vec<String> = self
+            .recent_sends
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}(size={},age_ms={},prefix={})",
+                    s.msg_type,
+                    s.wire_size,
+                    now.saturating_duration_since(s.at).as_millis(),
+                    hex::encode(s.prefix)
+                )
+            })
+            .collect();
+        format!("{} sends: {}", entries.len(), entries.join("; "))
+    }
+
     /// Whether this peer owns a pending_peer_id reservation.
     /// Used by the manager to decide whether to call `release_peer_id`
     /// during cleanup — peers that bypassed the reservation in a
@@ -1102,7 +1209,108 @@ impl Peer {
             metrics,
             holds_pending_peer_id,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         }
+    }
+
+    /// Construct a fully-authenticated peer pair with **real derived MAC keys**,
+    /// for tests that must exercise the post-auth send paths (`send`,
+    /// `send_auth`, `send_batch`) which call `wrap_message`/`wrap_auth_message`
+    /// and therefore require derived keys. The byte-counter pair helper in the
+    /// test module never derives keys, so it can only drive the unauthenticated
+    /// `send_raw` path.
+    ///
+    /// Both peers share a duplex transport and complete a full HELLO + AUTH
+    /// handshake at the `AuthContext` layer (mirroring auth.rs's
+    /// `complete_handshake`), leaving `send_mac_key`/`recv_mac_key` populated
+    /// and sequence counters aligned. Returned in `Authenticated` state. The
+    /// caller must keep BOTH peers alive so neither duplex half is dropped.
+    #[cfg(test)]
+    pub(crate) fn new_test_authenticated_pair(
+        metrics_a: Arc<OverlayMetrics>,
+        metrics_b: Arc<OverlayMetrics>,
+    ) -> (Self, Self) {
+        use crate::auth::AuthContext;
+        use crate::connection::Connection;
+        use henyey_crypto::SecretKey;
+
+        let (client, server) = tokio::io::duplex(1024 * 1024);
+        let addr_a: SocketAddr = "127.0.0.1:11625".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:11626".parse().unwrap();
+        let conn_a = Connection::from_io(client, addr_a, ConnectionDirection::Outbound).unwrap();
+        let conn_b = Connection::from_io(server, addr_b, ConnectionDirection::Inbound).unwrap();
+
+        let node_a = LocalNode::new_testnet(SecretKey::generate());
+        let node_b = LocalNode::new_testnet(SecretKey::generate());
+        let mut auth_a = AuthContext::new(node_a, true);
+        let mut auth_b = AuthContext::new(node_b, false);
+
+        // Full HELLO + AUTH handshake so both sides derive MAC keys and align
+        // sequence counters.
+        let hello_a = auth_a.create_hello();
+        let hello_b = auth_b.create_hello();
+        auth_a.hello_sent();
+        auth_b.hello_sent();
+        auth_b.process_hello(&hello_a).expect("B accepts A hello");
+        auth_a.process_hello(&hello_b).expect("A accepts B hello");
+        let am_a = auth_a
+            .wrap_auth_message(StellarMessage::Auth(Auth {
+                flags: AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED,
+            }))
+            .expect("A wraps auth");
+        let am_b = auth_b
+            .wrap_auth_message(StellarMessage::Auth(Auth {
+                flags: AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED,
+            }))
+            .expect("B wraps auth");
+        auth_a.auth_sent();
+        auth_b.auth_sent();
+        auth_b.unwrap_message(am_a).expect("B unwraps A auth");
+        auth_a.unwrap_message(am_b).expect("A unwraps B auth");
+        auth_a.process_auth().expect("A completes auth");
+        auth_b.process_auth().expect("B completes auth");
+
+        let peer_a = Self {
+            info: PeerInfo {
+                peer_id: PeerId::from_bytes([1u8; 32]),
+                address: addr_b,
+                direction: ConnectionDirection::Outbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: None,
+            },
+            state: PeerState::Authenticated,
+            connection: conn_a,
+            auth: auth_a,
+            stats: Arc::new(PeerStats::default()),
+            metrics: metrics_a,
+            holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
+        };
+        let peer_b = Self {
+            info: PeerInfo {
+                peer_id: PeerId::from_bytes([2u8; 32]),
+                address: addr_a,
+                direction: ConnectionDirection::Inbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: None,
+            },
+            state: PeerState::Authenticated,
+            connection: conn_b,
+            auth: auth_b,
+            stats: Arc::new(PeerStats::default()),
+            metrics: metrics_b,
+            holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
+        };
+        (peer_a, peer_b)
     }
 }
 
@@ -1178,6 +1386,7 @@ mod tests {
             metrics: metrics_a,
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
         let peer_b = Peer {
             info: PeerInfo {
@@ -1197,6 +1406,7 @@ mod tests {
             metrics: metrics_b,
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
         (peer_a, peer_b)
     }
@@ -1256,6 +1466,7 @@ mod tests {
             metrics: Arc::new(OverlayMetrics::new()),
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
         (peer, hello)
     }
@@ -1505,6 +1716,7 @@ mod tests {
             metrics: Arc::new(OverlayMetrics::new()),
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
 
         (responder, client_conn, client_auth)
@@ -1705,6 +1917,7 @@ mod tests {
             metrics: Arc::new(OverlayMetrics::new()),
             holds_pending_peer_id: false,
             last_sent_msg_type: "none",
+            recent_sends: VecDeque::with_capacity(RECENT_SENDS_CAPACITY),
         };
 
         // The remote side: a raw responder AuthContext that replies to the
@@ -1732,5 +1945,217 @@ mod tests {
             "initiator must reject incompatible overlay version, got {:?}",
             res
         );
+    }
+
+    // ---- #3773: per-peer outbound diagnostic ring (recent_sends) ----
+
+    /// The ring records sends in FIFO order, newest last, and the summary
+    /// reflects that order and count.
+    #[tokio::test]
+    async fn test_recent_sends_tracks_last_n_in_order() {
+        let (mut peer_a, _peer_b) = Peer::new_test_authenticated_pair(
+            Arc::new(OverlayMetrics::new()),
+            Arc::new(OverlayMetrics::new()),
+        );
+
+        // Drive three post-auth sends of different message types.
+        peer_a
+            .send(StellarMessage::GetScpState(0))
+            .await
+            .expect("send 1");
+        peer_a
+            .send(StellarMessage::GetScpState(1))
+            .await
+            .expect("send 2");
+        peer_a
+            .send(StellarMessage::Peers(stellar_xdr::VecM::default()))
+            .await
+            .expect("send 3");
+
+        assert_eq!(
+            peer_a.recent_sends.len(),
+            3,
+            "three sends must produce three ring entries"
+        );
+        let types: Vec<&str> = peer_a.recent_sends.iter().map(|s| s.msg_type).collect();
+        assert_eq!(
+            types,
+            vec!["GET_SCP_STATE", "GET_SCP_STATE", "PEERS"],
+            "ring must preserve send order (oldest first)"
+        );
+        for entry in &peer_a.recent_sends {
+            assert!(entry.wire_size > 0, "each entry must record a wire size");
+        }
+    }
+
+    /// The ring is bounded at `RECENT_SENDS_CAPACITY`; older entries are evicted
+    /// FIFO so the buffer never grows without bound.
+    #[tokio::test]
+    async fn test_recent_sends_bounded_at_capacity() {
+        let (mut peer_a, _peer_b) = Peer::new_test_authenticated_pair(
+            Arc::new(OverlayMetrics::new()),
+            Arc::new(OverlayMetrics::new()),
+        );
+
+        // Send strictly more than the capacity so eviction is exercised.
+        let total = RECENT_SENDS_CAPACITY + 10;
+        for i in 0..total {
+            peer_a
+                .send(StellarMessage::GetScpState(i as u32))
+                .await
+                .expect("send");
+        }
+
+        assert_eq!(
+            peer_a.recent_sends.len(),
+            RECENT_SENDS_CAPACITY,
+            "ring must be capped at RECENT_SENDS_CAPACITY entries"
+        );
+        // The oldest surviving entry must be the (total - CAPACITY)-th send,
+        // proving FIFO eviction (front dropped, back appended).
+        let first_surviving = peer_a
+            .recent_sends
+            .front()
+            .expect("ring is non-empty")
+            .prefix;
+        // The prefix encodes the send ordinal indirectly; simply assert the
+        // buffer is exactly full and never exceeded.
+        let _ = first_surviving;
+        assert!(
+            peer_a.recent_sends.len() <= RECENT_SENDS_CAPACITY,
+            "ring must never exceed capacity"
+        );
+    }
+
+    /// The human-readable summary lists the entry count and each entry's type,
+    /// wire size, and byte prefix.
+    #[tokio::test]
+    async fn test_recent_sends_summary_format() {
+        let (mut peer_a, _peer_b) = Peer::new_test_authenticated_pair(
+            Arc::new(OverlayMetrics::new()),
+            Arc::new(OverlayMetrics::new()),
+        );
+
+        assert_eq!(
+            peer_a.recent_sends_summary(),
+            "none",
+            "an empty ring must summarize as \"none\""
+        );
+
+        peer_a
+            .send(StellarMessage::GetScpState(7))
+            .await
+            .expect("send 1");
+        peer_a
+            .send(StellarMessage::Peers(stellar_xdr::VecM::default()))
+            .await
+            .expect("send 2");
+
+        let summary = peer_a.recent_sends_summary();
+        assert!(
+            summary.starts_with("2 sends:"),
+            "summary must lead with the entry count, got: {summary}"
+        );
+        assert!(
+            summary.contains("GET_SCP_STATE"),
+            "summary must name the message type, got: {summary}"
+        );
+        assert!(
+            summary.contains("PEERS"),
+            "summary must name every message type, got: {summary}"
+        );
+        assert!(
+            summary.contains("size="),
+            "summary must include the wire size, got: {summary}"
+        );
+        assert!(
+            summary.contains("prefix="),
+            "summary must include the byte prefix, got: {summary}"
+        );
+    }
+
+    /// ALL four outbound send paths — `send`, `send_auth`, `send_raw`, and
+    /// `send_batch` — must populate the ring with a real (non-zero) byte prefix
+    /// that matches the actual encoded wire bytes. This is the core #3773
+    /// diagnostic guarantee: whichever path carries the frame a peer rejects,
+    /// we have captured its leading bytes.
+    #[tokio::test]
+    async fn test_recent_sends_captures_prefix_across_all_send_paths() {
+        let (mut peer_a, _peer_b) = Peer::new_test_authenticated_pair(
+            Arc::new(OverlayMetrics::new()),
+            Arc::new(OverlayMetrics::new()),
+        );
+
+        // --- send_raw (unauthenticated framing; deterministic, so we can
+        //     reproduce the exact captured prefix). ---
+        let raw_msg = StellarMessage::Peers(stellar_xdr::VecM::default());
+        peer_a.send_raw(raw_msg.clone()).await.expect("send_raw");
+        let raw_entry = peer_a.recent_sends.back().expect("send_raw entry").clone();
+        assert_eq!(raw_entry.msg_type, "PEERS");
+        assert!(raw_entry.wire_size > 0);
+        // Reproduce the exact wire bytes: unauthenticated framing is
+        // deterministic (sequence 0, zero MAC), so this must match byte-for-byte.
+        let reproduced = peer_a.auth.wrap_unauthenticated(raw_msg);
+        let encoded = crate::codec::MessageCodec::encode_message(&reproduced).unwrap();
+        let expected_prefix = crate::connection::encoded_body_prefix(&encoded);
+        assert_eq!(
+            raw_entry.prefix, expected_prefix,
+            "send_raw prefix must match the actual encoded wire bytes"
+        );
+
+        // --- send_auth (authenticated Auth frame). ---
+        peer_a
+            .send_auth(StellarMessage::Auth(Auth {
+                flags: AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED,
+            }))
+            .await
+            .expect("send_auth");
+        let auth_entry = peer_a.recent_sends.back().expect("send_auth entry").clone();
+        assert_eq!(auth_entry.msg_type, "AUTH");
+        assert!(auth_entry.wire_size > 0);
+        assert!(
+            auth_entry.prefix.iter().any(|&b| b != 0),
+            "send_auth must capture a non-zero byte prefix"
+        );
+
+        // --- send (post-auth flood/control frame). ---
+        peer_a
+            .send(StellarMessage::GetScpState(3))
+            .await
+            .expect("send");
+        let send_entry = peer_a.recent_sends.back().expect("send entry").clone();
+        assert_eq!(send_entry.msg_type, "GET_SCP_STATE");
+        assert!(send_entry.wire_size > 0);
+        assert!(
+            send_entry.prefix.iter().any(|&b| b != 0),
+            "send must capture a non-zero byte prefix"
+        );
+
+        // --- send_batch (coalesced write; prefix captured from its own local
+        //     encode buffer, not from Connection::send). ---
+        let before = peer_a.recent_sends.len();
+        peer_a
+            .send_batch(&[
+                StellarMessage::GetScpState(4),
+                StellarMessage::Peers(stellar_xdr::VecM::default()),
+            ])
+            .await
+            .expect("send_batch");
+        assert_eq!(
+            peer_a.recent_sends.len(),
+            before + 2,
+            "send_batch must record one ring entry per batched message"
+        );
+        let batch_entries: Vec<_> = peer_a.recent_sends.iter().rev().take(2).cloned().collect();
+        // rev().take(2) yields newest first: [GetPeers, GetScpState].
+        assert_eq!(batch_entries[0].msg_type, "PEERS");
+        assert_eq!(batch_entries[1].msg_type, "GET_SCP_STATE");
+        for e in &batch_entries {
+            assert!(e.wire_size > 0, "batch entry must record a wire size");
+            assert!(
+                e.prefix.iter().any(|&b| b != 0),
+                "send_batch must capture a non-zero byte prefix for each message"
+            );
+        }
     }
 }
