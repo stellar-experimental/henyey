@@ -54,6 +54,10 @@ rusqlite.workspace = true
 test-utils = []
 
 [dev-dependencies]
+# Pull in henyey-common's dev-only `test-support` feature so overlay tests can
+# use the shared `tracing_capture::capture_events` harness (#3773). Mirrors the
+# pattern already used by crates/bucket/Cargo.toml and crates/history/Cargo.toml.
+henyey-common = { workspace = true, features = ["test-support"] }
 metrics-exporter-prometheus.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

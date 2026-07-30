@@ -3558,4 +3558,101 @@ mod tests {
             "the batch-completing drain fires the resume Notify exactly once"
         );
     }
+
+    /// #3773: the non-Load `ErrorMsg` warn must carry a `recent_sends` field
+    /// populated from the peer's outbound diagnostic ring, so an operator who
+    /// sees a peer-reported `ERR_DATA "received corrupt XDR"` can identify the
+    /// frames henyey sent just before the peer dropped us. Uses the shared
+    /// `tracing_capture` harness (now enabled via the `test-support` dev
+    /// feature) to inspect the emitted event's structured fields.
+    #[test]
+    fn test_error_msg_warn_includes_recent_sends() {
+        use henyey_common::test_support::tracing_capture::capture_events;
+
+        // A current-thread runtime we drive via `block_on`, so the async
+        // `handle_received_message` runs on THIS thread — the one where
+        // `capture_events` installs its thread-local subscriber.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+        let (mut peer, _peer_b) = crate::peer::Peer::new_test_authenticated_pair(
+            Arc::clone(&metrics),
+            Arc::new(crate::metrics::OverlayMetrics::new()),
+        );
+        // Populate the ring with a real outbound send so the summary is
+        // non-empty when the warn reads it.
+        rt.block_on(peer.send(StellarMessage::GetScpState(9)))
+            .expect("send to populate ring");
+
+        // PeerLoopCtx scaffolding. The non-Load ErrorMsg branch returns
+        // `Break` before touching flow control / capacity, so these are only
+        // needed to satisfy the signature.
+        let mut received_peers = false;
+        let mut ping = PingTracker::new();
+        let mut query_limiter = QueryRateLimiter::new();
+        let mut peer_rate_limiter = PeerRateLimiter::new();
+        let mut scp_messages = 0u64;
+        let mut last_write = Instant::now();
+        let mut enqueue_time_of_last_write = Instant::now();
+        let mut scp_written = 0u64;
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<OutboundMessage>(16);
+        let mut ctx = PeerLoopCtx {
+            peer: &mut peer,
+            received_peers: &mut received_peers,
+            ping: &mut ping,
+            query_limiter: &mut query_limiter,
+            peer_rate_limiter: &mut peer_rate_limiter,
+            scp_messages: &mut scp_messages,
+            last_write: &mut last_write,
+            enqueue_time_of_last_write: &mut enqueue_time_of_last_write,
+            scp_written: &mut scp_written,
+            outbound_tx: &outbound_tx,
+        };
+
+        let peer_id = crate::PeerId::from_bytes([7u8; 32]);
+        let (shared, _scp_rx) = crate::manager::tests::shared_state_with_scp_receiver();
+        let fc = Arc::new(crate::flow_control::FlowControl::new(
+            FlowControlConfig::default(),
+        ));
+        let read_resume = Arc::new(tokio::sync::Notify::new());
+
+        // A non-Load ERROR — the exact class peers report in #3773.
+        let err_msg = StellarMessage::ErrorMsg(stellar_xdr::SError {
+            code: ErrorCode::Data,
+            msg: stellar_xdr::StringM::try_from("received corrupt XDR".to_string()).unwrap(),
+        });
+
+        let events = capture_events(|| {
+            let action = rt.block_on(OverlayManager::handle_received_message(
+                err_msg,
+                &peer_id,
+                &mut ctx,
+                &fc,
+                &shared,
+                false,
+                &read_resume,
+            ));
+            assert!(
+                matches!(action, RecvAction::Break),
+                "a peer-sent ErrorMsg must terminate the loop"
+            );
+        });
+
+        let warn = events
+            .iter()
+            .find(|e| e.message.contains("sent_error"))
+            .expect("a `Peer sent_error` warn must be emitted for a non-Load ErrorMsg");
+        let (_, value) = warn
+            .fields
+            .iter()
+            .find(|(k, _)| k == "recent_sends")
+            .expect("the sent_error warn must carry a `recent_sends` field");
+        assert!(
+            value.contains("GET_SCP_STATE"),
+            "recent_sends must surface the frame(s) sent before the drop, got: {value}"
+        );
+    }
 }
