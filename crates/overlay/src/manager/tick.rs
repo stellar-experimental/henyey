@@ -1960,7 +1960,119 @@ mod tests {
         .await;
 
         assert!(
-            retry_after.get(&key).is_none(),
+            !retry_after.contains_key(&key),
+            "a successful connect must reset (remove) the failure count"
+        );
+
+        manager_b.shutdown().await.expect("shutdown listener peer");
+    }
+
+    /// Sibling of `test_connect_preferred_peers_backoff_increments_and_resets`
+    /// for the general known-peer pass. Repeated failures against the same
+    /// known peer must accumulate a persistent per-key failure count
+    /// (1, 2, 3, ...) in `retry_after`, and a subsequent success must reset it
+    /// via `.remove(&key)`. Both `Err`/`Ok` arms of `fill_outbound_slots` were
+    /// changed identically to `connect_preferred_peers`, so this locks in the
+    /// symmetric behavior.
+    #[tokio::test]
+    async fn test_fill_outbound_slots_backoff_increments_and_resets() {
+        let known_addr = PeerAddress::new("127.0.0.1", 11626);
+        let mut config = OverlayConfig::default();
+        config.known_peers = vec![known_addr.clone()];
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager = OverlayManager::new_with_connection_factory(
+            config,
+            local_node.clone(),
+            Arc::new(FailingConnectionFactory),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let known_peers = RwLock::new(super::super::KnownPeerSet::from_config(vec![
+            known_addr.clone()
+        ]));
+        let mut retry_after: HashMap<DialKey, (Instant, u32)> = HashMap::new();
+        let key = known_addr.dial_key();
+
+        let mut now = Instant::now();
+        let failing_ctx = TickConnectCtx {
+            local_node: local_node.clone(),
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: Arc::new(FailingConnectionFactory),
+        };
+
+        for expected_failures in 1..=3u32 {
+            OverlayManager::fill_outbound_slots(
+                &known_peers,
+                &mut retry_after,
+                now,
+                1,
+                &manager.outbound_pool,
+                &shared,
+                &failing_ctx,
+            )
+            .await;
+
+            let (_, failures) = retry_after
+                .get(&key)
+                .expect("failed known-peer dial must record a retry_after entry");
+            assert_eq!(
+                *failures, expected_failures,
+                "failure count should increment monotonically on each consecutive failure"
+            );
+
+            // Advance simulated time safely past the maximum possible jittered
+            // backoff at this failure count, so the next call isn't gated by
+            // retry_after (compute_connect_backoff isn't seedable).
+            now += Duration::from_secs(max_connect_backoff_secs(expected_failures) + 1);
+        }
+
+        // Now succeed: stand up a real listener peer reachable over the
+        // loopback connection factory, reusing the same known_addr/port so the
+        // gate check (already past due to the time advance above) lets the dial
+        // through.
+        let factory = Arc::new(crate::loopback::LoopbackConnectionFactory::default());
+        let mut config_b = OverlayConfig::testnet();
+        config_b.listen_port = known_addr.port;
+        config_b.listen_enabled = true;
+        config_b.known_peers.clear();
+        config_b.connect_timeout_secs = 1;
+        let local_b = LocalNode::new_testnet(SecretKey::generate());
+        let mut manager_b = OverlayManager::new_with_connection_factory(
+            config_b,
+            local_b,
+            Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+        manager_b.start(None).await.expect("start listener peer");
+
+        let success_ctx = TickConnectCtx {
+            local_node,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        };
+
+        OverlayManager::fill_outbound_slots(
+            &known_peers,
+            &mut retry_after,
+            now,
+            1,
+            &manager.outbound_pool,
+            &shared,
+            &success_ctx,
+        )
+        .await;
+
+        assert!(
+            !retry_after.contains_key(&key),
             "a successful connect must reset (remove) the failure count"
         );
 
