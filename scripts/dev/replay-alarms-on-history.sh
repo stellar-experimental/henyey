@@ -197,14 +197,19 @@ if [[ "$REPLAY_MODE" == true ]]; then
   # Discover complete snapshot directories (those containing metadata.env)
   SNAPSHOTS=()
   if [[ -d "$ARCHIVE_DIR" ]]; then
-    while IFS= read -r -d '' d; do
+    # Enumerate by MTIME (ascending), not lexical name: the archive may hold
+    # mixed timestamp-name formats (dash-format RFC-3339 and compact), and a
+    # name sort places every dash dir ahead of every compact dir regardless of
+    # real age, corrupting the chronological sequential-replay order (#3724).
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
       if [[ -f "$d/metadata.env" ]]; then
         SNAPSHOTS+=("$d")
       else
         echo "WARNING: Skipping incomplete archive entry: $d (no metadata.env)" >&2
       fi
     done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
-      ! -name '*.tmp' -print0 | sort -z)
+      ! -name '*.tmp' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
   fi
 
   if [[ ${#SNAPSHOTS[@]} -eq 0 ]]; then
@@ -440,12 +445,16 @@ if [[ -f "$CURRENT" ]] && [[ -f "$PREV" ]]; then
   EVAL_ENV_ARGS="MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0"
   if [[ -d "$ARCHIVE_DIR" ]]; then
     LATEST_SNAP=""
-    while IFS= read -r -d '' d; do
+    # Newest-by-MTIME wins (last line of an ascending mtime sort), not the
+    # lexical-max name — mixed dash/compact name formats make a name sort
+    # misidentify the "latest" snapshot (#3724).
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
       if [[ -f "$d/metadata.env" ]]; then
         LATEST_SNAP="$d"
       fi
     done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
-      ! -name '*.tmp' -print0 | sort -z)
+      ! -name '*.tmp' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
     if [[ -n "$LATEST_SNAP" ]] && [[ -f "$LATEST_SNAP/metadata.env" ]]; then
       if validate_metadata "$LATEST_SNAP"; then
         echo "Using metadata from latest archive: $(basename "$LATEST_SNAP")"
