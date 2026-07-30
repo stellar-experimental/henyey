@@ -347,6 +347,14 @@ const MAINTENANCE_CHUNK_LEDGERS: u32 = 2;
 /// between chunks.
 const MAINTENANCE_CHUNK_PAUSE: Duration = Duration::from_millis(25);
 
+/// Bounded retry count for a transiently-busy maintenance delete chunk.
+/// Deliberately small and maintenance-local — NOT tied to
+/// `commit_with_busy_retry`'s consensus-continuation semantics (that path
+/// escalates to a recoverable shutdown when its budget is exhausted, which is
+/// disproportionate for a routine retention trim: the node should simply wait
+/// for the next scheduled maintenance cycle). See #3772.
+const MAINTENANCE_DELETE_MAX_ATTEMPTS: u32 = 3;
+
 /// Run one table's maintenance deletion in bounded chunks.
 ///
 /// Calls `delete_chunk` with at most [`MAINTENANCE_CHUNK_LEDGERS`] ledgers per
@@ -363,21 +371,56 @@ fn delete_in_chunks(
     let mut total_rows = 0u64;
     while remaining > 0 {
         let chunk = remaining.min(MAINTENANCE_CHUNK_LEDGERS);
-        // Per-chunk WAL write-lock instrumentation (#3702): the guard must
-        // wrap a single bounded statement, not the whole pass, so a reported
-        // long hold is a real single-transaction hold.
-        let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
-        match delete_chunk(chunk) {
+        // Retry a transiently-busy chunk a bounded number of times before
+        // giving up on this table's trim (#3772). Losing the SQLite
+        // write-lock race for the whole `busy_timeout` window must not
+        // silently abort the entire retention pass — that starves exactly the
+        // trimming that would relieve the contention. A genuine (non-transient)
+        // error still fails closed immediately, and the budget is small so a
+        // fully-stuck table costs at most MAINTENANCE_DELETE_MAX_ATTEMPTS
+        // attempts. This is deliberately NOT `commit_with_busy_retry`, whose
+        // exhausted-budget path triggers a recoverable shutdown — overkill for
+        // a routine trim that can wait for the next maintenance cycle.
+        let mut outcome: Result<u32, henyey_db::DbError> = Ok(0);
+        let mut attempts = 0u32;
+        while attempts < MAINTENANCE_DELETE_MAX_ATTEMPTS {
+            attempts += 1;
+            // Per-chunk WAL write-lock instrumentation (#3702): the guard must
+            // wrap a single bounded statement, not the whole pass, so a
+            // reported long hold is a real single-transaction hold. Each retry
+            // attempt is its own single delete statement, hence its own guard.
+            let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
+            match delete_chunk(chunk) {
+                Ok(rows) => {
+                    outcome = Ok(rows);
+                    break;
+                }
+                Err(e) if crate::app::is_transient_db_busy(&e) => {
+                    outcome = Err(e);
+                    drop(_write_ctx);
+                    // Back off before retrying, unless the budget is exhausted.
+                    if attempts < MAINTENANCE_DELETE_MAX_ATTEMPTS {
+                        std::thread::sleep(MAINTENANCE_CHUNK_PAUSE);
+                    }
+                }
+                Err(e) => {
+                    // Non-transient error: fail closed immediately, no retry.
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+
+        match outcome {
             Ok(0) => break,
             Ok(rows) => {
                 total_rows += rows as u64;
             }
             Err(e) => {
-                warn!(error = %e, "Failed to delete old {} entries", label);
+                warn!(error = %e, attempts, "Failed to delete old {} entries", label);
                 break;
             }
         }
-        drop(_write_ctx);
         remaining = remaining.saturating_sub(chunk);
         if remaining > 0 {
             std::thread::sleep(MAINTENANCE_CHUNK_PAUSE);
@@ -1517,7 +1560,7 @@ mod tests {
     }
 
     /// #3772: a persistently-busy chunk must give up after exactly
-    /// `MAINTENANCE_DELETE_MAX_ATTEMPTS` (== 3) attempts (bounded — no unbounded
+    /// `MAINTENANCE_DELETE_MAX_ATTEMPTS` attempts (bounded — no unbounded
     /// spin), then break the pass. On the unmodified code the loop breaks after
     /// a single call.
     #[test]
@@ -1528,10 +1571,13 @@ mod tests {
             Err(busy_error())
         });
         assert_eq!(
-            calls, 3,
-            "a persistently-busy chunk must be attempted exactly MAINTENANCE_DELETE_MAX_ATTEMPTS (3) times"
+            calls, MAINTENANCE_DELETE_MAX_ATTEMPTS,
+            "a persistently-busy chunk must be attempted exactly MAINTENANCE_DELETE_MAX_ATTEMPTS times"
         );
-        assert_eq!(total, 0, "no rows are deleted when every attempt fails busy");
+        assert_eq!(
+            total, 0,
+            "no rows are deleted when every attempt fails busy"
+        );
     }
 
     /// #3772: a genuine (non-transient) error must NOT be retried — the
@@ -1548,6 +1594,9 @@ mod tests {
             calls, 1,
             "a non-transient error must not be retried (fail closed immediately)"
         );
-        assert_eq!(total, 0, "no rows counted on immediate non-transient failure");
+        assert_eq!(
+            total, 0,
+            "no rows counted on immediate non-transient failure"
+        );
     }
 }
