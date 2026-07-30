@@ -1511,7 +1511,11 @@ impl OverlayManager {
                     sanitize_error_msg(&err.msg[..])
                 );
             } else {
+                // #3773: dump the per-peer outbound diagnostic ring alongside
+                // the warning, so a peer-reported `ERR_DATA "received corrupt
+                // XDR"` can be tied to the frame(s) henyey sent just before.
                 warn!(
+                    recent_sends = %ctx.peer.recent_sends_summary(),
                     "Peer sent_error peer={} code={:?} msg={}",
                     peer_id,
                     err.code,
