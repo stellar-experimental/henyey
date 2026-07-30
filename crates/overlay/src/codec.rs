@@ -46,6 +46,23 @@ const MAX_UNAUTHENTICATED_MESSAGE_SIZE: usize = 4096;
 /// Minimum message size - must fit at least the authenticated message header.
 const MIN_MESSAGE_SIZE: usize = 12;
 
+/// Rejects an outbound XDR payload whose length exceeds `MAX_MESSAGE_SIZE`.
+///
+/// This is the single enforcement point for the encode-side size bound, shared
+/// by the real send-path encoder (`MessageCodec::encode_message`) and the
+/// `Encoder` trait impl. Keeping one implementation prevents the two paths from
+/// silently diverging again (see #3774). Mirrors the receive-side rejection in
+/// `Decoder::decode` and stellar-core's `TCPPeer.cpp:690-701`.
+fn check_encode_size(xdr_len: usize) -> Result<()> {
+    if xdr_len > MAX_MESSAGE_SIZE {
+        return Err(OverlayError::Message(format!(
+            "message too large: {} bytes",
+            xdr_len
+        )));
+    }
+    Ok(())
+}
+
 /// A framed message received from the network.
 ///
 /// Contains the decoded message along with metadata about how it was received.
@@ -139,6 +156,7 @@ impl MessageCodec {
     /// writes each overlay message as a single XDR record fragment.
     pub fn encode_message(message: &AuthenticatedMessage) -> Result<Vec<u8>> {
         let xdr_bytes = message.to_xdr(Limits::none())?;
+        check_encode_size(xdr_bytes.len())?;
         let len = xdr_bytes.len() as u32;
 
         let mut buf = Vec::with_capacity(4 + xdr_bytes.len());
@@ -257,13 +275,8 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
         // Encode to XDR
         let xdr_bytes = message.to_xdr(Limits::none())?;
 
-        // Check size
-        if xdr_bytes.len() > MAX_MESSAGE_SIZE {
-            return Err(OverlayError::Message(format!(
-                "message too large: {} bytes",
-                xdr_bytes.len()
-            )));
-        }
+        // Check size (shared with the real send-path encoder, `encode_message`).
+        check_encode_size(xdr_bytes.len())?;
 
         // Write XDR record-marking prefix. Bit 31 is the final-fragment bit,
         // not an authentication marker.
@@ -724,6 +737,14 @@ mod tests {
             result.unwrap().is_none(),
             "should be waiting for more body data"
         );
+    }
+
+    #[test]
+    fn test_check_encode_size_rejects_oversized() {
+        // Exactly at the bound is allowed; one byte over is rejected.
+        assert!(check_encode_size(MAX_MESSAGE_SIZE).is_ok());
+        assert!(check_encode_size(MAX_MESSAGE_SIZE + 1).is_err());
+        assert!(check_encode_size(0).is_ok());
     }
 
     #[test]
