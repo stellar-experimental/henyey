@@ -1799,6 +1799,19 @@ mod tests {
         assert_eq!(DropInitiator::default(), DropInitiator::Local);
     }
 
+    /// #3775: a peer-sent `ErrorMsg` terminates the session at the peer's
+    /// explicit request, so its drop reason (`peer_error`) must classify as
+    /// `Remote` — not fall through to the `Local` default the way it did before
+    /// this fix. Regression guard for `from_reason`'s taxonomy.
+    #[test]
+    fn test_from_reason_classifies_peer_error_as_remote() {
+        assert_eq!(
+            DropInitiator::from_reason("peer_error"),
+            DropInitiator::Remote,
+            "a peer-sent ErrorMsg (reason=\"peer_error\") is remote-initiated"
+        );
+    }
+
     #[test]
     fn test_check_peer_timeouts_returns_reason() {
         // #3570: check_peer_timeouts now returns Option<IdleReason> instead of
