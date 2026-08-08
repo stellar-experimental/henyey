@@ -12,8 +12,13 @@
 //! # Length Field Format
 //!
 //! The length field uses XDR record marking semantics:
-//! - **Bit 31 (MSB)**: Final-fragment flag. Henyey emits and accepts only
-//!   single-fragment overlay messages, so this bit must be set.
+//! - **Bit 31 (MSB)**: Record-marking continuation ("last fragment") flag.
+//!   Henyey always sets it on send, since every overlay message is written as
+//!   a single XDR record fragment. On receive the bit is **masked off and
+//!   never rejected on**, matching stellar-core's
+//!   `TCPPeer::getIncomingMsgLength()` (`TCPPeer.cpp:673-686`), which does
+//!   `length &= 0x7f` and never inspects the bit. It is surfaced as
+//!   [`MessageFrame::is_last_fragment`] for diagnostics only.
 //! - **Bits 0-30**: Actual message body length in bytes.
 //!
 //! # Message Size Limits
@@ -163,17 +168,18 @@ impl Decoder for MessageCodec {
                         return Ok(None);
                     }
 
-                    // Read XDR record-marking prefix. Bit 31 is the final
-                    // fragment flag, not an authentication marker.
+                    // Read XDR record-marking prefix. Bit 31 is the
+                    // continuation ("last fragment") flag, not an
+                    // authentication marker. It is masked off and never
+                    // rejected on: stellar-core's
+                    // `TCPPeer::getIncomingMsgLength()` (TCPPeer.cpp:673-686)
+                    // does `length &= 0x7f` and never inspects the bit, so
+                    // rejecting a clear bit would drop peers stellar-core
+                    // keeps (#3776). The value is retained purely as
+                    // descriptive metadata on `MessageFrame`.
                     let raw_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
                     let is_last_fragment = (raw_len & 0x80000000) != 0;
                     let len = (raw_len & 0x7FFFFFFF) as usize;
-
-                    if !is_last_fragment {
-                        return Err(OverlayError::Message(
-                            "fragmented XDR records are not supported".into(),
-                        ));
-                    }
 
                     // Validate length
                     // OVERLAY_SPEC §3.3: len==0 is handled distinctly as
