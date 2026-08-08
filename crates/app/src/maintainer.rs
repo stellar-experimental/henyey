@@ -199,6 +199,7 @@ impl Maintainer {
                     let db = Arc::clone(&self.database);
                     let config_count = self.config.count;
                     let rpc_retention_window = self.config.rpc_retention_window;
+                    let period = self.config.period;
                     let get_bounds = Arc::clone(&self.get_ledger_bounds);
 
                     match henyey_common::spawn_blocking_logged(
@@ -217,10 +218,11 @@ impl Maintainer {
                             );
 
                             let elapsed = start.elapsed();
-                            if elapsed > Duration::from_secs(10) {
+                            if elapsed > maintenance_warn_threshold(period) {
                                 warn!(
                                     elapsed_ms = elapsed.as_millis(),
-                                    "Maintenance took too long; consider increasing AUTOMATIC_MAINTENANCE_COUNT \
+                                    "Maintenance cycle exceeded its expected-relative-to-period threshold; if \
+                                     consistently slow, consider tuning MAINTENANCE_CHUNK_LEDGERS/MAINTENANCE_CHUNK_PAUSE \
                                      or performing manual database maintenance"
                                 );
                             } else {
@@ -266,10 +268,11 @@ impl Maintainer {
         );
 
         let elapsed = start.elapsed();
-        if elapsed > Duration::from_secs(10) {
+        if elapsed > maintenance_warn_threshold(self.config.period) {
             warn!(
                 elapsed_ms = elapsed.as_millis(),
-                "Maintenance took too long; consider increasing AUTOMATIC_MAINTENANCE_COUNT \
+                "Maintenance cycle exceeded its expected-relative-to-period threshold; if \
+                 consistently slow, consider tuning MAINTENANCE_CHUNK_LEDGERS/MAINTENANCE_CHUNK_PAUSE \
                  or performing manual database maintenance"
             );
         } else {
@@ -346,6 +349,23 @@ const MAINTENANCE_CHUNK_LEDGERS: u32 = 2;
 /// transaction (and other writers) a window to acquire the WAL write lock
 /// between chunks.
 const MAINTENANCE_CHUNK_PAUSE: Duration = Duration::from_millis(25);
+
+/// Warn threshold for a maintenance cycle's elapsed time.
+///
+/// A flat threshold predates the per-chunk WAL-lock-yielding pauses added
+/// for #3702 (`MAINTENANCE_CHUNK_PAUSE` between chunks, across up to 5
+/// tables in `run_maintenance`), whose structural floor alone can exceed a
+/// few seconds on short periods — firing this warning in steady state
+/// rather than signaling genuine slowness. Instead, warn only when a cycle
+/// risks not keeping up with its own configured period: a cycle longer than
+/// a third of the period is the operationally meaningful risk, independent
+/// of how many tables/chunks the current build happens to have. Clamped to
+/// a 10s floor (the previous flat threshold) so a misconfigured/degenerate
+/// `period` (e.g. zero, not rejected by the type system) cannot make this
+/// warning fire unconditionally by driving the threshold itself to zero.
+fn maintenance_warn_threshold(period: Duration) -> Duration {
+    (period / 3).max(Duration::from_secs(10))
+}
 
 /// Run one table's maintenance deletion in bounded chunks.
 ///
@@ -580,6 +600,74 @@ mod tests {
     fn test_checkpoint_frequency() {
         // Verify default checkpoint frequency matches Stellar standard
         assert_eq!(checkpoint_frequency(), 64);
+    }
+
+    /// Regression test for #3754: the warn threshold must scale with the
+    /// configured maintenance period rather than a flat 10s. At the
+    /// mainnet-rpc `period_secs=900` config, this yields 300s.
+    #[test]
+    fn test_maintenance_warn_threshold_scales_with_period() {
+        assert_eq!(
+            maintenance_warn_threshold(Duration::from_secs(900)),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// Regression test for #3754: guards the formula against the crate's
+    /// default 4-hour maintenance period.
+    #[test]
+    fn test_maintenance_warn_threshold_uses_default_period() {
+        assert_eq!(
+            maintenance_warn_threshold(DEFAULT_MAINTENANCE_PERIOD),
+            DEFAULT_MAINTENANCE_PERIOD / 3
+        );
+    }
+
+    /// Regression test for #3754: a degenerate/misconfigured zero `period`
+    /// (not rejected by the type system) must not drive the threshold to
+    /// zero and make the warning fire unconditionally. Clamped to the
+    /// previous flat 10s floor.
+    #[test]
+    fn test_maintenance_warn_threshold_zero_period_is_clamped() {
+        assert_eq!(
+            maintenance_warn_threshold(Duration::ZERO),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// Regression test for #3754: converts the plan's hand-verified
+    /// structural-sleep-floor arithmetic into a CI guardrail. Computes the
+    /// theoretical worst-case sleep floor from the crate's own real
+    /// chunking constants (5 tables, each walked in
+    /// `ceil(period_ledgers / MAINTENANCE_CHUNK_LEDGERS)` chunks separated
+    /// by `MAINTENANCE_CHUNK_PAUSE`) for the mainnet-rpc `period_secs=900`
+    /// scenario from the issue (~5s/ledger -> ~180 ledgers/cycle), and
+    /// asserts it stays strictly under `maintenance_warn_threshold(period)`.
+    /// This fails loudly if `MAINTENANCE_CHUNK_LEDGERS`/`MAINTENANCE_CHUNK_PAUSE`
+    /// are ever retuned enough to threaten the invariant this fix relies on.
+    #[test]
+    fn test_maintenance_warn_threshold_exceeds_structural_sleep_floor() {
+        let period = Duration::from_secs(900);
+
+        // Ledgers accrued per maintenance cycle, assuming ~5s/ledger close
+        // time (matches the `ledgers_per_period` estimate in `start()`).
+        let ledgers_per_period = period.as_secs() / 5;
+
+        // Each of the 5 tables walked by `run_maintenance` (SCP, ledger
+        // headers, tx history, events, ledger close meta) is deleted in
+        // chunks of at most `MAINTENANCE_CHUNK_LEDGERS` ledgers.
+        const TABLES: u64 = 5;
+        let chunks_per_table = ledgers_per_period.div_ceil(MAINTENANCE_CHUNK_LEDGERS as u64);
+        let structural_floor = MAINTENANCE_CHUNK_PAUSE * (TABLES * chunks_per_table) as u32;
+
+        let threshold = maintenance_warn_threshold(period);
+        assert!(
+            structural_floor < threshold,
+            "structural sleep floor {structural_floor:?} must stay strictly below the warn \
+             threshold {threshold:?} (period={period:?}); if this fails, \
+             MAINTENANCE_CHUNK_LEDGERS/MAINTENANCE_CHUNK_PAUSE have been retuned enough to \
+             threaten the fix in #3754"
+        );
     }
 
     #[tokio::test]
