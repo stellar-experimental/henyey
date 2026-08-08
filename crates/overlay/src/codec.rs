@@ -468,6 +468,71 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_accepts_continuation_bit_clear() {
+        // Regression for #3776: a frame whose XDR record-marking bit 31 is
+        // CLEAR must decode exactly like the bit-31-set equivalent.
+        // stellar-core's `TCPPeer::getIncomingMsgLength()` masks the bit off
+        // (`length &= 0x7f`) and never inspects it, and stellar-core's own
+        // writer (xdrpp `marshal.cc`) always sets it and never implements
+        // continuation fragments — so rejecting a clear bit is strictly
+        // stricter than upstream and drops peers stellar-core would keep.
+        let msg = make_test_message();
+
+        // Reference frame: bit 31 set (what `encode_message` emits).
+        let with_bit = MessageCodec::encode_message(&msg).unwrap();
+        let body = &with_bit[4..];
+
+        // Same frame, bit 31 cleared in the length prefix.
+        let mut without_bit = Vec::with_capacity(with_bit.len());
+        without_bit.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        without_bit.extend_from_slice(body);
+
+        // Sanity: the two differ only in bit 31 of the prefix.
+        let raw_len_set = u32::from_be_bytes([with_bit[0], with_bit[1], with_bit[2], with_bit[3]]);
+        let raw_len_clear = u32::from_be_bytes([
+            without_bit[0],
+            without_bit[1],
+            without_bit[2],
+            without_bit[3],
+        ]);
+        assert_eq!(raw_len_set & 0x80000000, 0x80000000);
+        assert_eq!(raw_len_clear & 0x80000000, 0);
+        assert_eq!(raw_len_set & 0x7FFFFFFF, raw_len_clear & 0x7FFFFFFF);
+
+        // Decode the bit-31-set frame for comparison.
+        let mut codec = MessageCodec::new();
+        let mut buf = BytesMut::from(&with_bit[..]);
+        let expected = codec
+            .decode(&mut buf)
+            .expect("bit-31-set frame should decode")
+            .expect("bit-31-set frame should yield a complete frame");
+        assert!(expected.is_last_fragment);
+
+        // Decode the bit-31-clear frame: must succeed identically, only with
+        // `is_last_fragment == false` as descriptive metadata.
+        let mut codec = MessageCodec::new();
+        let mut buf = BytesMut::from(&without_bit[..]);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("bit-31-clear frame must not be rejected (#3776)")
+            .expect("bit-31-clear frame should yield a complete frame");
+
+        assert!(
+            !frame.is_last_fragment,
+            "bit 31 clear should be reported as is_last_fragment == false"
+        );
+        assert_eq!(frame.raw_len, expected.raw_len);
+        match (frame.message, expected.message) {
+            (AuthenticatedMessage::V0(got), AuthenticatedMessage::V0(want)) => {
+                assert_eq!(got.sequence, want.sequence);
+                assert_eq!(got.mac.mac, want.mac.mac);
+                assert!(matches!(got.message, StellarMessage::Peers(_)));
+            }
+        }
+        assert!(buf.is_empty(), "the whole frame should have been consumed");
+    }
+
+    #[test]
     fn test_codec_streaming() {
         let msg = make_test_message();
         let mut codec = MessageCodec::new();
