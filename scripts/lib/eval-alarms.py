@@ -15,6 +15,14 @@ Inputs (env vars):
                         survived, so the same-PID baseline is hours old and the
                         counter-delta would false-fire as an acute burst.
     GAP_STALE_THRESHOLD_SECONDS  gap-stale threshold (default: 3600 ≈ 3× tick).
+    MIN_EVAL_WINDOW_SECONDS  symmetric LOWER bound to gap-stale (default: 600).
+                        When the prev baseline is YOUNGER than this, a duplicate/
+                        back-to-back tick (e.g. the watchdog firing into a
+                        still-running tick, #3757) sampled too short an interval
+                        to carry a meaningful cross-tick delta; the counter-family
+                        evaluators return a NON-destructive skip that PRESERVES
+                        the streak/ratio/dynamic snapshot. Age -1/absent ⇒ unknown
+                        ⇒ NOT too-fresh (fail-safe).
     WARMUP_TICKS_REMAINING  0/1/2 (default: 0)
     FRESH_START         yes/no (default: no)
     CRASH_RECOVERY      yes/no (default: no)
@@ -50,6 +58,15 @@ except ImportError:
 
 SCHEMA_VERSION = 1
 
+# Sentinel skip_reason for the symmetric "too-fresh" lower-bound guard (#3757):
+# a duplicate / back-to-back tick sampled an inter-scrape interval shorter than
+# MIN_EVAL_WINDOW_SECONDS. The cross-tick counter-family evaluators return this
+# as a NON-destructive skip (no snapshot write). It is the lower-bound mirror of
+# the gap_stale upper bound: gap_stale suppresses a too-OLD baseline (loop
+# stalled), too-fresh suppresses a too-YOUNG one (watchdog duplicate fired into
+# a still-running tick).
+SKIP_INTERVAL_TOO_SHORT = "interval too short"
+
 # Skip reasons that must NOT trigger a counter-snapshot reset (#3758). These are
 # monitoring-side caller errors (e.g. an abbreviated tick that failed to export
 # PID/START_TICKS) that carry ZERO information about the node — treating them as
@@ -62,7 +79,11 @@ SCHEMA_VERSION = 1
 # allow-list impractical and a prefix allow-list fragile. Any FUTURE
 # monitoring-side caller-error skip reason carrying no node info must be added
 # here.
-PRESERVE_BASELINE_SKIP_REASONS = {"missing process identity"}
+#
+# SKIP_INTERVAL_TOO_SHORT (#3757) belongs here for the same reason: the
+# evaluator already returned WITHOUT a snapshot write, and this membership stops
+# the centralized reset from wiping the streak/ratio/dynamic state.
+PRESERVE_BASELINE_SKIP_REASONS = {"missing process identity", SKIP_INTERVAL_TOO_SHORT}
 
 # When True (set by --no-snapshot-write in main()), write_snapshot() becomes a
 # no-op so the evaluator runs as a TRUE read-only dry-run: it evaluates against
@@ -623,6 +644,23 @@ def gap_stale_reason(age_hours: float) -> str:
     return f"gap-stale (prev age {age_hours}h)"
 
 
+def compute_too_fresh(prev_scrape_age: int, min_eval_window: int) -> bool:
+    """Symmetric lower-bound mirror of gap_stale (#3757).
+
+    True when the prev baseline is YOUNGER than MIN_EVAL_WINDOW_SECONDS — i.e. a
+    duplicate / back-to-back tick (e.g. the watchdog firing into a still-running
+    interactive tick) sampled an inter-scrape interval too short to carry a
+    meaningful cross-tick delta. Such a tick would otherwise reset a breach
+    streak to 0 (delta=0) or advance it (delta>=1), burning alarm cooldowns and
+    double-advancing streak/ratio snapshots.
+
+    Half-open window [0, min): age 0 (same instant) IS too-fresh, exactly the
+    window is NOT. Age -1/absent ⇒ unknown ⇒ NOT too-fresh (fail-safe: never
+    suppress on unknown age, exactly like gap_stale).
+    """
+    return 0 <= prev_scrape_age < min_eval_window
+
+
 def eval_counter(
     alarm: dict,
     current: dict,
@@ -631,6 +669,7 @@ def eval_counter(
     warmup_remaining: int,
     gap_stale: bool = False,
     gap_stale_age_hours: float = 0,
+    too_fresh: bool = False,
 ) -> dict:
     """Evaluate a counter alarm."""
     if prev_prom_invalid:
@@ -665,6 +704,14 @@ def eval_counter(
     if warmup_remaining > 0 and prev_val == 0:
         return make_result(alarm, "skipped", skip_reason="warmup (prev=0)")
 
+    # Too-fresh (#3757): a duplicate/back-to-back tick sampled an inter-scrape
+    # interval below MIN_EVAL_WINDOW_SECONDS. prev.prom is recomputed each tick
+    # (no persisted baseline), so a plain SKIP suffices — the next normal-cadence
+    # tick spans the real interval. Checked after the metric/warmup guards and
+    # before the delta so a too-short burst read is not mistaken for a fire.
+    if too_fresh:
+        return make_result(alarm, "skipped", skip_reason=SKIP_INTERVAL_TOO_SHORT)
+
     # Counter reset: if cur < prev, delta = cur
     if cur_val < prev_val:
         delta = cur_val
@@ -689,6 +736,7 @@ def eval_counter_dynamic(
     warmup_remaining: int,
     gap_stale: bool = False,
     gap_stale_age_hours: float = 0,
+    too_fresh: bool = False,
 ) -> dict:
     """Evaluate a counter-dynamic alarm (threshold = multiplier × prior delta)."""
     ev_default = default_extra_values(alarm, "counter-dynamic")
@@ -721,6 +769,15 @@ def eval_counter_dynamic(
 
     if warmup_remaining > 0 and prev_val == 0:
         return make_result(alarm, "skipped", skip_reason="warmup (prev=0)",
+                           extra_values=ev_default)
+
+    # Too-fresh (#3757): skip BEFORE the prior-delta snapshot write below — a
+    # duplicate tick's below-window delta must not be stored as next tick's
+    # prior_delta, which would poison the dynamic threshold. The prior_delta
+    # snapshot is left untouched, so the next normal tick compares against the
+    # last real delta. Mirrors the gap_stale branch above.
+    if too_fresh:
+        return make_result(alarm, "skipped", skip_reason=SKIP_INTERVAL_TOO_SHORT,
                            extra_values=ev_default)
 
     # Counter reset
@@ -776,6 +833,7 @@ def eval_histogram_p99(
     prev_prom_invalid: bool,
     gap_stale: bool = False,
     gap_stale_age_hours: float = 0,
+    too_fresh: bool = False,
 ) -> dict:
     """Evaluate a histogram-p99 alarm with mean fallback."""
     ev_default = default_extra_values(alarm, "histogram-p99")
@@ -789,6 +847,12 @@ def eval_histogram_p99(
     if gap_stale:
         return make_result(alarm, "skipped",
                            skip_reason=gap_stale_reason(gap_stale_age_hours),
+                           extra_values=ev_default)
+    # Too-fresh (#3757): a below-window duplicate tick's count/sum/bucket deltas
+    # span too short an interval to be meaningful. prev.prom is recomputed each
+    # tick (no persisted baseline), so SKIP. Mirrors the gap_stale upper bound.
+    if too_fresh:
+        return make_result(alarm, "skipped", skip_reason=SKIP_INTERVAL_TOO_SHORT,
                            extra_values=ev_default)
 
     metric = alarm["metric"]
@@ -909,6 +973,7 @@ def eval_histogram_bucket_rate(
     prev_prom_invalid: bool,
     gap_stale: bool = False,
     gap_stale_age_hours: float = 0,
+    too_fresh: bool = False,
 ) -> dict:
     """Evaluate a histogram-bucket-rate alarm.
 
@@ -932,6 +997,14 @@ def eval_histogram_bucket_rate(
     if gap_stale:
         return make_result(alarm, "skipped",
                            skip_reason=gap_stale_reason(gap_stale_age_hours),
+                           extra_values=ev_default)
+    # Too-fresh (#3757): a below-window duplicate tick's count/bucket deltas span
+    # too short an interval to be meaningful. prev.prom is recomputed each tick
+    # (no persisted baseline), so SKIP. Mirrors the gap_stale upper bound, and
+    # matches eval_histogram_p99 — this family is a prev.prom-differencing
+    # evaluator, so it needs the lower bound just as much as the upper one.
+    if too_fresh:
+        return make_result(alarm, "skipped", skip_reason=SKIP_INTERVAL_TOO_SHORT,
                            extra_values=ev_default)
 
     metric = alarm["metric"]
@@ -1035,6 +1108,7 @@ def eval_counter_ratio(
     crash_recovery: bool,
     uptime: int,
     gap_stale: bool = False,
+    too_fresh: bool = False,
 ) -> dict:
     """Evaluate a counter-ratio alarm with streak detection.
 
@@ -1192,6 +1266,18 @@ def eval_counter_ratio(
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
+    # Too-fresh (#3757): a duplicate/back-to-back tick sampled an inter-scrape
+    # interval below MIN_EVAL_WINDOW_SECONDS. Unlike gap_stale (which re-baselines
+    # because the snapshot is stale), the baseline here is still VALID — the
+    # duplicate must be a pure no-op. Return a NON-destructive skip WITHOUT
+    # writing the snapshot, so the streak and cumulative baselines are preserved
+    # untouched; the next normal-cadence tick spans the real interval. Sequenced
+    # after the identity / counter-reset / gap_stale branches so a restart is
+    # always handled first, and before any streak/baseline write below.
+    if too_fresh:
+        return make_result(alarm, "skipped", skip_reason=SKIP_INTERVAL_TOO_SHORT,
+                           extra_values=ev_default)
+
     num_delta = cur_num - prev_num
     den_delta = cur_den - prev_den
 
@@ -1284,6 +1370,7 @@ def eval_counter_streak(
     pid: str,
     start_ticks: str,
     gap_stale: bool = False,
+    too_fresh: bool = False,
 ) -> dict:
     """Evaluate a counter-streak alarm.
 
@@ -1404,6 +1491,20 @@ def eval_counter_streak(
         }
         write_snapshot(snapshot_path, new_snapshot)
         return make_result(alarm, "collecting_baseline",
+                           extra_values=ev_default)
+
+    # Too-fresh (#3757): a duplicate/back-to-back tick sampled an inter-scrape
+    # interval below MIN_EVAL_WINDOW_SECONDS. The snapshot baseline is still
+    # VALID (identity matched, no counter reset, not gap-stale) — the duplicate
+    # must be a pure no-op. Return a NON-destructive skip WITHOUT writing the
+    # snapshot, so counter_value and breach_streak are preserved untouched and
+    # the next normal-cadence tick computes the delta over the real interval.
+    # This is the headline harm from #3757: a watchdog duplicate would otherwise
+    # advance (delta>=1) or reset (delta=0) the streak and burn the alarm
+    # cooldown. Sequenced after the identity / counter-reset / gap_stale branches
+    # (a restart is always handled first) and before the delta computation.
+    if too_fresh:
+        return make_result(alarm, "skipped", skip_reason=SKIP_INTERVAL_TOO_SHORT,
                            extra_values=ev_default)
 
     delta = int(cur_val) - prev_counter
@@ -1750,6 +1851,17 @@ def main() -> int:
         gap_stale_threshold = 3600
     gap_stale = prev_scrape_age >= 0 and prev_scrape_age >= gap_stale_threshold
     gap_stale_age_hours = round(prev_scrape_age / 3600.0, 1) if gap_stale else 0
+    # Too-fresh (#3757): the symmetric LOWER bound to gap_stale. When the prev
+    # baseline is younger than MIN_EVAL_WINDOW_SECONDS, a duplicate/back-to-back
+    # tick (e.g. the watchdog firing into a still-running interactive tick)
+    # sampled too short an interval to carry a meaningful cross-tick delta. The
+    # counter-family evaluators then return a NON-destructive skip that PRESERVES
+    # the streak/ratio/dynamic snapshot instead of resetting or advancing it.
+    try:
+        min_eval_window = int(os.environ.get("MIN_EVAL_WINDOW_SECONDS", "600"))
+    except ValueError:
+        min_eval_window = 600
+    too_fresh = compute_too_fresh(prev_scrape_age, min_eval_window)
     warmup_remaining = int(os.environ.get("WARMUP_TICKS_REMAINING", "0"))
     fresh_start = os.environ.get("FRESH_START", "no").lower() == "yes"
     crash_recovery = os.environ.get("CRASH_RECOVERY", "no").lower() == "yes"
@@ -1827,24 +1939,24 @@ def main() -> int:
                 result = eval_gauge_ratio(alarm, current, persistence_state, prev_prom_invalid)
             elif kind == "counter":
                 result = eval_counter(alarm, current, prev, prev_prom_invalid, warmup_remaining,
-                                      gap_stale, gap_stale_age_hours)
+                                      gap_stale, gap_stale_age_hours, too_fresh)
             elif kind == "counter-dynamic":
                 result = eval_counter_dynamic(alarm, current, prev, state_dir, prev_prom_invalid, warmup_remaining,
-                                              gap_stale, gap_stale_age_hours)
+                                              gap_stale, gap_stale_age_hours, too_fresh)
             elif kind == "histogram-p99":
                 result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid,
-                                            gap_stale, gap_stale_age_hours)
+                                            gap_stale, gap_stale_age_hours, too_fresh)
             elif kind == "histogram-bucket-rate":
                 result = eval_histogram_bucket_rate(alarm, current, prev, prev_prom_invalid,
-                                                    gap_stale, gap_stale_age_hours)
+                                                    gap_stale, gap_stale_age_hours, too_fresh)
             elif kind == "counter-ratio":
                 result = eval_counter_ratio(
                     alarm, current, prev, state_dir, pid, start_ticks_val,
-                    fresh_start, crash_recovery, uptime, gap_stale,
+                    fresh_start, crash_recovery, uptime, gap_stale, too_fresh,
                 )
             elif kind == "counter-streak":
                 result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val,
-                                             gap_stale)
+                                             gap_stale, too_fresh)
             else:
                 result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 
@@ -1852,8 +1964,8 @@ def main() -> int:
         results.append(result)
         maybe_reset_gauge_persistence(alarm, kind, result["state"], persistence_state)
         # Pass the skip reason so the cleanup hook can exempt monitoring-side
-        # caller errors (e.g. "missing process identity") from destroying the
-        # baseline — see PRESERVE_BASELINE_SKIP_REASONS / #3758.
+        # caller errors ("missing process identity", "interval too short") from
+        # destroying the baseline — see PRESERVE_BASELINE_SKIP_REASONS / #3758.
         maybe_reset_counter_snapshot(
             alarm, kind, result["state"], state_dir, result.get("skip_reason"),
         )
