@@ -775,15 +775,28 @@ classify_path_binary_relevance() {
 # (exactly the `gh run list … --json headSha,status,conclusion --jq` order):
 #     <headSha>|<status>|<conclusion>
 #
+# Greenness is keyed on each sha's MOST-RECENT definitive verdict, not "any
+# success ever". `Verify Execution (Mainnet)` is deterministic per-sha, so a
+# newer `failure` on a sha whose older run `success`ed means a genuine
+# regression (or a flake) surfaced by newer mainnet data — either way "latest
+# success ever" is the wrong signal for "safe to ship now" (#3740). Because
+# records arrive newest-first, the FIRST definitive (success/failure) row per
+# sha wins; an older success can no longer resurrect a sha whose newest run
+# failed. Non-definitive conclusions (cancelled/skipped/neutral/…) are
+# cancel-per-head noise and are ignored (older rows still decide the sha).
+#
 # Prints the chosen deploy-target sha to STDOUT (empty if none), and a single
 # reason token to STDERR. Reason tokens:
 #     (sha printed)        — a valid newer green target was selected
-#     no-green-run         — no record is completed/success
+#     no-green-run         — no definitive verdict yielded a usable green target
 #     green-equals-deployed— newest valid green sha == deployed (up-to-date)
 #     green-behind-deployed— only green sha(s) are ancestors of deployed (no
 #                            backwards deploy)
 #     green-not-on-main    — only green sha(s) are not ancestors of ORIGIN_SHA
 #                            (off-main / force-pushed / unresolvable locally)
+#     green-superseded-by-failure — a sha's newest VE verdict was a failure that
+#                            superseded an older success for that same sha, and
+#                            no other usable green remained (#3740)
 #     walk-exceeded        — newest valid green sha is > MAX_DEPLOY_WALK commits
 #                            ahead of deployed (defensive staleness bound)
 #
@@ -836,14 +849,57 @@ select_latest_green_deploy_target() {
   # makes the deploy gate fail-closed to `defer-no-green`, silently deferring
   # every deploy (#3581). Use a non-reserved name.
   local line sha run_status conclusion
-  local saw_green=0           # any completed/success record at all
+  local saw_green=0           # any completed/success record that was NOT superseded
   local saw_on_main=0         # any green record that is on main (ancestor of HEAD)
+  local saw_superseded=0      # a sha's newest verdict was failure but an older run succeeded
+  # Per-sha bookkeeping via whitespace-delimited accumulator strings (NOT a
+  # bash-4 `local -A` associative array): the function is invoked under
+  # `emulate -L zsh` in the deploy gate (see the #3581/#3592 zsh cases), where
+  # associative-array semantics diverge. Hex shas contain no whitespace, so
+  # space-delimited membership (`case " $set " in *" $sha "*)`) is exact.
+  local seen_shas=''          # shas whose newest DEFINITIVE verdict is already recorded
+  local failed_shas=''        # shas whose newest definitive verdict was failure
 
   while IFS='|' read -r sha run_status conclusion; do
     # Skip blank lines.
     [[ -z "$sha" ]] && continue
-    # Only completed/success records are deploy candidates.
-    [[ "$run_status" == "completed" && "$conclusion" == "success" ]] || continue
+    # Only completed runs carry a verdict; in-progress/queued rows are not yet a
+    # conclusion for this sha — skip without recording (an older completed row
+    # for the same sha still decides it).
+    [[ "$run_status" == "completed" ]] || continue
+    # Only success/failure are DEFINITIVE verdicts. Any other conclusion
+    # (cancelled/skipped/neutral/timed_out/action_required/…) is cancel-per-head
+    # noise on a busy main — ignore the row and keep consulting older rows for
+    # this sha (preserves the HEAD|cancelled → older-green behavior of #3351).
+    [[ "$conclusion" == "success" || "$conclusion" == "failure" ]] || continue
+
+    # Records arrive newest-first, so the FIRST definitive row per sha is that
+    # sha's authoritative (most-recent) verdict. Once recorded, an older row for
+    # the same sha cannot change it — an older success can no longer resurrect a
+    # sha whose newest VE run failed. When a later (older) success row shows up
+    # for a sha we already recorded as failed, note that a green was superseded
+    # by a newer failure (the "note when skipped due to a newer failure" #3740
+    # asks for) — then skip it.
+    case " $seen_shas " in
+      *" $sha "*)
+        if [[ "$conclusion" == "success" ]]; then
+          case " $failed_shas " in *" $sha "*) saw_superseded=1 ;; esac
+        fi
+        continue
+        ;;
+    esac
+    seen_shas="$seen_shas $sha"
+
+    if [[ "$conclusion" == "failure" ]]; then
+      # Newest verdict for this sha is a failure → disqualify the sha entirely.
+      # Record it so a later (older) success row for the same sha is reported as
+      # green-superseded-by-failure rather than a bare no-green-run. saw_green is
+      # intentionally NOT set for a disqualified sha.
+      failed_shas="$failed_shas $sha"
+      continue
+    fi
+
+    # conclusion == success and this is the sha's newest definitive verdict.
     saw_green=1
 
     # Guardrail 1 — on main: the green sha must be an ancestor-or-equal of the
@@ -895,8 +951,12 @@ select_latest_green_deploy_target() {
     # Green sha(s) exist but none are ancestors of origin HEAD (off-main /
     # force-pushed / unresolvable locally).
     echo "green-not-on-main" >&2
+  elif (( saw_superseded == 1 )); then
+    # No usable green remained, and the reason is that a sha's newest VE verdict
+    # was a failure that superseded an older success for that same sha (#3740).
+    echo "green-superseded-by-failure" >&2
   else
-    # No completed/success record at all.
+    # No definitive (success/failure) verdict yielded a usable green target.
     echo "no-green-run" >&2
   fi
   return 0
