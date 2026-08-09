@@ -86,7 +86,8 @@ const RECOVERY_THROTTLE_SECS: u64 = 30;
 ///
 /// The spawned-task warning in `broadcast_recovery_scp_state` (line ~693)
 /// and the watchdog SCP verifier errors are excluded: both are already
-/// naturally rate-limited to at most once per 10s tick.
+/// naturally rate-limited to at most once per watchdog sample (a jittered
+/// >=7s interval since #3795; was a fixed 10s tick).
 pub(crate) struct RecoveryLogThrottles {
     /// Rate-limits "Pending EXTERNALIZE far ahead" to once per distinct ledger.
     pub far_ahead: LogOncePerLedger,

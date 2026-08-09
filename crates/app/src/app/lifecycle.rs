@@ -619,8 +619,24 @@ impl App {
         const MAX_DRAIN_PER_TICK: usize = 200;
 
         let mut select_iteration: u64 = 0;
+        // Loop-top anchor for loop-side exact stall accounting (#3795). Same
+        // anchor as `tick_event_loop()` (and therefore `last_event_loop_tick_ms`),
+        // so the loop-side number and the sampler's `stale_secs` are the same
+        // quantity measured two ways. Measured at loop top — NOT reusing
+        // `phase_dispatch_start` — because that starts after the
+        // `deferred_catchup.lock().await` preamble, a tokio Mutex acquire that
+        // can itself block and would be invisible to a later anchor.
+        let mut last_tick_at = std::time::Instant::now();
         loop {
             select_iteration += 1;
+            // Report the exact inter-tick gap BEFORE `set_phase(0)` clears the
+            // sub-phase, so the just-ran arm is attributed exactly. Complete by
+            // construction: every stall that ends produces exactly one report
+            // at its true duration, independent of the sampler's phase (#3795).
+            let now = std::time::Instant::now();
+            let gap = now.duration_since(last_tick_at);
+            last_tick_at = now;
+            self.report_event_loop_stall(gap);
             self.tick_event_loop();
             self.set_phase(0); // 0 = waiting in select
 
