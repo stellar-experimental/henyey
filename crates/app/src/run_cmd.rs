@@ -483,14 +483,29 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                 app.database().clone(),
                 app.ledger_manager().clone(),
             );
-            let _result = app
+            // #3797: on a fatal startup-catchup failure (knit-to-LCL with
+            // LCL > genesis, verification/hash-integrity corruption), emit the
+            // `fatal_wipe_required=true` signal BEFORE propagating the error, so
+            // the monitor's (3a) auto-wipe self-heal fires automatically. The
+            // online catchup handler already does this; the startup path used to
+            // `?`-propagate the same fatal class silently, forcing a manual wipe
+            // (the ~9 h outage in #3797). Transient/ENOSPC-class errors are not
+            // classified wipe-required, so they propagate unchanged.
+            match app
                 .catchup_with_run_mode(
                     CatchupTarget::Current,
                     catchup_mode,
                     CatchupRunMode::Online,
                     finalize,
                 )
-                .await?;
+                .await
+            {
+                Ok(_result) => {}
+                Err(e) => {
+                    app.signal_startup_catchup_failure(&e);
+                    return Err(e);
+                }
+            }
 
             // Wait for SCP state request to complete
             let _ = scp_request_handle.await;
