@@ -21,7 +21,7 @@
 | SurveyManager | Partial | Owned by the app layer (`crates/app/src/survey.rs` `SurveyDataManager`/`SurveyState`/`SurveyMessageLimiter` + `crates/app/src/app/survey_impl.rs`); overlay handles transport only. Survey flow complete; JSON summary and limiter behavior simplified |
 | OverlayMetrics | Full | Counters and timers for all message types |
 | PeerBareAddress | Full | Mapped to PeerAddress in lib.rs |
-| MessageCodec (framing) | Full | Length-prefix with auth bit (bit 31) |
+| MessageCodec (framing) | Full | Length-prefix with XDR record-marking continuation bit (bit 31): always set on send, masked and ignored on receive |
 | Error Handling | Full | ERR_LOAD load shedding, 100-byte truncation, send_error_and_drop |
 
 ## File Mapping
@@ -441,7 +441,7 @@ Corresponds to: XDR framing in `TCPPeer.cpp`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | RM framing (4-byte header) | `MessageCodec` (Decoder+Encoder) | Full |
-| Auth bit handling (bit 31) | `is_authenticated` field | Full |
+| RM continuation bit (bit 31) — `getIncomingMsgLength()` masks it (`length &= 0x7f`) and never inspects it; the writer (xdrpp `marshal.cc`) always sets it | `MessageFrame::is_last_fragment` (descriptive metadata only; masked, never rejected on) | Full |
 | `MAX_UNAUTH_MESSAGE_SIZE` | `MIN_MESSAGE_SIZE` / `MAX_MESSAGE_SIZE` | Full |
 
 ### PeerSharedKeyId (`N/A`)
