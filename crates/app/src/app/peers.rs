@@ -257,6 +257,13 @@ impl App {
             })
             .await
         {
+            // #3802: log-and-continue, no retry — the prune is lost until the
+            // next `maintain_peers` tick. Count the transient-busy subset so
+            // the loss shows up in Prometheus rather than only in the log.
+            crate::metrics::record_db_busy_drop_if_transient_anyhow(
+                crate::metrics::SITE_PEER_FAILURE_PRUNE,
+                &e,
+            );
             tracing::warn!(error = %e, "Failed to remove failed peers");
         }
 

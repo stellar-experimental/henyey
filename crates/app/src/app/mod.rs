@@ -567,6 +567,11 @@ pub use persist::CatchupFinalizer;
 // the retention-trim retry loop reuses the same structured DB-busy/locked
 // classifier as the consensus-persist path (#3772).
 pub(crate) use persist::is_transient_db_busy;
+// Re-exported for `crate::metrics` (#3802): the busy-drop telemetry helper for
+// the `anyhow`-returning call sites classifies through the same downcast gate.
+// Same module-boundary reason as above — `crate::metrics` is outside `mod app`,
+// so `pub(super)` on the fn would not reach it.
+pub(crate) use persist::is_transient_db_busy_anyhow;
 pub(crate) use tx_flooding::{
     FLOOD_OP_RATE_PER_LEDGER, FLOOD_SOROBAN_RATE_PER_LEDGER, FLOOD_SOROBAN_TX_PERIOD_MS,
     FLOOD_TX_PERIOD_MS,
