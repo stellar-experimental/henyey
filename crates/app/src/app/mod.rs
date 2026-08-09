@@ -532,6 +532,11 @@ mod types;
 mod upgrades;
 
 pub use persist::CatchupFinalizer;
+// Re-exported for `crate::maintainer` (a sibling of `crate::app`, so
+// `pub(crate)` on the fn alone is not reachable across the module boundary):
+// the retention-trim retry loop reuses the same structured DB-busy/locked
+// classifier as the consensus-persist path (#3772).
+pub(crate) use persist::is_transient_db_busy;
 pub(crate) use tx_flooding::{
     FLOOD_OP_RATE_PER_LEDGER, FLOOD_SOROBAN_RATE_PER_LEDGER, FLOOD_SOROBAN_TX_PERIOD_MS,
     FLOOD_TX_PERIOD_MS,
