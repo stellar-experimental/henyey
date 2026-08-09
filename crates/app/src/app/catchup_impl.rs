@@ -3004,6 +3004,68 @@ impl App {
         false
     }
 
+    /// #3797: classify a **startup (boot-time) catchup** failure as
+    /// wipe-required.
+    ///
+    /// Returns `true` iff `err` downcasts to a fatal catchup/integrity
+    /// [`HistoryError`](henyey_history::HistoryError)
+    /// (`is_fatal_catchup_failure()`) **and** it is not the narrow
+    /// stateless-fresh-genesis knit carve-out (`current_ledger_seq() ==
+    /// GENESIS_LEDGER_SEQ && is_knit_to_lcl_failure()`). This mirrors, for the
+    /// startup path, the exact classification the online catchup handler
+    /// [`handle_catchup_result`](Self::handle_catchup_result) already applies —
+    /// the #3410 genesis-knit exception (a stateless fresh node has no committed
+    /// state to protect) is preserved, and for `LCL > genesis` the #3282/#3288
+    /// terminal semantics are unchanged.
+    ///
+    /// The downcast searches the anyhow source chain, so a typed `HistoryError`
+    /// wrapped by `?`'s `.context(...)` on the way out of the startup catchup
+    /// call is still classified correctly.
+    ///
+    /// Transient/download and ENOSPC-class errors are **not**
+    /// `is_fatal_catchup_failure()`, so they return `false` — a disk-full during
+    /// startup catchup must not be mis-signalled as requiring a wipe (matching
+    /// the #3478 "free space, no wipe" recoverable-shutdown semantics).
+    pub(crate) fn startup_catchup_failure_requires_wipe(&self, err: &anyhow::Error) -> bool {
+        let is_fatal = err
+            .downcast_ref::<henyey_history::HistoryError>()
+            .is_some_and(|e| e.is_fatal_catchup_failure());
+        if !is_fatal {
+            return false;
+        }
+        let at_genesis = self.current_ledger_seq() == GENESIS_LEDGER_SEQ;
+        let is_knit_to_lcl = err
+            .downcast_ref::<henyey_history::HistoryError>()
+            .is_some_and(|e| e.is_knit_to_lcl_failure());
+        !(at_genesis && is_knit_to_lcl)
+    }
+
+    /// #3797: emit the monitor's auto-wipe signal on a fatal **startup
+    /// (boot-time) catchup** failure, then let the caller propagate the error.
+    ///
+    /// The online catchup handler already emits `fatal_wipe_required=true` (via
+    /// [`trigger_fatal_shutdown`](Self::trigger_fatal_shutdown)) on the fatal
+    /// class, which the monitor greps to drive its `(3a)` auto-wipe self-heal.
+    /// The startup catchup path in `run_cmd` historically `?`-propagated the
+    /// same fatal class WITHOUT emitting that signal, so the monitor never
+    /// auto-recovered and the operator had to wipe by hand — the ~9 h outage in
+    /// #3797. Call this from the startup-catchup `Err` arm BEFORE returning the
+    /// error: on the wipe-required class it emits the signal; otherwise it is a
+    /// no-op and the caller propagates the (transient/recoverable) error
+    /// unchanged.
+    ///
+    /// At startup the main run loop is not yet spawned, so
+    /// `trigger_fatal_shutdown`'s `shutdown()` broadcast is a harmless send; the
+    /// caller still returns `Err`, so `run_node` exits non-zero for the
+    /// supervisor.
+    pub(crate) fn signal_startup_catchup_failure(&self, err: &anyhow::Error) {
+        if self.startup_catchup_failure_requires_wipe(err) {
+            self.trigger_fatal_shutdown(&format!(
+                "startup catchup verification/integrity failure: {err}"
+            ));
+        }
+    }
+
     pub(super) async fn maybe_start_externalized_catchup(
         &self,
         latest_externalized: u64,
@@ -8040,11 +8102,12 @@ mod tests {
 
         // Realistic incident shape: a typed knit-to-LCL HistoryError wrapped in
         // an anyhow `.context()` layer, as `?` would add on the way out.
-        let err: anyhow::Error = anyhow::Error::from(henyey_history::HistoryError::KnitLclHashMismatch {
-            expected: "4426b58c".into(),
-            actual: "6f828db4".into(),
-        })
-        .context("close_ledger failed at ledger 63733632");
+        let err: anyhow::Error =
+            anyhow::Error::from(henyey_history::HistoryError::KnitLclHashMismatch {
+                expected: "4426b58c".into(),
+                actual: "6f828db4".into(),
+            })
+            .context("close_ledger failed at ledger 63733632");
 
         // Guard the downcast-through-context path used by the classifier.
         assert!(
