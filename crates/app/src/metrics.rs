@@ -593,6 +593,12 @@ metric_catalog! {
             => "Total bounded retries of a consensus-critical persist DB commit \
                 after a transient SQLITE_BUSY/LOCKED, before escalating to a \
                 clean recoverable shutdown; see issue #3640";
+        EVENT_LOOP_STALL_ERROR_TOTAL = "henyey_event_loop_stall_error_total"
+            => "Event-loop stalls of >=30s, counted loop-side exactly once per \
+                stall when the loop resumes (issue #3795). Complete by \
+                construction — unlike the phase-locked watchdog sampler, which \
+                deterministically misses recovering stalls in a fixed blind \
+                band. Do NOT sum with the sampler's repeated WATCHDOG log lines.";
 
         // SCP/herder counters.
         SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
@@ -903,6 +909,16 @@ metric_catalog! {
     }
 
     histograms {
+        // Event-loop stall distribution (issue #3795).
+        EVENT_LOOP_STALL_SECONDS = "henyey_event_loop_stall_seconds"
+            => "Event-loop inter-tick stall duration (seconds), recorded \
+                loop-side exactly once per stall when the loop resumes. \
+                TRUNCATED at >=15s by design (a partial distribution — shorter \
+                gaps are not recorded), and counts each stall EXACTLY ONCE, \
+                whereas the watchdog sampler's WARN/ERROR log lines fire \
+                repeatedly during one stall; the two must not be summed. See \
+                issue #3795.";
+
         // Phase 4: Ledger close histogram.
         LEDGER_CLOSE_DURATION_SECONDS = "stellar_ledger_close_duration_seconds"
             => "Ledger close wall-clock duration in seconds";

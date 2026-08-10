@@ -3868,10 +3868,57 @@ impl App {
             .store(now_ms, Ordering::Relaxed);
     }
 
+    /// Loop-side exact accounting of an inter-tick stall (issue #3795).
+    ///
+    /// Called once per event-loop iteration with the exact gap since the
+    /// previous loop-top, measured from the *same* anchor as
+    /// [`tick_event_loop`](Self::tick_event_loop). Unlike the sampler — whose
+    /// phase-lock to the event-loop timer grid made its effective threshold a
+    /// fixed value in `[15 s, 25 s)` and left shorter recovering stalls
+    /// deterministically invisible — this path sees **every** stall that ends,
+    /// exactly once, at its true duration, at both the WARN (`[15, 30)`) and
+    /// ERROR (`>= 30`) tiers.
+    ///
+    /// Hot-path discipline: the tier check is first and there is nothing
+    /// before the early return, so the steady-state cost is one compare. Read
+    /// the phase atomics here (before `set_phase(0)` clears the sub-phase) so
+    /// the just-ran arm is attributed exactly, with no extra plumbing.
+    ///
+    /// Liveness assumption (inherited from the sampler, not new): `gap`
+    /// includes the `select!` wait, so an idle loop would look stalled — it
+    /// cannot only because `consensus_interval` (1 s, unconditional) guarantees
+    /// a wakeup. Anyone who later makes that tick conditional would silently
+    /// turn idleness into a 15 s "stall".
+    #[inline]
+    pub(crate) fn report_event_loop_stall(&self, gap: Duration) {
+        let tier = event_loop_stall_tier(gap);
+        if tier == WatchdogTier::None {
+            return;
+        }
+        // Metric gated at >= 15 s (tier != None) so the hot path stays free.
+        // Counts each stall exactly once — do NOT sum with the sampler's
+        // repeated WARN/ERROR log lines (see the metric HELP text).
+        crate::metrics::EVENT_LOOP_STALL_SECONDS.record(gap.as_secs_f64());
+        if tier == WatchdogTier::Error {
+            crate::metrics::EVENT_LOOP_STALL_ERROR_TOTAL.increment(1);
+        }
+        let phase = self.event_loop_phase.load(Ordering::Relaxed);
+        let phase_sub = self.event_loop_phase_sub.load(Ordering::Relaxed);
+        emit_event_loop_stall(
+            tier,
+            gap.as_millis() as u64,
+            gap.as_secs(),
+            phase,
+            phase_sub,
+        );
+    }
+
     /// Start a std::thread watchdog that monitors event loop liveness.
     ///
-    /// The watchdog runs independently of the tokio runtime. Every 10 seconds
-    /// it checks the last event loop tick timestamp. If the event loop hasn't
+    /// The watchdog runs independently of the tokio runtime. On each sample
+    /// (a jittered `[7 s, 10 s)` interval — see [`watchdog_next_sample_delay`],
+    /// which de-phases the sampler from the event-loop timer grid, #3795) it
+    /// checks the last event loop tick timestamp. If the event loop hasn't
     /// ticked in 30+ seconds, it emits tiered diagnostics:
     ///
     /// - **Tier 0** (automatic): scrapes `/proc/<pid>/task/*/wchan` and
@@ -3884,16 +3931,12 @@ impl App {
     /// It also monitors the SCP signature-verifier thread (see
     /// [`henyey_herder::scp_verify`]): it fires an error if the worker is
     /// `Dead`, or if its heartbeat is stuck while there is a non-empty backlog
-    /// for at least [`BACKLOG_STALE_TICKS`] consecutive ticks.
+    /// for at least [`BACKLOG_STALE_WINDOW`].
     ///
     /// Returns a [`WatchdogGuard`] whose `Drop` impl signals the thread to
     /// exit and resets `last_event_loop_tick_ms` to 0 (preventing spurious
     /// abort after the event loop has exited).
     pub(crate) fn start_event_loop_watchdog(&self) -> WatchdogGuard {
-        /// Number of consecutive 10s ticks the verifier heartbeat must be
-        /// stuck (with a non-empty backlog) before the watchdog logs.
-        const BACKLOG_STALE_TICKS: u32 = 3;
-
         let tick_ms = Arc::clone(&self.last_event_loop_tick_ms);
         let phase = Arc::clone(&self.event_loop_phase);
         let phase_sub = Arc::clone(&self.event_loop_phase_sub);
@@ -3913,13 +3956,35 @@ impl App {
             .name("watchdog".into())
             .spawn(move || {
                 let mut last_hb_seen: u64 = 0;
-                let mut stale_hb_ticks: u32 = 0;
+                // Duration-based replacement for the old `stale_hb_ticks`
+                // counter: when the heartbeat is first seen stuck with a
+                // non-empty backlog, stamp the instant; the WATCHDOG error
+                // fires once the stall has lasted `BACKLOG_STALE_WINDOW` and
+                // on every sample thereafter (#3795).
+                let mut hb_stuck_since: Option<std::time::Instant> = None;
+                // Per-thread PRNG state for the jittered sample delay,
+                // seeded from wall-clock nanos XOR pid so different nodes
+                // de-phase differently. `| 1` guarantees a non-zero seed
+                // (the xorshift64* fixed point); the generator re-guards
+                // internally regardless (#3795).
+                let mut sample_rng_state: u64 = {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    (nanos ^ ((pid as u64) << 32)) | 1
+                };
                 loop {
-                    // Sleep via condvar so we can be woken promptly on shutdown.
+                    // Sleep via condvar so we can be woken promptly on
+                    // shutdown. The delay is drawn fresh each iteration in
+                    // [7s, 10s) so the sampler's phase cannot lock to any
+                    // event-loop timer grid (#3795). Worst case stays < 10s,
+                    // so abort latency (#3767) does not regress.
                     {
+                        let delay = watchdog_next_sample_delay(&mut sample_rng_state);
                         let (lock, cvar) = &*condvar_thread;
                         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = cvar.wait_timeout(guard, Duration::from_secs(10));
+                        let _ = cvar.wait_timeout(guard, delay);
                     }
 
                     // Check shutdown flag after waking.
@@ -4063,18 +4128,23 @@ impl App {
                             let hb = v.heartbeat();
                             let backlog = v.backlog();
                             if backlog > 0 && hb == last_hb_seen {
-                                stale_hb_ticks += 1;
-                                if stale_hb_ticks >= BACKLOG_STALE_TICKS {
+                                let stuck_since =
+                                    *hb_stuck_since.get_or_insert_with(std::time::Instant::now);
+                                let stuck_for = stuck_since.elapsed();
+                                if backlog_heartbeat_is_stuck(stuck_for, backlog) {
                                     tracing::error!(
                                         backlog,
                                         hb,
-                                        stale_hb_ticks,
+                                        stuck_secs = stuck_for.as_secs(),
                                         "WATCHDOG: scp-verify worker stuck \
                                          (heartbeat not advancing while backlog > 0)"
                                     );
                                 }
                             } else {
-                                stale_hb_ticks = 0;
+                                // Reset on BOTH edges (heartbeat advanced OR
+                                // backlog drained), matching the deployed
+                                // counter's two reset conditions (#3795).
+                                hb_stuck_since = None;
                                 last_hb_seen = hb;
                             }
                         }
@@ -4301,7 +4371,7 @@ pub(crate) fn warn_phase_if_slow(elapsed: std::time::Duration, phase: u64) {
 ///
 /// Pure function that builds the operator hint string with pre-substituted
 /// PID. Extracted from the watchdog loop so the text can be unit-tested
-/// without waiting for the 10-second poll interval or propagating a tracing
+/// without waiting for the sampler's poll interval or propagating a tracing
 /// subscriber across thread boundaries.
 ///
 /// Phase-code legend embedded in the ≥30s WATCHDOG error event.
@@ -4337,6 +4407,158 @@ pub(crate) const WATCHDOG_PHASE_LEGEND: &str = "\
 #[cfg(test)]
 pub(crate) const WATCHDOG_FREEZE_FIELD: &str = "watchdog_freeze";
 
+/// Base of the watchdog sampler's inter-sample delay, in milliseconds
+/// (issue #3795).
+///
+/// The deployed sampler used a fixed 10 s relative period, which is
+/// commensurate with the 60 s / 10 s event-loop timer grid (10 | 60). With
+/// both the sampler and the parking arms anchored to absolute grids, the
+/// sampler's phase relative to park onsets froze on hour-to-day timescales,
+/// making the *effective* WARN/ERROR threshold a fixed value in `[15 s, 25 s)`
+/// instead of the coded 15 s and rendering shorter recovering stalls
+/// deterministically invisible.
+///
+/// The fix draws a fresh delay in `[BASE, BASE + JITTER)` each sample so the
+/// phase performs a random walk against *every* grid, present or future. The
+/// base is also coprime with `{1, 5, 10, 30, 60}` s (see
+/// [`WATCHDOG_SAMPLE_PERIOD_BASE_SECS`]) as belt-and-braces, but the jitter is
+/// the real guarantee — `flood_tx_period` / `flood_demand_period` are
+/// config-derived and cannot be proven coprime with any fixed integer.
+pub(crate) const WATCHDOG_SAMPLE_PERIOD_BASE_MS: u64 = 7_000;
+
+/// Maximum jitter added to [`WATCHDOG_SAMPLE_PERIOD_BASE_MS`] (exclusive
+/// upper bound), in milliseconds (issue #3795). Mean sample period is
+/// `BASE + JITTER/2 = 8.5 s`, so unrecovered-freeze detection latency
+/// strictly improves over the old fixed 10 s.
+pub(crate) const WATCHDOG_SAMPLE_JITTER_MAX_MS: u64 = 3_000;
+
+/// Base sample period in whole seconds — used only for the coprimality
+/// invariant (issue #3795). gcd is *necessary but not sufficient*: it rules
+/// out re-aliasing on a degenerate (zero-jitter) draw against the fixed
+/// timers, but the config-derived flood periods keep jitter load-bearing.
+pub(crate) const WATCHDOG_SAMPLE_PERIOD_BASE_SECS: u64 = 7;
+
+// Worst-case sample delay must stay strictly under 10 s so the auto-abort
+// latency (`should_abort`, issue #3767) cannot regress relative to the old
+// fixed 10 s sampler.
+const _: () = assert!(WATCHDOG_SAMPLE_PERIOD_BASE_MS + WATCHDOG_SAMPLE_JITTER_MAX_MS <= 10_000);
+const _: () = assert!(WATCHDOG_SAMPLE_PERIOD_BASE_MS == WATCHDOG_SAMPLE_PERIOD_BASE_SECS * 1_000);
+
+/// Draw the next watchdog sample delay in `[7 s, 10 s)` and advance `state`
+/// (issue #3795).
+///
+/// Pure `xorshift64*` generator, extracted so its range / determinism /
+/// seed-zero behaviour are unit-testable without a running thread.
+///
+/// **Seed-zero guard (load-bearing):** `xorshift64*` has the all-zero state
+/// as a fixed point — a `0` state would emit `0` forever, collapsing the
+/// delay to a constant base period and re-freezing the phase-lock this jitter
+/// exists to break, in production, while every timing-agnostic test stayed
+/// green. The state is forced non-zero on entry.
+pub(crate) fn watchdog_next_sample_delay(state: &mut u64) -> Duration {
+    if *state == 0 {
+        *state = 0x9E37_79B9_7F4A_7C15;
+    }
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    let rand = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    let jitter = rand % WATCHDOG_SAMPLE_JITTER_MAX_MS;
+    Duration::from_millis(WATCHDOG_SAMPLE_PERIOD_BASE_MS + jitter)
+}
+
+/// Shared WARN-tier staleness threshold (seconds) used by BOTH the sampler
+/// ([`WatchdogSnapshot::tier`]) and the loop-side exact path
+/// ([`event_loop_stall_tier`]) so the two routings can never drift (#3795).
+pub(crate) const EVENT_LOOP_STALL_WARN_SECS: u64 = 15;
+/// Shared ERROR-tier staleness threshold (seconds). See
+/// [`EVENT_LOOP_STALL_WARN_SECS`].
+pub(crate) const EVENT_LOOP_STALL_ERROR_SECS: u64 = 30;
+
+/// Pure tier routing from a raw staleness in whole seconds. The single
+/// source of truth for both tier-routing paths (#3795).
+fn stall_tier_from_secs(stale_secs: u64) -> WatchdogTier {
+    if stale_secs >= EVENT_LOOP_STALL_ERROR_SECS {
+        WatchdogTier::Error
+    } else if stale_secs >= EVENT_LOOP_STALL_WARN_SECS {
+        WatchdogTier::Warn
+    } else {
+        WatchdogTier::None
+    }
+}
+
+/// Loop-side tier routing from an exact inter-tick gap (#3795).
+///
+/// `gap.as_secs()` truncates to whole seconds, matching the sampler's
+/// `stale_secs = elapsed_ms / 1000`, so both paths agree on every boundary
+/// (pinned by `test_event_loop_stall_tier_boundaries`).
+#[inline]
+pub(crate) fn event_loop_stall_tier(gap: Duration) -> WatchdogTier {
+    stall_tier_from_secs(gap.as_secs())
+}
+
+/// Emit the loop-side "exact accounting" stall log line at the given tier
+/// (issue #3795). Extracted from [`App::report_event_loop_stall`] so the
+/// rendered text is unit-testable without constructing an `App`.
+///
+/// This line fires only *after* the event loop has demonstrably resumed, so a
+/// restart is the wrong response. It therefore deliberately carries **neither**
+/// of monitor-tick's auto-restart patterns — no `watchdog_freeze` field and
+/// no `"WATCHDOG: Event loop appears frozen"` text — even at the ERROR tier.
+/// The residual non-monotonicity that leaves in monitor-tick's *restart* rule
+/// (a recovered ≥30 s stall now yields an ERROR line without `watchdog_freeze`)
+/// is tracked in #3815. See `test_loop_side_stall_event_does_not_trip_monitor_restart_grep`.
+pub(crate) fn emit_event_loop_stall(
+    tier: WatchdogTier,
+    stall_ms: u64,
+    stall_secs: u64,
+    phase: u64,
+    phase_sub: u32,
+) {
+    match tier {
+        WatchdogTier::Error => tracing::error!(
+            stall_recovered = true,
+            stall_ms,
+            stall_secs,
+            phase,
+            phase_name = event_loop_phase_name(phase),
+            phase_sub,
+            "Event loop stall (loop-side exact accounting)"
+        ),
+        WatchdogTier::Warn => tracing::warn!(
+            stall_recovered = true,
+            stall_ms,
+            stall_secs,
+            phase,
+            phase_name = event_loop_phase_name(phase),
+            phase_sub,
+            "Event loop stall (loop-side exact accounting)"
+        ),
+        WatchdogTier::None => {}
+    }
+}
+
+/// The SCP-verifier heartbeat must be stuck (with a non-empty backlog) for at
+/// least this long before the watchdog logs (issue #3795).
+///
+/// Re-expressed as an absolute duration — it was `BACKLOG_STALE_TICKS = 3`
+/// consecutive ticks × the old *fixed* 10 s sample period — so it is now
+/// independent of the jittered sample cadence.
+pub(crate) const BACKLOG_STALE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Pure predicate: has the SCP-verifier heartbeat been stuck long enough,
+/// with a non-empty backlog, to warrant a WATCHDOG error (#3795)?
+///
+/// The `backlog == 0` reset edge is handled by the caller (it clears the
+/// stuck-since timestamp), matching the deployed counter's two reset edges
+/// (heartbeat advances *or* backlog drains).
+#[inline]
+pub(crate) fn backlog_heartbeat_is_stuck(stuck_for: Duration, backlog: usize) -> bool {
+    backlog > 0 && stuck_for >= BACKLOG_STALE_WINDOW
+}
+
 /// Which tier of WATCHDOG alert to emit based on event-loop staleness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchdogTier {
@@ -4365,14 +4587,11 @@ pub(crate) struct WatchdogSnapshot {
 
 impl WatchdogSnapshot {
     /// Determine which alert tier this snapshot falls into.
+    ///
+    /// Delegates to [`stall_tier_from_secs`] so the sampler and the loop-side
+    /// exact path share one set of threshold constants (#3795).
     pub(crate) fn tier(&self) -> WatchdogTier {
-        if self.stale_secs >= 30 {
-            WatchdogTier::Error
-        } else if self.stale_secs >= 15 {
-            WatchdogTier::Warn
-        } else {
-            WatchdogTier::None
-        }
+        stall_tier_from_secs(self.stale_secs)
     }
 
     /// Whether the watchdog should abort the process.
@@ -8227,6 +8446,392 @@ mod tests {
         snap.stale_secs = 10;
         assert_eq!(snap.tier(), super::WatchdogTier::None);
         assert!(snap.should_abort(), "abort must fire even below Warn tier");
+    }
+
+    // ------------------------------------------------------------------
+    // Watchdog phase-lock / loop-side exact-accounting tests (issue #3795)
+    //
+    // The sampler's fixed 10 s relative period was commensurate with the
+    // 60 s park grid (10 | 60), so its phase relative to park onsets froze
+    // and the *effective* WARN/ERROR threshold became a fixed value in
+    // [15 s, 25 s) rather than the coded 15 s. These tests pin, purely and
+    // deterministically (no sleeps, no timers, no I/O, no live park):
+    //   1. the jittered sampler has no systematic blind window,
+    //   2. the old fixed-period sampler was blind by construction,
+    //   3. the new loop-side path is complete at BOTH tiers,
+    //   4. the loop-side ERROR line does not trip monitor-tick's restart grep,
+    //   5. the base period is coprime with the event-loop timer set,
+    //   6. the two tier-routing paths agree on the shared constants,
+    //   7. the sample-delay generator's range / determinism / seed-zero guard,
+    //   8. the SCP-verifier backlog window is duration- not tick-based.
+    // ------------------------------------------------------------------
+
+    /// Geometry simulator (test-only): count how many periodic "parks" are
+    /// *detected* at tier threshold `x_s` by a sampler whose inter-sample
+    /// delays come from `next_delay_s`.
+    ///
+    /// Parks start at `phi0_s + period_s * j` and occupy `[s_j, s_j + d_s]`.
+    /// A sample train is the running sum of `next_delay_s()` (relative,
+    /// re-armed — exactly the production shape). Park `j` is detected iff some
+    /// sample lands in `[s_j + x_s, s_j + d_s]`. Both parks and samples are
+    /// monotone, so a single forward index walks the sample train once.
+    ///
+    /// Substituting a constant `|| 10.0` closure reproduces the deployed
+    /// fixed-10 s sampler; substituting `watchdog_next_sample_delay` (as a
+    /// seconds closure) reproduces the fix.
+    fn count_park_detections(
+        period_s: f64,
+        phi0_s: f64,
+        d_s: f64,
+        x_s: f64,
+        num_parks: usize,
+        mut next_delay_s: impl FnMut() -> f64,
+    ) -> usize {
+        let last_park_start = phi0_s + period_s * (num_parks as f64 - 1.0);
+        let horizon = last_park_start + d_s + period_s;
+        let mut samples: Vec<f64> = Vec::new();
+        let mut t = 0.0f64;
+        loop {
+            t += next_delay_s();
+            if t > horizon {
+                break;
+            }
+            samples.push(t);
+        }
+        let mut detected = 0usize;
+        let mut idx = 0usize;
+        for j in 0..num_parks {
+            let s = phi0_s + period_s * j as f64;
+            let lo = s + x_s;
+            let hi = s + d_s;
+            while idx < samples.len() && samples[idx] < lo {
+                idx += 1;
+            }
+            if idx < samples.len() && samples[idx] <= hi {
+                detected += 1;
+            }
+        }
+        detected
+    }
+
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+
+    /// Test 1 (#3795): the jittered production sampler has no systematic
+    /// blind window. For every event-loop timer period and a range of stall
+    /// durations, at least one sample lands in every park's detection window,
+    /// and the aggregate detection rate tracks the analytic
+    /// `min(1, (D-15)/mean_period)` within a generous factor of 3.
+    ///
+    /// **Fails on `origin/main`:** does not compile — the sample period is an
+    /// unnamed inline literal (`Duration::from_secs(10)`), so
+    /// `watchdog_next_sample_delay` / `WATCHDOG_SAMPLE_*` do not exist. Naming
+    /// them is step 1 of the fix. The blind-by-construction number the fix
+    /// removes is pinned separately by test 2.
+    #[test]
+    fn test_watchdog_sampler_has_no_systematic_blind_window() {
+        // Fixed, documented seed. `mean_period` = base + jitter/2 = 8.5 s.
+        const SEED: u64 = 0xDEAD_BEEF_1234_5678;
+        let mean_period = (super::WATCHDOG_SAMPLE_PERIOD_BASE_MS as f64
+            + super::WATCHDOG_SAMPLE_JITTER_MAX_MS as f64 / 2.0)
+            / 1000.0;
+        // Blind residue from the issue: onset (t mod 60) = 5.8.
+        let phi0 = 5.8f64;
+        for period_s in [1.0f64, 5.0, 10.0, 30.0, 60.0] {
+            for d_s in [15.5f64, 16.0, 20.0, 24.9] {
+                // 2000 parks for the low-probability short stalls (per-park
+                // detection ≈ 6 % at D=15.5 and successive samples correlate).
+                let num_parks = if d_s < 17.0 { 2000 } else { 500 };
+                let mut state = SEED;
+                let detected = count_park_detections(period_s, phi0, d_s, 15.0, num_parks, || {
+                    super::watchdog_next_sample_delay(&mut state).as_secs_f64()
+                });
+                assert!(
+                    detected > 0,
+                    "jittered sampler must detect SOME park (P={period_s}, D={d_s}); \
+                     got 0 — the blind window is back"
+                );
+                let rate = detected as f64 / num_parks as f64;
+                let analytic = ((d_s - 15.0) / mean_period).min(1.0);
+                assert!(
+                    rate >= analytic / 3.0 && rate <= (analytic * 3.0).min(1.0) + 1e-9,
+                    "detection rate {rate:.4} not within factor 3 of analytic \
+                     {analytic:.4} (P={period_s}, D={d_s}, detected={detected})"
+                );
+            }
+        }
+    }
+
+    /// Test 2 (#3795): the deployed fixed-10 s sampler is blind by
+    /// construction. Same geometry helper, driven by a constant 10 s delay:
+    /// a 16 s stall at the blind residue is NEVER detected, a 26 s stall
+    /// always is. Documents the exact defect; asserts about a constant
+    /// sequence, so it stays green after the fix.
+    #[test]
+    fn test_fixed_period_sampler_is_blind_by_construction() {
+        // onset residue 5.8, sample residue 0 (samples at 10, 20, 30, …):
+        // the 16 s WARN window [20.8, 21.8] contains no multiple of 10.
+        let blind = count_park_detections(60.0, 5.8, 16.0, 15.0, 200, || 10.0);
+        assert_eq!(
+            blind, 0,
+            "fixed-10s sampler must be blind to a 16s stall at the 60s park grid"
+        );
+        let seen = count_park_detections(60.0, 5.8, 26.0, 15.0, 200, || 10.0);
+        assert_eq!(
+            seen, 200,
+            "fixed-10s sampler must see a 26s stall (window wider than the period)"
+        );
+    }
+
+    /// Test 3 (#3795): the loop-side exact-accounting path is complete at
+    /// BOTH tiers, where the sampler is blind. Geometry chosen so the sampler
+    /// misses the narrow WARN window (D=16) and the narrow ERROR window
+    /// (D=35), while the loop-side path — which measures the exact gap and
+    /// routes it through `event_loop_stall_tier` — catches every park.
+    ///
+    /// **Fails on `origin/main`:** there is no loop-side tier path at all, so
+    /// the recovering D=35 freeze produces no ERROR-tier record whatsoever
+    /// even though the sampler *sees* the stall. This is the sharpest form of
+    /// the finding.
+    #[test]
+    fn test_loop_side_reporting_is_complete_for_both_tiers() {
+        use super::WatchdogTier;
+        // Residue 1.0: WARN window [16,17] and ERROR window [31,36] both miss
+        // the residue-0 samples with no wrap-around (φ mod 10 ∈ (0,5)).
+        let phi0 = 1.0f64;
+
+        // D = 16 s: WARN tier.
+        let sampler_warn_16 = count_park_detections(60.0, phi0, 16.0, 15.0, 200, || 10.0);
+        assert_eq!(sampler_warn_16, 0, "sampler WARN must be blind at D=16");
+        let loop_warn_16 = (0..200)
+            .filter(|_| super::event_loop_stall_tier(Duration::from_secs(16)) == WatchdogTier::Warn)
+            .count();
+        assert_eq!(
+            loop_warn_16, 200,
+            "loop-side WARN must catch every D=16 park"
+        );
+
+        // D = 35 s: WARN window (20 s wide) always fires; ERROR window
+        // (5 s wide) is blind; loop-side catches every ERROR.
+        let sampler_warn_35 = count_park_detections(60.0, phi0, 35.0, 15.0, 200, || 10.0);
+        assert_eq!(
+            sampler_warn_35, 200,
+            "sampler WARN always fires at D=35 (window wider than period)"
+        );
+        let sampler_error_35 = count_park_detections(60.0, phi0, 35.0, 30.0, 200, || 10.0);
+        assert_eq!(sampler_error_35, 0, "sampler ERROR must be blind at D=35");
+        let loop_error_35 = (0..200)
+            .filter(|_| {
+                super::event_loop_stall_tier(Duration::from_secs(35)) == WatchdogTier::Error
+            })
+            .count();
+        assert_eq!(
+            loop_error_35, 200,
+            "loop-side ERROR must catch every recovering D=35 park"
+        );
+    }
+
+    /// Test 4 (#3795): the loop-side ERROR-tier line must NOT trip
+    /// monitor-tick's auto-restart grep — it fires only after the loop has
+    /// demonstrably resumed, so a restart is the wrong action. It carries
+    /// neither the `watchdog_freeze` field nor the "Event loop appears
+    /// frozen" text, while `WatchdogSnapshot::emit_error()` still carries both.
+    #[test]
+    fn test_loop_side_stall_event_does_not_trip_monitor_restart_grep() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        #[derive(Clone)]
+        struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn render(f: impl FnOnce()) -> String {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let buf_clone = buf.clone();
+            let fmt_layer = fmt::layer()
+                .with_writer(move || -> Box<dyn std::io::Write> {
+                    Box::new(BufWriter(buf_clone.clone()))
+                })
+                .with_ansi(false)
+                .with_target(true);
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("error"))
+                .with(fmt_layer);
+            with_default(subscriber, f);
+            let bytes = buf.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+
+        // Loop-side ERROR-tier event: neither restart pattern.
+        let loop_side = render(|| {
+            super::emit_event_loop_stall(super::WatchdogTier::Error, 35_000, 35, 29, 0);
+        });
+        assert!(
+            !loop_side.contains("watchdog_freeze"),
+            "loop-side event must NOT carry the watchdog_freeze field: {loop_side}"
+        );
+        assert!(
+            !loop_side.contains("WATCHDOG: Event loop appears frozen"),
+            "loop-side event must NOT carry the frozen sentinel text: {loop_side}"
+        );
+        assert!(
+            loop_side.contains("Event loop stall (loop-side exact accounting)"),
+            "loop-side event must carry its distinct message: {loop_side}"
+        );
+
+        // The sampler's error path still carries BOTH restart patterns.
+        let snap = test_snapshot(35);
+        let sampler = render(|| snap.emit_error());
+        assert!(
+            sampler.contains("watchdog_freeze"),
+            "sampler emit_error must still carry watchdog_freeze: {sampler}"
+        );
+        assert!(
+            sampler.contains("WATCHDOG: Event loop appears frozen"),
+            "sampler emit_error must still carry the frozen sentinel text: {sampler}"
+        );
+    }
+
+    /// Test 5 (#3795): the base sample period is coprime with every
+    /// event-loop timer period, so a *degenerate* (zero-jitter) draw could
+    /// not re-alias. gcd is necessary but NOT sufficient — the config-derived
+    /// `flood_tx_period` / `flood_demand_period` cannot be proven coprime with
+    /// any fixed integer, which is the recorded reason jitter (test 1/7) is
+    /// the real guarantee.
+    ///
+    /// **Fails on `origin/main`:** the old period is 10, and gcd(10, 60) = 10,
+    /// gcd(10, 10) = 10.
+    #[test]
+    fn test_watchdog_sample_base_period_coprime_with_event_loop_timer_periods() {
+        for p in [1u64, 5, 10, 30, 60] {
+            assert_eq!(
+                gcd(super::WATCHDOG_SAMPLE_PERIOD_BASE_SECS, p),
+                1,
+                "base sample period {} must be coprime with timer period {p}",
+                super::WATCHDOG_SAMPLE_PERIOD_BASE_SECS
+            );
+        }
+    }
+
+    /// Test 6 (#3795): `event_loop_stall_tier` boundaries, and that it agrees
+    /// with `WatchdogSnapshot::tier()` for every integral staleness — so the
+    /// two tier-routing paths cannot drift off the shared constants.
+    #[test]
+    fn test_event_loop_stall_tier_boundaries() {
+        use super::WatchdogTier;
+        assert_eq!(
+            super::event_loop_stall_tier(Duration::from_millis(14_999)),
+            WatchdogTier::None
+        );
+        assert_eq!(
+            super::event_loop_stall_tier(Duration::from_secs(15)),
+            WatchdogTier::Warn
+        );
+        assert_eq!(
+            super::event_loop_stall_tier(Duration::from_millis(29_999)),
+            WatchdogTier::Warn
+        );
+        assert_eq!(
+            super::event_loop_stall_tier(Duration::from_secs(30)),
+            WatchdogTier::Error
+        );
+        for stale_secs in 0..=60u64 {
+            assert_eq!(
+                super::event_loop_stall_tier(Duration::from_secs(stale_secs)),
+                test_snapshot(stale_secs).tier(),
+                "loop-side and sampler tier routing must agree at {stale_secs}s"
+            );
+        }
+    }
+
+    /// Test 7 (#3795): the sample-delay generator's contract — range,
+    /// determinism, divergence, and the xorshift seed-zero footgun (a zero
+    /// state would emit a constant period forever and re-freeze the phase).
+    #[test]
+    fn test_watchdog_sample_delay_range_and_determinism() {
+        let base = super::WATCHDOG_SAMPLE_PERIOD_BASE_MS;
+        let max = super::WATCHDOG_SAMPLE_PERIOD_BASE_MS + super::WATCHDOG_SAMPLE_JITTER_MAX_MS;
+
+        // Range: every delay in [base, base+jitter).
+        let mut s = 0xABCD_1234u64;
+        for _ in 0..10_000 {
+            let ms = super::watchdog_next_sample_delay(&mut s).as_millis() as u64;
+            assert!(
+                ms >= base && ms < max,
+                "delay {ms}ms out of [{base}, {max})"
+            );
+        }
+
+        // Determinism: same seed → same sequence.
+        let mut a = 42u64;
+        let mut b = 42u64;
+        for _ in 0..1000 {
+            assert_eq!(
+                super::watchdog_next_sample_delay(&mut a),
+                super::watchdog_next_sample_delay(&mut b)
+            );
+        }
+
+        // Divergence: two different seeds diverge within a few draws.
+        let mut c = 1u64;
+        let mut d = 2u64;
+        let seq_c: Vec<_> = (0..8)
+            .map(|_| super::watchdog_next_sample_delay(&mut c))
+            .collect();
+        let seq_d: Vec<_> = (0..8)
+            .map(|_| super::watchdog_next_sample_delay(&mut d))
+            .collect();
+        assert_ne!(
+            seq_c, seq_d,
+            "different seeds must produce different sequences"
+        );
+
+        // Seed-zero guard: a 0 state must NOT collapse to a constant period.
+        let mut z = 0u64;
+        let z_seq: Vec<u128> = (0..8)
+            .map(|_| super::watchdog_next_sample_delay(&mut z).as_millis())
+            .collect();
+        assert!(
+            z_seq.iter().any(|&v| v != z_seq[0]),
+            "seed=0 must still vary, not freeze at a constant period: {z_seq:?}"
+        );
+
+        // Worst-case delay stays < 10 s so abort latency cannot regress.
+        assert!(max <= 10_000, "worst-case sample delay must stay <= 10s");
+    }
+
+    /// Test 8 (#3795): the SCP-verifier backlog-stuck window is
+    /// duration-based (30 s absolute), not a count of sample periods — so it
+    /// is independent of the now-jittered sample cadence. Also guards the
+    /// `backlog == 0` short-circuit.
+    #[test]
+    fn test_backlog_stale_window_is_duration_based() {
+        assert!(!super::backlog_heartbeat_is_stuck(
+            Duration::from_secs(29),
+            5
+        ));
+        assert!(super::backlog_heartbeat_is_stuck(
+            Duration::from_secs(30),
+            5
+        ));
+        assert!(!super::backlog_heartbeat_is_stuck(
+            Duration::from_secs(999),
+            0
+        ));
+        assert_eq!(super::BACKLOG_STALE_WINDOW, Duration::from_secs(30));
     }
 
     /// Test B: `emit_warn()` emits a WARN event with the correct fields
