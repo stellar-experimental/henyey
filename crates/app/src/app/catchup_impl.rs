@@ -2891,7 +2891,10 @@ impl App {
                     self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
                     // Continue to the shared restore/cooldown tail below (do NOT
                     // wipe). The next catchup will be archive-authoritative.
-                    self.restore_operational_state().await;
+                    // Failed catchup: restore AppState only — extension
+                    // readiness stays false until a catchup succeeds or a
+                    // live ledger closes.
+                    self.restore_app_state_without_readiness().await;
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     if reset_stuck_state {
                         if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
@@ -2933,7 +2936,10 @@ impl App {
                          genesis) would still wipe here."
                     );
                     self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
-                    self.restore_operational_state().await;
+                    // Failed catchup: restore AppState only — extension
+                    // readiness stays false until a catchup succeeds or a
+                    // live ledger closes.
+                    self.restore_app_state_without_readiness().await;
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     if reset_stuck_state {
                         if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
@@ -2979,11 +2985,14 @@ impl App {
                         self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
                     }
                 }
-                // Restore operational state so the node can continue
-                // participating in consensus. Without this, the node stays
-                // permanently stuck in CatchingUp after a failed catchup
-                // (e.g., archive checkpoint not yet published).
-                self.restore_operational_state().await;
+                // Restore the AppState so the node can continue participating
+                // in consensus. Without this, the node stays permanently stuck
+                // in CatchingUp after a failed catchup (e.g., archive
+                // checkpoint not yet published). Extension readiness is NOT
+                // signalled — the catchup failed, so the ledger is stale;
+                // readiness returns on a successful catchup or the first
+                // successful live ledger close.
+                self.restore_app_state_without_readiness().await;
                 // Apply cooldown after failed catchup to prevent rapid-fire retries.
                 // Without this, a failed catchup (e.g., archive checkpoint not yet
                 // published) would re-trigger immediately on the next tick because

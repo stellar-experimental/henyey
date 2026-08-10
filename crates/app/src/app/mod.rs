@@ -586,6 +586,19 @@ pub struct App {
 
     /// Current application state.
     state: RwLock<AppState>,
+    /// Extension readiness flag: `true` only while the node is in an
+    /// operational state (`Synced`/`Validating`) with real, current ledger
+    /// state. See [`App::operational_readiness`] for scope and caveats.
+    operational: Arc<AtomicBool>,
+    /// Monotonic counter bumped (under `operational_transition`'s write side)
+    /// on every operational-state transition. Lifecycle-coarse only — NOT
+    /// bumped by ledger closes.
+    operational_generation: Arc<AtomicU64>,
+    /// Transition barrier: lifecycle transitions hold the write side while
+    /// updating `operational` + `operational_generation`; extensions hold the
+    /// read side to re-check flag + generation atomically. Lock order:
+    /// always acquired BEFORE the `state` lock (see [`App::set_state`]).
+    operational_transition: Arc<tokio::sync::RwLock<()>>,
 
     /// Database connection.
     db: henyey_db::Database,
@@ -646,8 +659,8 @@ pub struct App {
     /// Shutdown signal sender.
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 
-    /// Shutdown signal receiver.
-    _shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    /// Receiver created with the channel so shutdowns sent before `run()` are retained.
+    initial_shutdown_rx: tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<()>>>,
 
     /// Channel for outbound SCP envelopes.
     scp_envelope_tx: tokio::sync::mpsc::Sender<ScpEnvelope>,
@@ -1580,6 +1593,9 @@ impl App {
             clock,
             overlay_connection_factory,
             state: RwLock::new(AppState::Initializing),
+            operational: Arc::new(AtomicBool::new(false)),
+            operational_generation: Arc::new(AtomicU64::new(0)),
+            operational_transition: Arc::new(tokio::sync::RwLock::new(())),
             db,
             _db_lock: Some(db_lock),
             keypair,
@@ -1593,7 +1609,7 @@ impl App {
             pre_bound_listener: std::sync::Mutex::new(None),
             herder,
             shutdown_tx,
-            _shutdown_rx: shutdown_rx,
+            initial_shutdown_rx: tokio::sync::Mutex::new(Some(shutdown_rx)),
             scp_envelope_tx,
             scp_envelope_rx: TokioMutex::new(scp_envelope_rx),
             last_processed_slot: RwLock::new(0),
@@ -2046,25 +2062,158 @@ impl App {
         *self.state.read().await
     }
 
+    /// Return the operational signal, transition generation, and transition
+    /// barrier for in-process extensions.
+    ///
+    /// # Scope: lifecycle-coarse only
+    ///
+    /// The flag, generation, and barrier synchronize **operational-state
+    /// transitions** (entering/leaving `Synced`/`Validating`) and nothing
+    /// finer. The ledger-close pipeline mutates committed ledger state
+    /// **without** touching the barrier or bumping the generation, so holding
+    /// the barrier's read side and re-checking flag + generation gives **no
+    /// per-ledger snapshot consistency** — the ledger can advance (or be
+    /// mid-close) at any point while the guard is held. Consumers that need
+    /// ledger-consistent reads must use the committed-snapshot API
+    /// ([`BucketSnapshotManager`] via the query-server read path) instead.
+    ///
+    /// What the recheck protocol does guarantee: lifecycle transitions take
+    /// the barrier's write side and update flag + generation while holding it
+    /// exclusively, so while an extension holds the read side no transition
+    /// can complete. Re-reading flag + generation under the guard therefore
+    /// atomically confirms "the node was still operational and no lifecycle
+    /// transition raced my work" before committing derived state.
+    pub fn operational_readiness(
+        &self,
+    ) -> (
+        Arc<AtomicBool>,
+        Arc<AtomicU64>,
+        Arc<tokio::sync::RwLock<()>>,
+    ) {
+        (
+            Arc::clone(&self.operational),
+            Arc::clone(&self.operational_generation),
+            Arc::clone(&self.operational_transition),
+        )
+    }
+
     /// Set the application state.
+    ///
+    /// # Lock order: barrier, then state
+    ///
+    /// The operational-transition barrier is acquired **before** the state
+    /// write lock. Extensions may hold the barrier's read side while calling
+    /// [`App::state`] (or any other state reader, e.g. the HTTP `/status`
+    /// handler); if a transition took the state write lock first and then
+    /// awaited the barrier, a reader queued behind the writer on the state
+    /// lock would deadlock the main event loop (ABBA). With barrier-first
+    /// ordering, state readers never block on a transition that is itself
+    /// blocked on the barrier.
     pub(crate) async fn set_state(&self, state: AppState) {
+        self.set_state_with_readiness(state, true).await;
+    }
+
+    /// Set the application state, optionally suppressing the extension
+    /// readiness signal for operational states.
+    ///
+    /// With `signal_ready == false`, a transition into `Synced`/`Validating`
+    /// still updates [`AppState`] (keeping consensus/retry machinery alive)
+    /// but leaves `operational == false` — used when the node's ledger state
+    /// is stale or absent (see [`App::restore_app_state_without_readiness`]).
+    ///
+    /// Flag and generation updates happen while the barrier is held
+    /// exclusively, so a consumer holding the barrier's read side always
+    /// observes a consistent flag + generation pair.
+    async fn set_state_with_readiness(&self, state: AppState, signal_ready: bool) {
+        // Barrier FIRST, then state — see the lock-order note on `set_state`.
+        let _transition = self.operational_transition.write().await;
         let mut current = self.state.write().await;
-        if *current != state {
-            tracing::info!(from = %*current, to = %state, "State transition");
+        // Re-check under both locks: another transition may have run between
+        // a caller's decision and this acquisition.
+        if *current == state {
+            return;
+        }
+        tracing::info!(from = %*current, to = %state, "State transition");
+        let is_operational =
+            signal_ready && matches!(state, AppState::Synced | AppState::Validating);
+        if !is_operational {
+            self.operational_generation.fetch_add(1, Ordering::AcqRel);
+            self.operational.store(false, Ordering::Release);
             *current = state;
+        } else {
+            *current = state;
+            self.operational_generation.fetch_add(1, Ordering::AcqRel);
+            self.operational.store(true, Ordering::Release);
+        }
+    }
+
+    /// One-shot extension readiness recovery after a successful **live**
+    /// ledger close.
+    ///
+    /// A node can sit in an operational [`AppState`] with the extension
+    /// readiness flag still `false`: a no-state watcher at startup, or a node
+    /// whose failed catchup restored the state without signalling readiness
+    /// (see [`App::restore_app_state_without_readiness`]). A freshly closed
+    /// live ledger proves the node is current, so publish readiness now.
+    ///
+    /// Cheap in steady state: a single atomic load; the barrier is only taken
+    /// when the flag is actually `false`. This deliberately does NOT wire the
+    /// generation into every ledger close — it fires at most once per
+    /// non-operational episode.
+    pub(crate) async fn signal_operational_after_live_close(&self) {
+        if self.operational.load(Ordering::Acquire) {
+            return;
+        }
+        // Same lock order as `set_state_with_readiness`: barrier, then state.
+        let _transition = self.operational_transition.write().await;
+        let current = *self.state.read().await;
+        if matches!(current, AppState::Synced | AppState::Validating)
+            && !self.operational.load(Ordering::Acquire)
+        {
+            self.operational_generation.fetch_add(1, Ordering::AcqRel);
+            self.operational.store(true, Ordering::Release);
+            tracing::info!(
+                state = %current,
+                "Extension readiness signalled after live ledger close"
+            );
         }
     }
 
     /// Transition to `Validating` (if validator) or `Synced` (if watcher).
     ///
-    /// Used after catchup completes, fails, or is skipped to leave the
-    /// `CatchingUp` state and resume normal operation.
+    /// Used after catchup completes or is skipped-as-no-op to leave the
+    /// `CatchingUp` state and resume normal operation. Signals extension
+    /// readiness (`operational = true`). For FAILED catchups use
+    /// [`App::restore_app_state_without_readiness`] instead.
     pub(crate) async fn restore_operational_state(&self) {
-        if self.is_validator {
-            self.set_state(AppState::Validating).await;
+        self.restore_operational_state_inner(true).await;
+    }
+
+    /// Same as [`App::restore_operational_state`] but does **not** signal
+    /// extension readiness: `operational` stays `false` and no
+    /// readiness-signalling generation is published.
+    ///
+    /// Used when [`AppState`] must return to `Synced`/`Validating` to keep the
+    /// consensus/retry machinery alive even though the node's ledger state is
+    /// stale or absent, so an extension acting on it would be wrong:
+    /// - after a FAILED catchup (retry loop must continue);
+    /// - at startup for a no-state watcher (`ledger_seq == 0`, uninitialized
+    ///   ledger manager).
+    ///
+    /// Readiness is signalled later by a successful catchup
+    /// ([`App::restore_operational_state`]) or the first successful live
+    /// ledger close ([`App::signal_operational_after_live_close`]).
+    pub(crate) async fn restore_app_state_without_readiness(&self) {
+        self.restore_operational_state_inner(false).await;
+    }
+
+    async fn restore_operational_state_inner(&self, signal_ready: bool) {
+        let target = if self.is_validator {
+            AppState::Validating
         } else {
-            self.set_state(AppState::Synced).await;
-        }
+            AppState::Synced
+        };
+        self.set_state_with_readiness(target, signal_ready).await;
         // Post-catchup warm-up hook (#3232): the cold catchup-apply path skips
         // the per-entry account/bucket warm cache to flatten the catchup anon-RSS
         // peak. Now that the node has left CatchingUp and is operational, warm the
@@ -4821,6 +4970,186 @@ mod tests {
 
         let app = App::new(config).await.unwrap();
         assert_eq!(app.state().await, AppState::Initializing);
+        let (operational, generation, transition) = app.operational_readiness();
+        assert!(!operational.load(Ordering::Acquire));
+        let initial_generation = generation.load(Ordering::Acquire);
+        let commit_guard = transition.read_owned().await;
+        let state_transition = app.set_state(AppState::Synced);
+        tokio::pin!(state_transition);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut state_transition)
+                .await
+                .is_err()
+        );
+        drop(commit_guard);
+        state_transition.await;
+        assert!(operational.load(Ordering::Acquire));
+        assert!(generation.load(Ordering::Acquire) > initial_generation);
+        app.set_state(AppState::CatchingUp).await;
+        assert!(!operational.load(Ordering::Acquire));
+
+        app.shutdown();
+        let mut shutdown_rx = app.take_initial_shutdown_receiver().await;
+        tokio::time::timeout(Duration::from_millis(10), shutdown_rx.recv())
+            .await
+            .expect("shutdown sent before main-loop startup must be retained")
+            .unwrap();
+    }
+
+    /// Lock-order regression test (ABBA deadlock): an extension holding the
+    /// readiness barrier's read side must be able to read `App::state()`
+    /// while a state transition is blocked on the barrier. With the buggy
+    /// order (state write lock taken first, then the barrier awaited), the
+    /// queued state writer would block the reader forever.
+    #[tokio::test]
+    async fn test_state_reader_does_not_deadlock_while_transition_blocked_on_barrier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = Arc::new(App::new(config).await.unwrap());
+
+        let (_operational, _generation, transition) = app.operational_readiness();
+        let commit_guard = transition.read_owned().await;
+
+        // Start a state transition; it must park on the barrier write lock.
+        let transition_task = {
+            let app = Arc::clone(&app);
+            tokio::spawn(async move {
+                app.set_state(AppState::Synced).await;
+            })
+        };
+        // Give the spawned transition a chance to reach the barrier await.
+        tokio::task::yield_now().await;
+
+        // The state reader must complete even though a transition is pending.
+        let state = tokio::time::timeout(Duration::from_secs(1), app.state())
+            .await
+            .expect("App::state() deadlocked while set_state awaited the barrier");
+        assert_eq!(state, AppState::Initializing);
+
+        drop(commit_guard);
+        tokio::time::timeout(Duration::from_secs(1), transition_task)
+            .await
+            .expect("set_state never completed after the barrier guard was dropped")
+            .unwrap();
+        assert_eq!(app.state().await, AppState::Synced);
+    }
+
+    /// A second take of the initial shutdown receiver (e.g. a NodeRunner
+    /// embedding retrying `App::run`) must fall back to a fresh subscription
+    /// instead of panicking.
+    #[tokio::test]
+    async fn test_second_take_of_initial_shutdown_receiver_falls_back_without_panic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let _first = app.take_initial_shutdown_receiver().await;
+        // Must not panic.
+        let mut second = app.take_initial_shutdown_receiver().await;
+        // The fallback receiver is live: it observes signals sent after it
+        // was subscribed.
+        app.shutdown();
+        tokio::time::timeout(Duration::from_millis(100), second.recv())
+            .await
+            .expect("fallback shutdown receiver must observe post-subscribe signals")
+            .unwrap();
+    }
+
+    /// A failed catchup restores the AppState (consensus retry must continue)
+    /// WITHOUT signalling extension readiness. Readiness returns via a
+    /// successful catchup (`restore_operational_state`) or the first
+    /// successful live ledger close (`signal_operational_after_live_close`).
+    #[tokio::test]
+    async fn test_readiness_stays_false_when_app_state_restored_without_readiness() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let (operational, generation, _transition) = app.operational_readiness();
+
+        // Enter catchup, then simulate the failed-catchup restore path.
+        app.set_state(AppState::CatchingUp).await;
+        assert!(!operational.load(Ordering::Acquire));
+        let generation_before = generation.load(Ordering::Acquire);
+
+        app.restore_app_state_without_readiness().await;
+        assert_eq!(
+            app.state().await,
+            AppState::Synced,
+            "AppState must be restored so the consensus retry loop stays alive"
+        );
+        assert!(
+            !operational.load(Ordering::Acquire),
+            "extension readiness must stay false after a failed catchup"
+        );
+        assert!(
+            generation.load(Ordering::Acquire) > generation_before,
+            "the transition must still invalidate in-flight extension rechecks"
+        );
+
+        // A successful live ledger close signals readiness (one-shot).
+        let generation_before_close = generation.load(Ordering::Acquire);
+        app.signal_operational_after_live_close().await;
+        assert!(
+            operational.load(Ordering::Acquire),
+            "a live close on an operational AppState must publish readiness"
+        );
+        assert!(generation.load(Ordering::Acquire) > generation_before_close);
+
+        // Steady state: subsequent closes are a no-op (no generation churn).
+        let generation_steady = generation.load(Ordering::Acquire);
+        app.signal_operational_after_live_close().await;
+        assert_eq!(generation.load(Ordering::Acquire), generation_steady);
+    }
+
+    /// `signal_operational_after_live_close` must NOT publish readiness while
+    /// the node is still catching up — only operational AppStates qualify.
+    #[tokio::test]
+    async fn test_live_close_signal_does_not_mark_catching_up_node_operational() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let (operational, _generation, _transition) = app.operational_readiness();
+
+        app.set_state(AppState::CatchingUp).await;
+        app.signal_operational_after_live_close().await;
+        assert!(
+            !operational.load(Ordering::Acquire),
+            "a buffered close during CatchingUp must not signal readiness"
+        );
+    }
+
+    /// A successful catchup (restore_operational_state) still signals
+    /// readiness — the decoupled failure path must not regress the success
+    /// path.
+    #[tokio::test]
+    async fn test_successful_catchup_restore_signals_readiness() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let (operational, _generation, _transition) = app.operational_readiness();
+
+        app.set_state(AppState::CatchingUp).await;
+        app.restore_operational_state().await;
+        assert_eq!(app.state().await, AppState::Synced);
+        assert!(
+            operational.load(Ordering::Acquire),
+            "a successful catchup must signal extension readiness"
+        );
     }
 
     #[tokio::test]

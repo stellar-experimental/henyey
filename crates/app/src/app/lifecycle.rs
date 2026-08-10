@@ -376,8 +376,17 @@ impl App {
         self.clock.sleep(Duration::from_millis(500)).await;
         self.request_scp_state_and_record().await;
 
-        // Set state based on validator mode
-        self.restore_operational_state().await;
+        // Set state based on validator mode. Gate the extension readiness
+        // signal the same way as `overlay.set_synced` and query readiness
+        // above: a no-state node (ledger_seq == 0, uninitialized ledger
+        // manager) must not be reported operational to extensions — it has no
+        // ledger state to act on. Readiness arrives with the first successful
+        // catchup or live ledger close.
+        if self.ledger_manager.is_initialized() && ledger_seq > 0 {
+            self.restore_operational_state().await;
+        } else {
+            self.restore_app_state_without_readiness().await;
+        }
 
         // Start sync recovery tracking to enable the consensus stuck timer
         self.start_sync_recovery_tracking();
@@ -485,7 +494,7 @@ impl App {
         });
 
         // Main run loop
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut shutdown_rx = self.take_initial_shutdown_receiver().await;
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -586,7 +595,7 @@ impl App {
         }
 
         // Cold-start arm of the event-driven consensus trigger (#2702). Runs
-        // after restore_operational_state() (which set herder tracking state)
+        // after the operational-state restore above (which set herder tracking state)
         // and after the pre-loop process_externalized_slots(), so by now a
         // tracking validator has a stable LCL to schedule the next ledger from.
         // Self-gates on is_tracking()/manual_close; if not yet tracking, it is a
@@ -922,8 +931,11 @@ impl App {
                                 );
                                 pending.task_handle.abort();
                             }
-                            // Restore operational state after failed catchup
-                            self.restore_operational_state().await;
+                            // Restore AppState after the failed (panicked /
+                            // cancelled) catchup — extension readiness stays
+                            // false until a catchup succeeds or a live ledger
+                            // closes.
+                            self.restore_app_state_without_readiness().await;
                         }
                     }
 
@@ -2309,6 +2321,16 @@ impl App {
     }
 
     /// Signal the application to shut down.
+    ///
+    /// # Deferred effect before/during startup
+    ///
+    /// The signal only takes effect when the main event loop's `select`
+    /// observes it. A shutdown requested before [`App::run`] starts is
+    /// retained (the initial broadcast receiver is created together with the
+    /// channel), and one requested while startup catchup is still running is
+    /// likewise buffered — but in both cases it is honored only at the first
+    /// main-loop select iteration. In-flight startup/catchup work is not
+    /// interrupted by this call.
     pub fn shutdown(&self) {
         tracing::info!("Shutdown requested");
         let _ = self.shutdown_tx.send(());
@@ -2393,6 +2415,27 @@ impl App {
     /// Subscribe to shutdown notifications.
     pub fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
+    }
+
+    /// Take the shutdown receiver created together with the channel, so a
+    /// shutdown signalled before `App::run` starts is retained and honored.
+    ///
+    /// Only the first call gets the pre-run receiver. Subsequent calls (e.g.
+    /// a `NodeRunner` embedding that retries `run()` after a transient error)
+    /// fall back to a fresh subscription: signals sent before the fallback
+    /// subscribe are lost, matching plain `subscribe_shutdown` semantics.
+    pub(super) async fn take_initial_shutdown_receiver(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<()> {
+        match self.initial_shutdown_rx.lock().await.take() {
+            Some(rx) => rx,
+            None => {
+                tracing::debug!(
+                    "Initial shutdown receiver already taken; subscribing a fresh receiver"
+                );
+                self.shutdown_tx.subscribe()
+            }
+        }
     }
 
     /// Drain the close pipeline on shutdown.

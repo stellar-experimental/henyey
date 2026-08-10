@@ -34,6 +34,7 @@ flowchart TD
 | `AppState` | Node lifecycle state: `Initializing`, `CatchingUp`, `Synced`, `Validating`, or `ShuttingDown`. |
 | `RunMode` | Run behavior for `run_node`: full node, validator, or watcher. |
 | `RunOptions` | Startup options controlling catchup forcing, sync wait behavior, and extra server spawning. |
+| `App::operational_readiness` | Shared operational flag, monotonic transition generation, and read/write barrier letting in-process extensions track lifecycle (operational-state) transitions. Lifecycle-coarse only — gives no per-ledger snapshot consistency. |
 | `CatchupOptions` | CLI-style catchup target and replay mode selection for `run_catchup`. |
 | `CatchupMode` | History replay depth: minimal, recent, or complete. |
 | `NodeRunner` | Convenience wrapper around `App` for embedding the run loop in tests or binaries. |
@@ -156,6 +157,32 @@ assert!(!config.network.passphrase.is_empty());
 Buffered ledger application is intentionally interleaved with the main event loop rather than drained in one long synchronous pass. This keeps SCP and tx-set traffic flowing while the node catches up to live consensus and avoids the catchup/drain/fall-behind loop that occurs if peer caches are allowed to age out mid-drain.
 
 Metadata streaming has asymmetric failure semantics: writes to the configured main output stream are fatal and abort the node, while rotating debug stream failures are logged and ignored. This mirrors the requirement that primary ingestion output must never be silently dropped.
+
+In-process extensions spawned through `RunOptions::extra_server_spawner` can use
+`App::operational_readiness` to coordinate work with catchup and loss-of-sync
+transitions. The signal is **lifecycle-coarse only**: the flag, generation, and
+barrier synchronize operational **state transitions** (entering/leaving
+`Synced`/`Validating`) and nothing finer. The generation changes on every such
+boundary, and lifecycle transitions take the barrier's write side while updating
+the flag and generation, so an extension holding the read side can atomically
+recheck flag + generation before committing derived state and know no lifecycle
+transition raced it. The barrier does **not** synchronize the ledger-close
+pipeline: ledgers close and committed state advances without touching the
+barrier or bumping the generation, so the recheck protocol gives **no
+per-ledger snapshot consistency** — the ledger can advance at any time while
+the read guard is held. Extensions that need ledger-consistent reads must use
+the committed-snapshot API (the `BucketSnapshotManager` read path that backs
+the query server) rather than the readiness barrier. The flag is also gated on
+real ledger state: a no-state watcher at startup, or a node whose catchup just
+failed, keeps `operational == false` (even though its `AppState` is
+`Synced`/`Validating` to keep consensus retry alive) until a catchup succeeds
+or a live ledger closes. This is internal extension plumbing and does not
+change Stellar's observable protocol behavior.
+
+`App::shutdown` has deferred-effect semantics: a shutdown requested before
+`App::run` starts (retained via the initial broadcast receiver) or while
+startup catchup is still running is only honored at the first main-loop
+`select` iteration — in-flight startup/catchup work is not interrupted.
 
 ### Catchup Crash Recovery (§14.5 parity)
 

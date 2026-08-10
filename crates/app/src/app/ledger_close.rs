@@ -3142,6 +3142,13 @@ impl App {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
 
+        // Signal extension readiness if it was deferred (no-state startup or
+        // a failed catchup restored the AppState without signalling): a
+        // successful live close proves the node is current. Steady-state
+        // cost is a single atomic load — the barrier is not touched once the
+        // flag is set.
+        self.signal_operational_after_live_close().await;
+
         // Clean up stale pending tx_set requests for slots we've now closed.
         // This prevents stale requests (from old SCP state responses) from
         // lingering and causing timeout → DontHave → recovery loops.

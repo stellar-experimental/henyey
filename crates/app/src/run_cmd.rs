@@ -419,11 +419,8 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         match app.load_last_known_ledger().await {
             Ok(RestoreResult::Restored) => {
                 let info = app.ledger_info();
-                tracing::info!(
-                    lcl_seq = info.ledger_seq,
-                    "Restored state from disk, skipping full catchup"
-                );
-                app.set_state(AppState::Synced).await;
+                tracing::info!(lcl_seq = info.ledger_seq, "Restored state from disk");
+                // Remain Initializing until catchup policy has been evaluated.
             }
             Ok(RestoreResult::NoState) => {
                 tracing::debug!("No persisted state available, will check catchup");
@@ -578,23 +575,42 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
 
 /// Check if the node needs to catch up.
 async fn check_needs_catchup(app: &App, options: &RunOptions) -> anyhow::Result<bool> {
-    if options.force_catchup {
-        return Ok(true);
-    }
-
-    let current_state = app.state().await;
-    if current_state == AppState::Initializing {
-        return Ok(true);
-    }
-
-    let close_time = app.ledger_info().close_time;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let target_close_time = app.target_ledger_close_duration().as_secs();
     let max_age_seconds = target_close_time.saturating_mul(options.max_ledger_age as u64);
-    Ok(is_ledger_too_old(close_time, now, max_age_seconds))
+    let info = app.ledger_info();
+    Ok(needs_catchup(
+        options.force_catchup,
+        info.ledger_seq,
+        info.close_time,
+        now,
+        max_age_seconds,
+    ))
+}
+
+/// Pure catchup-need predicate behind [`check_needs_catchup`].
+///
+/// A node with no ledger state at all (`ledger_seq == 0`, e.g. a fresh or
+/// no-state start) always needs catchup — this is deliberately independent of
+/// `AppState`, which stays `Initializing` until the catchup policy has been
+/// evaluated.
+fn needs_catchup(
+    force_catchup: bool,
+    ledger_seq: u32,
+    close_time: u64,
+    now: u64,
+    max_age_seconds: u64,
+) -> bool {
+    if force_catchup {
+        return true;
+    }
+    if ledger_seq == 0 {
+        return true;
+    }
+    is_ledger_too_old(close_time, now, max_age_seconds)
 }
 
 fn is_ledger_too_old(close_time: u64, now: u64, max_age_seconds: u64) -> bool {
@@ -824,5 +840,30 @@ mod tests {
         assert!(!is_ledger_too_old(100, 105, 10));
         assert!(is_ledger_too_old(100, 111, 10));
         assert!(!is_ledger_too_old(100, 1000, 0));
+    }
+
+    #[test]
+    fn test_needs_catchup_when_ledger_seq_zero() {
+        // A node with no ledger state must always catch up, even with a
+        // recent close time and no force flag.
+        assert!(needs_catchup(false, 0, 100, 100, 10));
+        assert!(needs_catchup(false, 0, 0, 100, 10));
+    }
+
+    #[test]
+    fn test_needs_catchup_ledger_seq_nonzero_uses_age() {
+        // Fresh ledger within max age: no catchup.
+        assert!(!needs_catchup(false, 42, 100, 105, 10));
+        // Stale ledger beyond max age: catchup.
+        assert!(needs_catchup(false, 42, 100, 111, 10));
+        // Zero close time is treated as unknown → catchup.
+        assert!(needs_catchup(false, 42, 0, 111, 10));
+        // max_age_seconds == 0 disables the age check.
+        assert!(!needs_catchup(false, 42, 100, 1000, 0));
+    }
+
+    #[test]
+    fn test_needs_catchup_force_flag_wins() {
+        assert!(needs_catchup(true, 42, 100, 105, 10));
     }
 }
