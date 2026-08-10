@@ -5,6 +5,10 @@
 **Overall Parity**: 97%
 **Last Updated**: 2026-05-19
 
+`OfferStore` immutable bases and private mutation overlays are internal execution
+plumbing. They preserve the same offer ordering, metadata, liability updates,
+and transaction result surface as the canonical owned store.
+
 ## Summary
 
 | Area | Status | Notes |

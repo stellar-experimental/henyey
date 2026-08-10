@@ -83,6 +83,7 @@ use henyey_bucket::HotArchiveBucketList;
 mod account_loading;
 mod apply;
 mod config;
+mod isolated_simulation;
 mod meta;
 mod preconditions;
 mod result_mapping;
@@ -93,6 +94,11 @@ pub(crate) use config::{compute_soroban_resource_fee, require_config};
 pub use config::{
     load_config_setting, load_frozen_key_config, load_soroban_config, load_soroban_network_info,
     require_soroban_config,
+};
+pub use isolated_simulation::{
+    simulate_classic_transaction, IsolatedClassicSimulation, IsolatedClassicSimulationBase,
+    IsolatedClassicSimulationError, IsolatedClassicSimulationRequest,
+    IsolatedClassicSimulationStats, NetLedgerChange,
 };
 pub use result_mapping::build_tx_result_pair;
 pub(crate) use tx_set::pre_deduct_all_fees_on_delta;

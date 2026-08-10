@@ -1,6 +1,6 @@
 //! Offer exchange math helpers (v10+).
 
-use stellar_xdr::{AccountId, Asset, ClaimAtom, Price};
+use stellar_xdr::{AccountId, Asset, ClaimAtom, OfferEntry, Price};
 
 use crate::frozen_keys::FrozenKeyConfig;
 use crate::state::LedgerStateManager;
@@ -201,6 +201,25 @@ pub fn adjust_offer_amount(
     Ok(res.num_wheat_received)
 }
 
+/// Quote crossing one offer with a fixed maximum input without mutating ledger state.
+pub fn quote_offer_strict_send(
+    offer: &OfferEntry,
+    max_send: i64,
+) -> Result<ExchangeResult, ExchangeError> {
+    if offer.amount <= 0 || max_send < 0 {
+        return Err(ExchangeError::InvalidAmount);
+    }
+    let adjusted = adjust_offer_amount(offer.price.clone(), offer.amount, i64::MAX)?;
+    exchange_v10(
+        offer.price.clone(),
+        adjusted,
+        i64::MAX,
+        max_send,
+        i64::MAX,
+        RoundingType::PathPaymentStrictSend,
+    )
+}
+
 pub(crate) fn exchange_v10(
     price: Price,
     max_wheat_send: i64,
@@ -274,6 +293,29 @@ mod tests {
 
         assert_eq!(result.num_wheat_received, 100);
         assert_eq!(result.num_sheep_send, 100);
+    }
+
+    #[test]
+    fn test_quote_offer_strict_send_is_bounded_by_offer_and_input() {
+        use stellar_xdr::{AccountId, Asset, OfferEntry, OfferEntryExt, PublicKey, Uint256};
+
+        let offer = OfferEntry {
+            seller_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+            offer_id: 1,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 7,
+            price: Price { n: 2, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        let partial = quote_offer_strict_send(&offer, 4).unwrap();
+        assert_eq!(partial.num_sheep_send, 4);
+        assert_eq!(partial.num_wheat_received, 2);
+
+        let exhausted = quote_offer_strict_send(&offer, 100).unwrap();
+        assert_eq!(exhausted.num_wheat_received, 7);
+        assert_eq!(exhausted.num_sheep_send, 14);
     }
 
     /// Test exchange with 2:1 price (2 sheep for 1 wheat).
