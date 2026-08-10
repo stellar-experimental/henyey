@@ -10,7 +10,7 @@ use crate::metrics::refresh_gauges;
 pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     refresh_gauges(&state).await;
     let body = match &state.prometheus_handle {
-        Some(handle) => handle.render(),
+        Some(handle) => sort_prometheus_families(&handle.render()),
         None => "# metrics recorder not installed\n".to_string(),
     };
     (
@@ -18,6 +18,165 @@ pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> im
         [("content-type", "text/plain; version=0.0.4")],
         body,
     )
+}
+
+/// Normalise `metrics-exporter-prometheus`'s rendered scrape into a byte-stable
+/// form for a fixed metric set.
+///
+/// `PrometheusHandle::render()` walks freshly-allocated, randomly-seeded
+/// `HashMap`s, so the *order* of families — and of label-set lines within a
+/// family — varies both across restarts and within a single process's lifetime
+/// (each `render()` builds new maps with a new `RandomState`). The series set,
+/// names, labels, values and types are all deterministic; only line order
+/// churns. That churn silently breaks positional consumers of the scrape (line
+/// diffs, `awk '{print $2}'` one-liners, archived-snapshot diffs). Prometheus
+/// itself does not care about ordering, so this is purely for consumer sanity.
+///
+/// The theoretical root fix is an ordering knob in the exporter (or sorting
+/// inside its recorder); `metrics-exporter-prometheus` 0.18 exposes neither, and
+/// an upstream PR / fork was deliberately declined as disproportionate for a
+/// low-severity observability nit. Post-processing the rendered text here is the
+/// chosen fix — do not re-litigate this without new upstream support.
+///
+/// Transform:
+/// - Family blocks (`# HELP`/`# TYPE` header lines, then metric lines, then a
+///   blank separator) are **stable**-sorted by family name.
+/// - Within each `counter`/`gauge` block, metric lines are stable-sorted by the
+///   whole line. This is value-independent: for two distinct series identities
+///   the byte comparison always resolves inside the identity (they differ
+///   before the value, or one identity is a strict prefix of the other and the
+///   shorter side compares `' '` against a non-space identity byte).
+/// - `histogram`/`summary` blocks keep their emitted line order — buckets are
+///   emitted in increasing `le` with `+Inf` last, then `_sum`, then `_count`,
+///   which lexicographic sorting would scramble (`+Inf` sorts before `0`). That
+///   order is already deterministic within a process.
+///
+/// The line multiset is preserved exactly (nothing dropped, duplicated, or
+/// synthesised), output framing matches the exporter's, and the function is
+/// idempotent — a byte-for-byte no-op on already-sorted input.
+fn sort_prometheus_families(rendered: &str) -> String {
+    struct Block {
+        name: String,
+        header: Vec<String>,
+        metrics: Vec<String>,
+        sortable: bool,
+        has_metric: bool,
+    }
+
+    /// The family name of a `# HELP <name> …` / `# TYPE <name> <type>` line is
+    /// the third whitespace token.
+    fn meta_family(line: &str) -> &str {
+        line.split_whitespace().nth(2).unwrap_or("")
+    }
+
+    let mut preamble: Vec<&str> = Vec::new();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut cur: Option<Block> = None;
+    let mut started = false;
+
+    for line in rendered.split('\n') {
+        if line.is_empty() {
+            // Blank line: closes the current block (and is the exporter's family
+            // separator / trailing terminator). Framing is re-synthesised on
+            // emit, so blank lines are not carried through.
+            if let Some(b) = cur.take() {
+                blocks.push(b);
+            }
+            continue;
+        }
+
+        let is_meta = line.starts_with("# HELP ") || line.starts_with("# TYPE ");
+
+        if !started && !is_meta {
+            // Anything before the first family block is preamble, emitted first
+            // and verbatim (empty for all real scrapes; the recorder-not-
+            // installed body reaches this path).
+            preamble.push(line);
+            continue;
+        }
+
+        if is_meta {
+            let name = meta_family(line);
+            // A meta line opens a new block if its family name differs from the
+            // current block's, or if it follows a metric line (a same-named
+            // block that has already emitted metrics).
+            let open_new = match &cur {
+                None => true,
+                Some(b) => b.name != name || b.has_metric,
+            };
+            if open_new {
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
+                cur = Some(Block {
+                    name: name.to_string(),
+                    header: Vec::new(),
+                    metrics: Vec::new(),
+                    sortable: false,
+                    has_metric: false,
+                });
+                started = true;
+            }
+            let b = cur.as_mut().expect("current block is set");
+            if line.starts_with("# TYPE ") {
+                let ty = line.split_whitespace().nth(3).unwrap_or("");
+                b.sortable = ty == "counter" || ty == "gauge";
+            }
+            b.header.push(line.to_string());
+        } else {
+            // Non-empty, non-meta line inside a block: a metric line (or any
+            // unrecognised line), carried through verbatim.
+            match cur.as_mut() {
+                Some(b) => {
+                    b.metrics.push(line.to_string());
+                    b.has_metric = true;
+                }
+                None => preamble.push(line),
+            }
+        }
+    }
+    if let Some(b) = cur.take() {
+        blocks.push(b);
+    }
+
+    // Stable sort so any same-name blocks retain relative order.
+    blocks.sort_by(|a, b| a.name.cmp(&b.name));
+    for b in &mut blocks {
+        if b.sortable {
+            // Stable, whole-line sort — value-independent (see doc comment).
+            b.metrics.sort();
+        }
+    }
+
+    let mut out = String::new();
+    for line in &preamble {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for b in &blocks {
+        for line in &b.header {
+            out.push_str(line);
+            out.push('\n');
+        }
+        for line in &b.metrics {
+            out.push_str(line);
+            out.push('\n');
+        }
+        // Canonical family separator / terminator, matching the exporter.
+        out.push('\n');
+    }
+    out
+}
+
+/// The ordered sequence of family names in a rendered scrape, one per `# TYPE`
+/// line. Used by tests to assert family ordering.
+#[cfg(test)]
+fn family_sequence(rendered: &str) -> Vec<&str> {
+    rendered
+        .lines()
+        .filter(|l| l.starts_with("# TYPE "))
+        .filter_map(|l| l.split_whitespace().nth(2))
+        .collect()
 }
 
 #[cfg(test)]
