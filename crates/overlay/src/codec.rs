@@ -623,7 +623,7 @@ mod tests {
         // OVERLAY_SPEC §3.3: zero-length messages produce a distinct
         // "error during read" error, matching stellar-core TCPPeer.cpp:690-700.
         let mut codec = MessageCodec::new();
-        let len: u32 = 0 | 0x80000000;
+        let len: u32 = 0x80000000;
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&[0u8; 16]);

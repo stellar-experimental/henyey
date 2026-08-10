@@ -10666,7 +10666,7 @@ mod tests {
         // Live-replay is gated off: the future slot is NOT installed into SCP.
         assert!(
             Herder::RESTORE_LIVE_ENVELOPE_REPLAY
-                == !herder.get_current_state_for_slot(lcl + 1).is_empty(),
+                != herder.get_current_state_for_slot(lcl + 1).is_empty(),
             "future-slot installation must track the RESTORE_LIVE_ENVELOPE_REPLAY gate"
         );
     }
