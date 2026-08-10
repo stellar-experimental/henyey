@@ -55,6 +55,8 @@ graph TD
 | `ClassicMarketSnapshot` | Immutable, complete offer and liquidity-pool view tied to one committed ledger sequence, hash, and protocol version. |
 | `CommittedMarketEvent` | Generation-tagged initialization/reset/ordinary committed market event with an exact snapshot, metadata-complete offer deltas, and a compact pool-count delta. |
 | `CommittedMarketSubscription` | Atomic subscribe-plus-bootstrap handle backed by a four-event non-blocking broadcast ring. Consumers must handle lag explicitly. |
+| `IsolatedClassicSimulationBase` | Freezes a caller-selected, metadata-complete offer set once and executes signed Classic envelopes with private ledger and offer overlays. |
+| `simulate_classic_transaction` | One-shot convenience API for exact, read-only Classic transaction execution against a committed snapshot. |
 | `ConfigUpgradeSetFrame` | Loader, validator, and applier for Soroban config-upgrade sets stored in ledger state. |
 | `InMemorySorobanState` | O(1) cache of contract data, code, TTLs, and config settings for Soroban execution. |
 | `SorobanNetworkInfo` | `/sorobaninfo`-style view of ledger-configured Soroban limits and fee parameters. |
@@ -188,6 +190,19 @@ HENYEY_MARKET_PUBLICATION_SNAPSHOT_OFFERS=1250000 \
 HENYEY_MARKET_PUBLICATION_CHANGES=2000 HENYEY_MARKET_PUBLICATION_LEDGERS=1000 \
 cargo test --release -p henyey-ledger benchmark_committed_market_publication_with_active_subscriber -- --ignored --nocapture
 ```
+
+### Isolated Classic simulation
+
+`IsolatedClassicSimulationBase` is a generic execution integration point for
+external consumers. The caller supplies a signed `TransactionEnvelope`, private
+ledger-entry overrides, and the complete offer records that transaction may
+cross. Henyey executes the envelope through the normal transaction executor at
+LCL+1, returning the exact result, operation results, transaction meta, fee, and
+net ledger changes. A prepared immutable offer base is shared across simulations;
+each call receives a fresh copy-on-write offer overlay. Canonical ledger state,
+the canonical offer store, and caches owned by the source snapshot are never
+mutated. Transaction construction and strategy policy deliberately remain with
+the caller.
 
 ## stellar-core Mapping
 

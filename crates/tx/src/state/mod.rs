@@ -332,10 +332,7 @@ impl LedgerStateManager {
             if let LedgerKey::Offer(ok) = &key {
                 let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
                 let mut store = self.offer_store_lock();
-                if let Some(record) = store.get_mut(&offer_key) {
-                    record.sponsor = Some(sponsor);
-                    record.has_ext = true;
-                } else {
+                if !store.set_sponsorship(&offer_key, Some(sponsor.clone()), true) {
                     // Offer doesn't exist yet (sponsorship set before create_offer).
                     // Store in entry_sponsorships; create_offer will pick it up.
                     drop(store);
@@ -352,8 +349,7 @@ impl LedgerStateManager {
             if let LedgerKey::Offer(ok) = key {
                 let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
                 let mut store = self.offer_store_lock();
-                if let Some(record) = store.get_mut(&offer_key) {
-                    let from_record = record.sponsor.take();
+                if let Some(from_record) = store.take_sponsorship(&offer_key) {
                     drop(store);
                     // Also check fallback map — a stale entry can exist after
                     // rollback restores sponsorship while the offer record
@@ -396,9 +392,7 @@ impl LedgerStateManager {
             if let LedgerKey::Offer(ok) = &key {
                 let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
                 let mut store = self.offer_store_lock();
-                if let Some(record) = store.get_mut(&offer_key) {
-                    record.has_ext = true;
-                } else {
+                if !store.set_has_ext(&offer_key, true) {
                     // Offer doesn't exist yet; store in ext set for create_offer to pick up.
                     drop(store);
                     self.entry_sponsorship_ext.insert(key);
@@ -414,9 +408,7 @@ impl LedgerStateManager {
             if let LedgerKey::Offer(ok) = key {
                 let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
                 let mut store = self.offer_store_lock();
-                if let Some(record) = store.get_mut(&offer_key) {
-                    let was = record.has_ext;
-                    record.has_ext = false;
+                if let Some(was) = store.clear_has_ext(&offer_key) {
                     was
                 } else {
                     // Check fallback set (ext set before offer existed).
@@ -451,9 +443,7 @@ impl LedgerStateManager {
             if let LedgerKey::Offer(ok) = &key {
                 let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
                 let mut store = self.offer_store_lock();
-                if let Some(record) = store.get_mut(&offer_key) {
-                    record.last_modified = seq;
-                }
+                store.set_last_modified(&offer_key, seq);
             }
         } else {
             self.entry_last_modified.insert(key, seq);

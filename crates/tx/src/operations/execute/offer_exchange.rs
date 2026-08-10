@@ -1,6 +1,6 @@
 //! Offer exchange math helpers (v10+).
 
-use stellar_xdr::{AccountId, Asset, ClaimAtom, Price};
+use stellar_xdr::{AccountId, Asset, ClaimAtom, OfferEntry, Price};
 
 use crate::frozen_keys::FrozenKeyConfig;
 use crate::state::LedgerStateManager;
@@ -201,6 +201,52 @@ pub fn adjust_offer_amount(
     Ok(res.num_wheat_received)
 }
 
+/// Quote crossing one offer with a fixed maximum input without mutating ledger state.
+///
+/// # Fully-backed-maker assumption
+///
+/// **When `max_wheat_send` / `max_sheep_receive` are `None`, this quote assumes
+/// the maker can fund the full posted `offer.amount` and receive an unbounded
+/// amount of the buying asset.** The real apply path (`cross_offer_v10`) caps
+/// the crossable amount by the maker's actual capacity — `can_sell_at_most` /
+/// `can_buy_at_most` evaluated *after* releasing this offer's liabilities. An
+/// under-backed maker therefore fills for **less** than this quote reports.
+///
+/// Callers that have the maker's balance/liability data should pass explicit
+/// caps to mirror the apply path exactly:
+///
+/// - `max_wheat_send`: how much of the selling (wheat) asset the maker can
+///   actually deliver (apply-path `can_sell_at_most` after releasing this
+///   offer's selling liabilities). Combined with `offer.amount` via `min`.
+/// - `max_sheep_receive`: how much of the buying (sheep) asset the maker can
+///   actually receive (apply-path `can_buy_at_most` after releasing this
+///   offer's buying liabilities).
+///
+/// Negative caps are treated as zero.
+pub fn quote_offer_strict_send(
+    offer: &OfferEntry,
+    max_send: i64,
+    max_wheat_send: Option<i64>,
+    max_sheep_receive: Option<i64>,
+) -> Result<ExchangeResult, ExchangeError> {
+    if offer.amount <= 0 || max_send < 0 {
+        return Err(ExchangeError::InvalidAmount);
+    }
+    // Mirror cross_offer_v10: maker wheat capacity is offer.amount capped by
+    // funding, then adjust_offer_amount is applied as a preventative measure.
+    let maker_wheat = offer.amount.min(max_wheat_send.unwrap_or(i64::MAX).max(0));
+    let maker_sheep = max_sheep_receive.unwrap_or(i64::MAX).max(0);
+    let adjusted = adjust_offer_amount(offer.price.clone(), maker_wheat, maker_sheep)?;
+    exchange_v10(
+        offer.price.clone(),
+        adjusted,
+        i64::MAX,
+        max_send,
+        maker_sheep,
+        RoundingType::PathPaymentStrictSend,
+    )
+}
+
 pub(crate) fn exchange_v10(
     price: Price,
     max_wheat_send: i64,
@@ -274,6 +320,130 @@ mod tests {
 
         assert_eq!(result.num_wheat_received, 100);
         assert_eq!(result.num_sheep_send, 100);
+    }
+
+    #[test]
+    fn test_quote_offer_strict_send_is_bounded_by_offer_and_input() {
+        use stellar_xdr::{AccountId, Asset, OfferEntry, OfferEntryExt, PublicKey, Uint256};
+
+        let offer = OfferEntry {
+            seller_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+            offer_id: 1,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 7,
+            price: Price { n: 2, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        let partial = quote_offer_strict_send(&offer, 4, None, None).unwrap();
+        assert_eq!(partial.num_sheep_send, 4);
+        assert_eq!(partial.num_wheat_received, 2);
+
+        let exhausted = quote_offer_strict_send(&offer, 100, None, None).unwrap();
+        assert_eq!(exhausted.num_wheat_received, 7);
+        assert_eq!(exhausted.num_sheep_send, 14);
+    }
+
+    fn quote_test_offer(amount: i64, price: Price) -> stellar_xdr::OfferEntry {
+        use stellar_xdr::{AccountId, Asset, OfferEntry, OfferEntryExt, PublicKey, Uint256};
+        OfferEntry {
+            seller_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
+            offer_id: 1,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount,
+            price,
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        }
+    }
+
+    /// n < d price (wheat cheap): exercises the round-up path in
+    /// exchange_v10_without_price_error_thresholds where sheep_send rounds
+    /// down and wheat_receive rounds up. Asserts parity with the exact
+    /// exchange_v10 call cross_offer_v10 would make for a fully-backed maker.
+    #[test]
+    fn test_quote_offer_strict_send_n_less_than_d_round_up() {
+        let price = Price { n: 1, d: 2 };
+        let offer = quote_test_offer(7, price.clone());
+
+        let quote = quote_offer_strict_send(&offer, 100, None, None).unwrap();
+
+        // Mirror cross_offer_v10 for a fully-backed maker:
+        // max_wheat_send = offer.amount, max_sheep_receive = i64::MAX.
+        let adjusted = adjust_offer_amount(price.clone(), offer.amount, i64::MAX).unwrap();
+        let crossed = exchange_v10(
+            price,
+            adjusted,
+            i64::MAX,
+            100,
+            i64::MAX,
+            RoundingType::PathPaymentStrictSend,
+        )
+        .unwrap();
+        assert_eq!(quote, crossed);
+
+        // Concrete values: adjust drops 7 -> 6 (odd wheat cannot trade at 1/2),
+        // then 6 wheat cross for 3 sheep (round-up path: 3 * 2 / 1 = 6).
+        assert_eq!(quote.num_wheat_received, 6);
+        assert_eq!(quote.num_sheep_send, 3);
+        assert!(!quote.wheat_stays);
+    }
+
+    /// Strict-send input too small to buy one unit of expensive wheat:
+    /// wheat_received rounds to zero while sheep_send stays positive, exactly
+    /// as cross_offer_v10 would compute (which must then not apply the trade).
+    #[test]
+    fn test_quote_offer_strict_send_rounds_to_zero_wheat() {
+        let price = Price { n: 5, d: 1 };
+        let offer = quote_test_offer(10, price.clone());
+
+        let quote = quote_offer_strict_send(&offer, 3, None, None).unwrap();
+
+        let adjusted = adjust_offer_amount(price.clone(), offer.amount, i64::MAX).unwrap();
+        let crossed = exchange_v10(
+            price,
+            adjusted,
+            i64::MAX,
+            3,
+            i64::MAX,
+            RoundingType::PathPaymentStrictSend,
+        )
+        .unwrap();
+        assert_eq!(quote, crossed);
+
+        assert_eq!(quote.num_wheat_received, 0);
+        assert_eq!(quote.num_sheep_send, 3);
+        assert!(quote.wheat_stays);
+    }
+
+    /// Maker-funding caps: an under-backed maker fills for less than the
+    /// posted amount, mirroring cross_offer_v10's can_sell_at_most cap.
+    #[test]
+    fn test_quote_offer_strict_send_maker_caps_limit_fill() {
+        let price = Price { n: 1, d: 1 };
+        let offer = quote_test_offer(100, price);
+
+        // Fully backed: taker's 50 fills 50.
+        let full = quote_offer_strict_send(&offer, 50, None, None).unwrap();
+        assert_eq!(full.num_wheat_received, 50);
+        assert_eq!(full.num_sheep_send, 50);
+
+        // Maker can only deliver 10 wheat: fill capped at 10.
+        let capped = quote_offer_strict_send(&offer, 50, Some(10), None).unwrap();
+        assert_eq!(capped.num_wheat_received, 10);
+        assert_eq!(capped.num_sheep_send, 10);
+
+        // Maker can only receive 7 sheep: fill capped at 7.
+        let sheep_capped = quote_offer_strict_send(&offer, 50, None, Some(7)).unwrap();
+        assert_eq!(sheep_capped.num_wheat_received, 7);
+        assert_eq!(sheep_capped.num_sheep_send, 7);
+
+        // Negative caps are treated as zero.
+        let negative = quote_offer_strict_send(&offer, 50, Some(-5), None).unwrap();
+        assert_eq!(negative.num_wheat_received, 0);
+        assert_eq!(negative.num_sheep_send, 0);
     }
 
     /// Test exchange with 2:1 price (2 sheep for 1 wheat).

@@ -156,7 +156,7 @@ assert!(delta.fee_charged() >= 0);
 
 Soroban execution is protocol-versioned. `soroban-env-host-p24` is used for protocol 24, while `soroban-env-host-p25` is used for protocol 25 and later. `PersistentModuleCache` lets the crate reuse compiled WASM modules without charging compilation work to transaction CPU budgets.
 
-`OfferStore` centralizes offer entries, indexes, and metadata so live execution and adjacent crates can share one canonical in-memory offer view instead of duplicating large offer structures.
+`OfferStore` centralizes offer entries, indexes, and metadata so live execution and adjacent crates can share one canonical in-memory offer view instead of duplicating large offer structures. Private overlays expose index-maintaining offer replacement plus metadata-specific setters; unrestricted mutable record access is intentionally unavailable so seller, ID, pair, and descriptor indexes cannot become stale.
 
 ## stellar-core Mapping
 

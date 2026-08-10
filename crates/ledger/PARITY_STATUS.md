@@ -13,6 +13,11 @@ not alter ledger-close results or XDR. Captured disk-backed bucket hashes remain
 internal garbage-collection roots for the lifetime of shared snapshot lookup
 closures.
 
+Isolated Classic simulation is also a read-only henyey extension API. It runs a
+caller-supplied signed envelope through the normal transaction executor at LCL+1
+over private ledger and offer overlays. It never applies its result to canonical
+state and does not alter protocol-visible execution semantics.
+
 ## Summary
 
 | Area | Status | Notes |

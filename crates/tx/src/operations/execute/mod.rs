@@ -500,8 +500,8 @@ mod sponsorship;
 mod trust_flags;
 
 pub use offer_exchange::{
-    adjust_offer_amount, exchange_v10_without_price_error_thresholds, ExchangeError,
-    ExchangeResult, RoundingType,
+    adjust_offer_amount, exchange_v10_without_price_error_thresholds, quote_offer_strict_send,
+    ExchangeError, ExchangeResult, RoundingType,
 };
 
 pub struct SorobanOperationMeta {
