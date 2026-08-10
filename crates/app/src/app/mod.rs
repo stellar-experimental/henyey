@@ -3404,6 +3404,7 @@ impl App {
             scp: self.herder.scp_metrics_snapshot(),
             scp_phase: self.herder.tracking_slot_ballot_phase(),
             scp_cumulative_statements: self.herder.scp_cumulative_statement_count() as u64,
+            scp_persist: self.herder.scp_persist_stats(),
             consensus_trigger_timer_fires: self
                 .consensus_trigger_timer_fires
                 .load(Ordering::Relaxed),

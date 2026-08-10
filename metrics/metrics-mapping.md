@@ -250,6 +250,15 @@ Fine-grained breakdown of ledger close phases, all in seconds.
 | `SCP_VERIFY_LATENCY_US_SUM` | `henyey_scp_verify_latency_us_sum` | Cumulative verification latency (μs) |
 | `SCP_VERIFY_LATENCY_US_COUNT` | `henyey_scp_verify_latency_us_count` | Verification count |
 
+### SCP State Persistence (#3796)
+
+| Constant | Prometheus name | Description |
+|---|---|---|
+| `SCP_PENDING_PERSISTS` | `henyey_scp_pending_persists` | Persist worker threads currently in flight (deferred SQLite writes) |
+| `SCP_PENDING_PERSISTS_PEAK` | `henyey_scp_pending_persists_peak` | Process-lifetime high-water mark of in-flight persist workers |
+| `SCP_PERSIST_ATTEMPTED_TOTAL` | `henyey_scp_persist_attempted_total` | Persist worker spawns attempted (counted before spawn) |
+| `SCP_PERSIST_SPAWN_FAILED_TOTAL` | `henyey_scp_persist_spawn_failed_total` | Persist worker spawns that failed to launch; `attempted - spawn_failed` = threads spawned |
+
 ### Clock Drift
 
 | Constant | Prometheus name | Description |
