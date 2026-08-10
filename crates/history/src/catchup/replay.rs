@@ -192,7 +192,7 @@ pub(super) fn decode_upgrades_from_header(header: &LedgerHeader) -> Vec<LedgerUp
 ///
 /// Walks `(from, target]` one checkpoint at a time. For each batch it computes
 /// the checkpoint-aligned upper bound `batch_to`, invokes `step(batch_from,
-/// batch_to)` to download → verify → replay → persist that batch, then **drops
+/// batch_to)` to download → verify → persist → replay that batch, then **drops
 /// the returned batch before issuing the next `step` call**. This is the
 /// mechanism that bounds peak resident transaction/result body memory to ~one
 /// checkpoint (`checkpoint_frequency()` ledgers) instead of the whole gap.
@@ -275,9 +275,38 @@ struct ReplayBatchCtx<'a> {
 }
 
 impl ReplayBatchCtx<'_> {
-    /// Download → verify-txset → replay → persist one checkpoint-sized batch
+    /// Download → verify-txset → **persist** → replay one checkpoint-sized batch
     /// `[batch_from+1, batch_to]`. Returns the batch `Vec<LedgerData>` (so the
     /// driver can drop it before the next download) and the advanced LCL seq.
+    ///
+    /// **Ordering invariant (#3811).** `persist_ledger_history` runs *before*
+    /// `replay_via_close_ledger`, so the whole batch's
+    /// `ledgerheaders`/`txsets`/`txresults`/`txhistory` rows are durable before
+    /// the first `close_ledger` advances the in-memory LCL. This restores the
+    /// persist-before-advance ordering stellar-core enforces:
+    /// `getHistoryManager().appendTransactionSet` +
+    /// `storePersistentStateAndLedgerHeaderInDB`
+    /// (`LedgerManagerImpl.cpp:1661`, `:2963-2966` via `:3122-3129`) precede
+    /// `ltx.commit()` (`:1835`), which precedes the in-memory advance
+    /// `advanceLastClosedLedgerState` (`:1409`, dispatched `:1878-1894`). The
+    /// upstream one-sided invariant "persisted history ⊇ closed-ledger set"
+    /// (ahead-of-LCL is truncated at restart; behind-LCL is corruption) is
+    /// stated by `CheckpointBuilder::cleanup(lcl)` with `enforceLCL = true`
+    /// (`CheckpointBuilder.cpp:199-345`).
+    ///
+    /// **Reachability — this is an elimination, not a narrowing.** After the
+    /// swap the first LCL mutation anywhere in the batch is the `close_ledger`
+    /// call inside `replay_via_close_ledger`. Every fallible step
+    /// (`download_ledger_data`, `verify_txsets`, `persist_ledger_history`) now
+    /// precedes *all* LCL motion, and the single persist covers every ledger
+    /// the replay loop will subsequently close. So the failure class this fixes
+    /// — an error raised after `replay_via_close_ledger` advanced LCL but before
+    /// `persist_ledger_history` committed — becomes empty: a persist failure
+    /// (including a transient `SQLITE_BUSY` → retriable
+    /// `HistoryError::CatchupFailed`) leaves LCL at `batch_from`, so the retry
+    /// loop's `replay_first = current_lcl + 1` re-derives the *same* batch and
+    /// genuinely re-does it, instead of resuming past a batch whose rows were
+    /// never written and silently reporting success.
     async fn replay_one_batch(
         &mut self,
         batch_from: u32,
@@ -298,14 +327,23 @@ impl ReplayBatchCtx<'_> {
         // already verified over the full range in phase 1).
         self.manager.verify_txsets(&ledger_data)?;
 
-        // Replay this batch via close_ledger (identical per-ledger state
-        // transitions and bucket-list updates as the whole-gap path).
-        self.manager
-            .replay_via_close_ledger(self.ledger_manager, &ledger_data)
-            .await?;
+        // Persist the whole batch's ledgerheaders/txsets/txresults/txhistory
+        // rows BEFORE any close_ledger advances the in-memory LCL (#3811). This
+        // consumes only archive-derived data (headers, tx-sets, tx-results)
+        // and has zero dependency on anything replay produces, so it can run
+        // first. See the method doc for the persist-before-advance invariant
+        // and the reachability argument.
         self.manager
             .persist_ledger_history(&ledger_data, &self.network_id)?;
 
+        // Replay this batch via close_ledger (identical per-ledger state
+        // transitions and bucket-list updates as the whole-gap path). This is
+        // the first LCL mutation in the batch.
+        self.manager
+            .replay_via_close_ledger(self.ledger_manager, &ledger_data)
+            .await?;
+
+        // Read the advanced LCL only after replay — do not hoist.
         let new_lcl_seq = self.ledger_manager.header_snapshot().header.ledger_seq;
         Ok((ledger_data, new_lcl_seq))
     }
@@ -584,10 +622,12 @@ impl CatchupManager {
     ///
     /// **Phase 2 — per-checkpoint replay (stream + free):** loop over the gap
     /// one checkpoint (≤ `checkpoint_frequency()` ledgers) at a time. For each
-    /// batch: download its tx/result bodies, verify tx-sets/results, replay
-    /// via `close_ledger` in order, persist, then **drop the batch before the
-    /// next download**. Peak resident tx/result body memory is bounded to ~one
-    /// checkpoint instead of the whole gap.
+    /// batch: download its tx/result bodies, verify tx-sets/results, persist
+    /// the batch's history rows, replay via `close_ledger` in order, then
+    /// **drop the batch before the next download**. Persist runs before replay
+    /// so durable history rows are never behind the in-memory LCL (#3811).
+    /// Peak resident tx/result body memory is bounded to ~one checkpoint
+    /// instead of the whole gap.
     ///
     /// Mirrors stellar-core `CatchupWork::downloadVerifyLedgerChain` (full
     /// header verify) + `DownloadApplyTxsWork` (per-checkpoint `BatchWork`
