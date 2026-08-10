@@ -2691,8 +2691,11 @@ async fn test_persist_failure_does_not_advance_lcl_or_report_catchup_success() {
     // `CatchupFailed`. Nothing in the replay path READS `ledgerheaders`, so
     // exactly persist fails. Do NOT hold the connection across catchup —
     // max_size(1) would deadlock.
-    db.with_connection(|conn| conn.execute("DROP TABLE ledgerheaders", []).map_err(Into::into))
-        .expect("drop ledgerheaders");
+    db.with_connection(|conn| {
+        conn.execute("DROP TABLE ledgerheaders", [])
+            .map_err(Into::into)
+    })
+    .expect("drop ledgerheaders");
 
     let result = manager
         .catchup_to_ledger_with_mode(target, CatchupMode::Recent(50), lcl, None, &ledger_manager)
@@ -2799,9 +2802,10 @@ async fn test_closed_ledgers_have_history_rows_when_replay_fails_midway() {
             txs: VecM::default(),
         };
         tx_sets.insert(seq, tx_set.clone());
-        let close_data =
-            LedgerCloseData::new(seq, TransactionSetVariant::Classic(tx_set), 0, prev);
-        probe.close_ledger(close_data, None).expect("probe close_ledger");
+        let close_data = LedgerCloseData::new(seq, TransactionSetVariant::Classic(tx_set), 0, prev);
+        probe
+            .close_ledger(close_data, None)
+            .expect("probe close_ledger");
         computed_header.insert(seq, probe.current_header());
     }
 
@@ -2842,7 +2846,11 @@ async fn test_closed_ledgers_have_history_rows_when_replay_fails_midway() {
             header,
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
-        apply_header_xdrs.push(entry.to_xdr(stellar_xdr::Limits::none()).expect("entry xdr"));
+        apply_header_xdrs.push(
+            entry
+                .to_xdr(stellar_xdr::Limits::none())
+                .expect("entry xdr"),
+        );
 
         let tx_history_entry = TransactionHistoryEntry {
             ledger_seq: seq,
