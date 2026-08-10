@@ -169,6 +169,20 @@ def test_negative_over_clamped():
     assert result["value"] == 0, f"Expected clamped rate 0, got {result['value']}"
 
 
+def test_zero_volume_no_division_error():
+    """Defensive: an alarm configured with min_count_delta=0 and a zero-volume
+    window must not raise ZeroDivisionError on `over / count_delta`; the window
+    has no observations, so rate is 0.0 and the alarm stays ok."""
+    zero_min_alarm = dict(ALARM)
+    zero_min_alarm["min_count_delta"] = 0
+    current, prev = make_histogram_data(count=0, n_over=0)
+    result = eval_histogram_bucket_rate(
+        zero_min_alarm, current, prev, prev_prom_invalid=False
+    )
+    assert result["state"] == "ok", f"Expected 'ok', got '{result['state']}'"
+    assert result["value"] == 0, f"Expected rate 0, got {result['value']}"
+
+
 def _load_catalog():
     try:
         import tomllib
@@ -226,6 +240,7 @@ if __name__ == "__main__":
         test_counter_reset_skips,
         test_missing_bucket_le_skips,
         test_negative_over_clamped,
+        test_zero_volume_no_division_error,
         test_catalog_alarm_semantics,
         test_catalog_validates,
     ]

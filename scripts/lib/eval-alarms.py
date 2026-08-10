@@ -1004,7 +1004,13 @@ def eval_histogram_bucket_rate(
     # (Critic A).
     over = count_delta - bucket_deltas[bucket_le]
     over = max(over, 0.0)
-    rate = over / count_delta
+    # Defensive: `count_delta < min_count` already skips low-volume windows for
+    # every shipped alarm (default min_count 20, this alarm 100), but a future
+    # alarm configured with `min_count_delta = 0` and a zero-volume window would
+    # reach here with count_delta == 0. Guard the division for symmetry with
+    # `eval_histogram_p99`'s `count_delta > 0` checks (a zero-volume window has
+    # no over-threshold slots, so rate is 0.0 and cannot fire).
+    rate = over / count_delta if count_delta > 0 else 0.0
 
     ev = {"rate_value": round(rate, 4)}
     if rate > rate_threshold:
