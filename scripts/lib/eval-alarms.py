@@ -50,6 +50,20 @@ except ImportError:
 
 SCHEMA_VERSION = 1
 
+# Skip reasons that must NOT trigger a counter-snapshot reset (#3758). These are
+# monitoring-side caller errors (e.g. an abbreviated tick that failed to export
+# PID/START_TICKS) that carry ZERO information about the node — treating them as
+# a coverage gap and clearing the baseline destroys sustained-breach evidence
+# (a live 22-tick breach_streak was erased this way). #3279's in-function guard
+# already preserves the baseline for this case; maybe_reset_counter_snapshot
+# honors the same contract via this set. Deny-list (not allow-list) because the
+# reset-worthy reasons carry dynamic text (`gap-stale (prev age 5.0h)`,
+# `low volume (delta=… < …)`, `missing <metric>{suffix}`), making an exact
+# allow-list impractical and a prefix allow-list fragile. Any FUTURE
+# monitoring-side caller-error skip reason carrying no node info must be added
+# here.
+PRESERVE_BASELINE_SKIP_REASONS = {"missing process identity"}
+
 # When True (set by --no-snapshot-write in main()), write_snapshot() becomes a
 # no-op so the evaluator runs as a TRUE read-only dry-run: it evaluates against
 # the existing on-disk snapshots and emits identical JSON/telemetry, but
@@ -410,6 +424,7 @@ def maybe_reset_gauge_persistence(
 
 def maybe_reset_counter_snapshot(
     alarm: dict, kind: str, state: str, state_dir: Path,
+    skip_reason: str | None = None,
 ):
     """Reset counter snapshot state on non-evaluable ticks.
 
@@ -426,8 +441,21 @@ def maybe_reset_counter_snapshot(
 
     Does NOT fire on "collecting_baseline" — that state means the evaluator
     wrote fresh baseline data that must be preserved for the next tick.
+
+    Exemption (#3758): a `missing process identity` skip is a monitoring-side
+    caller bug (an abbreviated tick that didn't export PID/START_TICKS) — it
+    carries ZERO information about the node. #3279's guard eval_counter_streak
+    deliberately treats it as "establish nothing, decide nothing, preserve the
+    baseline untouched" and returns before touching the snapshot. This hook
+    honors that same contract: for any reason in PRESERVE_BASELINE_SKIP_REASONS
+    we early-return before any write, so the caller-side cleanup no longer
+    destroys the baseline from the outside (a 22-tick breach_streak was erased
+    live this way). Any FUTURE monitoring-side caller-error skip reason that
+    carries no node information must be added to that set.
     """
     if state != "skipped":
+        return
+    if skip_reason in PRESERVE_BASELINE_SKIP_REASONS:
         return
     name = alarm["name"]
 
@@ -1569,6 +1597,24 @@ def main() -> int:
     pid = os.environ.get("PID", "")
     start_ticks_val = os.environ.get("START_TICKS", "")
 
+    # Loud caller-error warning (#3758): a validator-mode tick with no
+    # PID/START_TICKS is a monitoring-side bug (an abbreviated/headless tick
+    # that skipped the `export PID=... START_TICKS=...` preamble), not a node
+    # state. It silently degrades the counter-streak/ratio families to
+    # `skipped` — which reads as health in a tick report. Emit a single loud
+    # stderr line so the run is unmistakably flagged. Non-breaking: no exit-code
+    # change and no new alarm state (the stronger form — non-zero exit or a
+    # distinct FAILED aggregate state — is deliberately deferred, see #3758).
+    if monitor_mode == "validator" and (not pid or not start_ticks_val):
+        print(
+            "WARNING: validator-mode tick has missing process identity "
+            "(PID/START_TICKS unset) — counter-streak/ratio alarms will be "
+            "skipped, not evaluated. This is a monitoring-side caller bug, not "
+            "node health. Export PID and START_TICKS before invoking the "
+            "evaluator (see SKILL.md).",
+            file=sys.stderr,
+        )
+
     # Parse metrics
     current_path = Path(args.current)
     prev_path = Path(args.prev) if args.prev else None
@@ -1641,7 +1687,12 @@ def main() -> int:
         # --- Single converged post-processing ---
         results.append(result)
         maybe_reset_gauge_persistence(alarm, kind, result["state"], persistence_state)
-        maybe_reset_counter_snapshot(alarm, kind, result["state"], state_dir)
+        # Pass the skip reason so the cleanup hook can exempt monitoring-side
+        # caller errors (e.g. "missing process identity") from destroying the
+        # baseline — see PRESERVE_BASELINE_SKIP_REASONS / #3758.
+        maybe_reset_counter_snapshot(
+            alarm, kind, result["state"], state_dir, result.get("skip_reason"),
+        )
 
         # Telemetry (unified format for all branches)
         metric = telemetry_metric(alarm, kind)
