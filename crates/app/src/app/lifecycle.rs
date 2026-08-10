@@ -376,8 +376,17 @@ impl App {
         self.clock.sleep(Duration::from_millis(500)).await;
         self.request_scp_state_and_record().await;
 
-        // Set state based on validator mode
-        self.restore_operational_state().await;
+        // Set state based on validator mode. Gate the extension readiness
+        // signal the same way as `overlay.set_synced` and query readiness
+        // above: a no-state node (ledger_seq == 0, uninitialized ledger
+        // manager) must not be reported operational to extensions — it has no
+        // ledger state to act on. Readiness arrives with the first successful
+        // catchup or live ledger close.
+        if self.ledger_manager.is_initialized() && ledger_seq > 0 {
+            self.restore_operational_state().await;
+        } else {
+            self.restore_app_state_without_readiness().await;
+        }
 
         // Start sync recovery tracking to enable the consensus stuck timer
         self.start_sync_recovery_tracking();
@@ -485,7 +494,7 @@ impl App {
         });
 
         // Main run loop
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut shutdown_rx = self.take_initial_shutdown_receiver().await;
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -586,7 +595,7 @@ impl App {
         }
 
         // Cold-start arm of the event-driven consensus trigger (#2702). Runs
-        // after restore_operational_state() (which set herder tracking state)
+        // after the operational-state restore above (which set herder tracking state)
         // and after the pre-loop process_externalized_slots(), so by now a
         // tracking validator has a stable LCL to schedule the next ledger from.
         // Self-gates on is_tracking()/manual_close; if not yet tracking, it is a
@@ -619,8 +628,24 @@ impl App {
         const MAX_DRAIN_PER_TICK: usize = 200;
 
         let mut select_iteration: u64 = 0;
+        // Loop-top anchor for loop-side exact stall accounting (#3795). Same
+        // anchor as `tick_event_loop()` (and therefore `last_event_loop_tick_ms`),
+        // so the loop-side number and the sampler's `stale_secs` are the same
+        // quantity measured two ways. Measured at loop top — NOT reusing
+        // `phase_dispatch_start` — because that starts after the
+        // `deferred_catchup.lock().await` preamble, a tokio Mutex acquire that
+        // can itself block and would be invisible to a later anchor.
+        let mut last_tick_at = std::time::Instant::now();
         loop {
             select_iteration += 1;
+            // Report the exact inter-tick gap BEFORE `set_phase(0)` clears the
+            // sub-phase, so the just-ran arm is attributed exactly. Complete by
+            // construction: every stall that ends produces exactly one report
+            // at its true duration, independent of the sampler's phase (#3795).
+            let now = std::time::Instant::now();
+            let gap = now.duration_since(last_tick_at);
+            last_tick_at = now;
+            self.report_event_loop_stall(gap);
             self.tick_event_loop();
             self.set_phase(0); // 0 = waiting in select
 
@@ -906,8 +931,11 @@ impl App {
                                 );
                                 pending.task_handle.abort();
                             }
-                            // Restore operational state after failed catchup
-                            self.restore_operational_state().await;
+                            // Restore AppState after the failed (panicked /
+                            // cancelled) catchup — extension readiness stays
+                            // false until a catchup succeeds or a live ledger
+                            // closes.
+                            self.restore_app_state_without_readiness().await;
                         }
                     }
 
@@ -2293,6 +2321,16 @@ impl App {
     }
 
     /// Signal the application to shut down.
+    ///
+    /// # Deferred effect before/during startup
+    ///
+    /// The signal only takes effect when the main event loop's `select`
+    /// observes it. A shutdown requested before [`App::run`] starts is
+    /// retained (the initial broadcast receiver is created together with the
+    /// channel), and one requested while startup catchup is still running is
+    /// likewise buffered — but in both cases it is honored only at the first
+    /// main-loop select iteration. In-flight startup/catchup work is not
+    /// interrupted by this call.
     pub fn shutdown(&self) {
         tracing::info!("Shutdown requested");
         let _ = self.shutdown_tx.send(());
@@ -2377,6 +2415,27 @@ impl App {
     /// Subscribe to shutdown notifications.
     pub fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
+    }
+
+    /// Take the shutdown receiver created together with the channel, so a
+    /// shutdown signalled before `App::run` starts is retained and honored.
+    ///
+    /// Only the first call gets the pre-run receiver. Subsequent calls (e.g.
+    /// a `NodeRunner` embedding that retries `run()` after a transient error)
+    /// fall back to a fresh subscription: signals sent before the fallback
+    /// subscribe are lost, matching plain `subscribe_shutdown` semantics.
+    pub(super) async fn take_initial_shutdown_receiver(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<()> {
+        match self.initial_shutdown_rx.lock().await.take() {
+            Some(rx) => rx,
+            None => {
+                tracing::debug!(
+                    "Initial shutdown receiver already taken; subscribing a fresh receiver"
+                );
+                self.shutdown_tx.subscribe()
+            }
+        }
     }
 
     /// Drain the close pipeline on shutdown.
@@ -3498,7 +3557,7 @@ mod scp_dedup_pipeline_tests {
         // Drain a full batch of DISTINCT token-bearing SCP messages. The herder
         // is in Booting → pre-filter rejects, but the flow-control token still
         // releases at the end of pump_scp_intake (Drop on every path).
-        for slot in 0..batch as u64 {
+        for slot in 0..batch {
             let envelope = make_test_envelope(1000 + slot, 2_000_000_000);
             let mut msg = make_overlay_scp_msg(envelope);
             msg.attach_test_flow_release(Arc::clone(&flow_control), grant_tx.clone());
@@ -3518,7 +3577,7 @@ mod scp_dedup_pipeline_tests {
              exactly one SEND_MORE_EXTENDED (got {grants:?})"
         );
         assert_eq!(
-            grants[0] as u64, batch as u64,
+            grants[0] as u64, batch,
             "the grant must request the full batch of flood messages"
         );
     }

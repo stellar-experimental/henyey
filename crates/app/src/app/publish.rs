@@ -1020,6 +1020,38 @@ mod tests {
         assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
     }
 
+    /// A node restored from persisted disk state must stay non-operational
+    /// (AppState `Initializing`, extension readiness false) until the run
+    /// loop's catchup policy has been evaluated — the restore itself no
+    /// longer implies `Synced` (run_cmd.rs behavior for finding-fresh state).
+    #[tokio::test]
+    async fn restored_node_stays_non_operational_until_catchup_policy_evaluated() {
+        let fixture = setup_publish_fixture("restore-non-operational", |_dir, _config| {}).await;
+
+        let PublishTestFixture {
+            app, config, _dir, ..
+        } = fixture;
+        drop(app);
+
+        let second_app = reopen_app_after_drop(config).await;
+        assert_eq!(
+            second_app.load_last_known_ledger().await.unwrap(),
+            RestoreResult::Restored
+        );
+        assert_eq!(
+            second_app.state().await,
+            crate::AppState::Initializing,
+            "restore from disk must not transition AppState before the \
+             catchup policy runs"
+        );
+        let (operational, _generation, _transition) = second_app.operational_readiness();
+        assert!(
+            !operational.load(std::sync::atomic::Ordering::Acquire),
+            "restored node must not report extension readiness before the \
+             catchup policy runs"
+        );
+    }
+
     #[tokio::test]
     async fn test_publish_delay_gates_then_publishes() {
         // With a large PUBLISH_TO_ARCHIVE_DELAY, the first poll must NOT publish

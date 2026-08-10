@@ -2891,7 +2891,10 @@ impl App {
                     self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
                     // Continue to the shared restore/cooldown tail below (do NOT
                     // wipe). The next catchup will be archive-authoritative.
-                    self.restore_operational_state().await;
+                    // Failed catchup: restore AppState only — extension
+                    // readiness stays false until a catchup succeeds or a
+                    // live ledger closes.
+                    self.restore_app_state_without_readiness().await;
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     if reset_stuck_state {
                         if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
@@ -2933,7 +2936,10 @@ impl App {
                          genesis) would still wipe here."
                     );
                     self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
-                    self.restore_operational_state().await;
+                    // Failed catchup: restore AppState only — extension
+                    // readiness stays false until a catchup succeeds or a
+                    // live ledger closes.
+                    self.restore_app_state_without_readiness().await;
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     if reset_stuck_state {
                         if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
@@ -2979,11 +2985,14 @@ impl App {
                         self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
                     }
                 }
-                // Restore operational state so the node can continue
-                // participating in consensus. Without this, the node stays
-                // permanently stuck in CatchingUp after a failed catchup
-                // (e.g., archive checkpoint not yet published).
-                self.restore_operational_state().await;
+                // Restore the AppState so the node can continue participating
+                // in consensus. Without this, the node stays permanently stuck
+                // in CatchingUp after a failed catchup (e.g., archive
+                // checkpoint not yet published). Extension readiness is NOT
+                // signalled — the catchup failed, so the ledger is stale;
+                // readiness returns on a successful catchup or the first
+                // successful live ledger close.
+                self.restore_app_state_without_readiness().await;
                 // Apply cooldown after failed catchup to prevent rapid-fire retries.
                 // Without this, a failed catchup (e.g., archive checkpoint not yet
                 // published) would re-trigger immediately on the next tick because
@@ -3002,6 +3011,68 @@ impl App {
             }
         }
         false
+    }
+
+    /// #3797: classify a **startup (boot-time) catchup** failure as
+    /// wipe-required.
+    ///
+    /// Returns `true` iff `err` downcasts to a fatal catchup/integrity
+    /// [`HistoryError`](henyey_history::HistoryError)
+    /// (`is_fatal_catchup_failure()`) **and** it is not the narrow
+    /// stateless-fresh-genesis knit carve-out (`current_ledger_seq() ==
+    /// GENESIS_LEDGER_SEQ && is_knit_to_lcl_failure()`). This mirrors, for the
+    /// startup path, the exact classification the online catchup handler
+    /// [`handle_catchup_result`](Self::handle_catchup_result) already applies —
+    /// the #3410 genesis-knit exception (a stateless fresh node has no committed
+    /// state to protect) is preserved, and for `LCL > genesis` the #3282/#3288
+    /// terminal semantics are unchanged.
+    ///
+    /// The downcast searches the anyhow source chain, so a typed `HistoryError`
+    /// wrapped by `?`'s `.context(...)` on the way out of the startup catchup
+    /// call is still classified correctly.
+    ///
+    /// Transient/download and ENOSPC-class errors are **not**
+    /// `is_fatal_catchup_failure()`, so they return `false` — a disk-full during
+    /// startup catchup must not be mis-signalled as requiring a wipe (matching
+    /// the #3478 "free space, no wipe" recoverable-shutdown semantics).
+    pub(crate) fn startup_catchup_failure_requires_wipe(&self, err: &anyhow::Error) -> bool {
+        let is_fatal = err
+            .downcast_ref::<henyey_history::HistoryError>()
+            .is_some_and(|e| e.is_fatal_catchup_failure());
+        if !is_fatal {
+            return false;
+        }
+        let at_genesis = self.current_ledger_seq() == GENESIS_LEDGER_SEQ;
+        let is_knit_to_lcl = err
+            .downcast_ref::<henyey_history::HistoryError>()
+            .is_some_and(|e| e.is_knit_to_lcl_failure());
+        !(at_genesis && is_knit_to_lcl)
+    }
+
+    /// #3797: emit the monitor's auto-wipe signal on a fatal **startup
+    /// (boot-time) catchup** failure, then let the caller propagate the error.
+    ///
+    /// The online catchup handler already emits `fatal_wipe_required=true` (via
+    /// [`trigger_fatal_shutdown`](Self::trigger_fatal_shutdown)) on the fatal
+    /// class, which the monitor greps to drive its `(3a)` auto-wipe self-heal.
+    /// The startup catchup path in `run_cmd` historically `?`-propagated the
+    /// same fatal class WITHOUT emitting that signal, so the monitor never
+    /// auto-recovered and the operator had to wipe by hand — the ~9 h outage in
+    /// #3797. Call this from the startup-catchup `Err` arm BEFORE returning the
+    /// error: on the wipe-required class it emits the signal; otherwise it is a
+    /// no-op and the caller propagates the (transient/recoverable) error
+    /// unchanged.
+    ///
+    /// At startup the main run loop is not yet spawned, so
+    /// `trigger_fatal_shutdown`'s `shutdown()` broadcast is a harmless send; the
+    /// caller still returns `Err`, so `run_node` exits non-zero for the
+    /// supervisor.
+    pub(crate) fn signal_startup_catchup_failure(&self, err: &anyhow::Error) {
+        if self.startup_catchup_failure_requires_wipe(err) {
+            self.trigger_fatal_shutdown(&format!(
+                "startup catchup verification/integrity failure: {err}"
+            ));
+        }
     }
 
     pub(super) async fn maybe_start_externalized_catchup(
@@ -7939,6 +8010,205 @@ mod tests {
             installed, None,
             "Offline catchup must NOT call set_trusted_scp_anchor() even when \
              herder has externalized target+1 — the run_mode gate is broken"
+        );
+    }
+
+    // -- #3797: startup (boot-time) catchup must emit the wipe signal ---------
+    //
+    // The online catchup handler (`handle_catchup_result`) already emits
+    // `fatal_wipe_required=true` (via `trigger_fatal_shutdown`) on the fatal
+    // catchup/integrity class, which the monitor greps to drive its (3a)
+    // auto-wipe self-heal. The STARTUP catchup path in `run_cmd` historically
+    // `?`-propagated the same fatal class WITHOUT emitting that signal, so the
+    // monitor never auto-recovered and the operator had to wipe by hand — the
+    // ~9 h outage in #3797. These tests lock the fix: the startup path now
+    // classifies the failure via `startup_catchup_failure_requires_wipe` and
+    // emits the signal via `signal_startup_catchup_failure`.
+
+    /// Helper: build an `App` whose LCL is past genesis (a node with committed
+    /// state worth protecting), matching the #3797 incident node.
+    #[cfg(test)]
+    async fn app_past_genesis() -> App {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let mut header = app.ledger_manager.current_header();
+        header.ledger_seq = 63_733_600;
+        app.ledger_manager
+            .set_header_for_test(header, henyey_common::Hash256::ZERO);
+        assert!(
+            app.current_ledger_seq() > GENESIS_LEDGER_SEQ,
+            "precondition: node must be past genesis"
+        );
+        // Keep the tempdir alive for the app's lifetime by leaking it — the app
+        // holds an open DB handle into it and the process exits at test end.
+        std::mem::forget(dir);
+        app
+    }
+
+    /// PRIMARY REGRESSION (#3797). Drives the exact production seam that
+    /// `run_cmd`'s startup-catchup Err arm calls — `signal_startup_catchup_failure`
+    /// — under a capturing subscriber, feeding a realistically `.context()`-wrapped
+    /// knit-to-LCL `HistoryError` at `LCL > genesis` (the incident shape). Asserts
+    /// the rendered event carries `fatal_wipe_required=true`.
+    ///
+    /// FAILS on `origin/main`: the startup path there `?`-propagates the error
+    /// with no wipe field (grep over the incident crash log returned 0 matches),
+    /// so the monitor's (3a) auto-wipe never fired. PASSES after the fix.
+    #[tokio::test]
+    async fn test_startup_catchup_fatal_emits_wipe_field() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        const FATAL_WIPE_FIELD: &str = "fatal_wipe_required";
+
+        #[derive(Default)]
+        struct CapturedBool {
+            value: Option<bool>,
+        }
+        impl Visit for CapturedBool {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if field.name() == FATAL_WIPE_FIELD {
+                    self.value = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct WipeFieldSubscriber {
+            captured: Arc<Mutex<Option<bool>>>,
+        }
+        impl Subscriber for WipeFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut cap = CapturedBool::default();
+                event.record(&mut cap);
+                if let Some(v) = cap.value {
+                    *self.captured.lock().unwrap() = Some(v);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let app = app_past_genesis().await;
+
+        // Realistic incident shape: a typed knit-to-LCL HistoryError wrapped in
+        // an anyhow `.context()` layer, as `?` would add on the way out.
+        let err: anyhow::Error =
+            anyhow::Error::from(henyey_history::HistoryError::KnitLclHashMismatch {
+                expected: "4426b58c".into(),
+                actual: "6f828db4".into(),
+            })
+            .context("close_ledger failed at ledger 63733632");
+
+        // Guard the downcast-through-context path used by the classifier.
+        assert!(
+            app.startup_catchup_failure_requires_wipe(&err),
+            "classifier must fire on a .context()-wrapped knit-to-LCL error at LCL > genesis"
+        );
+
+        let sub = WipeFieldSubscriber::default();
+        let captured = sub.captured.clone();
+
+        // Drive the exact production seam run_cmd's Err arm calls.
+        with_default(sub, || {
+            app.signal_startup_catchup_failure(&err);
+        });
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(true),
+            "startup catchup fatal failure must emit {FATAL_WIPE_FIELD}=true so the \
+             monitor's (3a) auto-wipe self-heal fires (#3797)"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set on a fatal startup catchup failure"
+        );
+    }
+
+    /// #3797 predicate: a knit-to-LCL fatal at `LCL > genesis` requires a wipe.
+    #[tokio::test]
+    async fn test_startup_catchup_knit_fatal_beyond_genesis_requires_wipe() {
+        let app = app_past_genesis().await;
+        let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .into();
+        assert!(
+            app.startup_catchup_failure_requires_wipe(&err),
+            "knit-to-LCL at LCL > genesis is unrecoverable in-process — must wipe"
+        );
+    }
+
+    /// #3797 preserves #3410: a knit-to-LCL fatal at genesis (stateless fresh
+    /// node) must NOT wipe — there is no committed local state to protect.
+    #[tokio::test]
+    async fn test_startup_catchup_knit_fatal_at_genesis_no_wipe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        assert_eq!(
+            app.current_ledger_seq(),
+            GENESIS_LEDGER_SEQ,
+            "precondition: fresh app must be at genesis"
+        );
+        let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .into();
+        assert!(
+            !app.startup_catchup_failure_requires_wipe(&err),
+            "knit-to-LCL at genesis must NOT wipe (preserves #3410)"
+        );
+    }
+
+    /// #3797: a transient (download/archive/ENOSPC-class) error must NOT be
+    /// classified wipe-required — no false wipe on disk-full.
+    #[tokio::test]
+    async fn test_startup_catchup_transient_error_no_wipe() {
+        let app = app_past_genesis().await;
+        let err: anyhow::Error =
+            henyey_history::HistoryError::ArchiveUnreachable("timeout".into()).into();
+        assert!(
+            !app.startup_catchup_failure_requires_wipe(&err),
+            "transient errors must not trigger a wipe"
+        );
+    }
+
+    /// #3797: a non-knit verification/integrity fatal at `LCL > genesis`
+    /// (genuine local corruption) requires a wipe.
+    #[tokio::test]
+    async fn test_startup_catchup_verification_fatal_requires_wipe() {
+        let app = app_past_genesis().await;
+        let err: anyhow::Error =
+            henyey_history::HistoryError::VerificationFailed("bucket list hash mismatch".into())
+                .into();
+        assert!(
+            app.startup_catchup_failure_requires_wipe(&err),
+            "a verification/integrity fatal at LCL > genesis must wipe"
         );
     }
 }

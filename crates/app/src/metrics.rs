@@ -303,6 +303,14 @@ metric_catalog! {
             => "Current depth of the SCP signature-verify input channel (event-loop sampled)";
         SCP_VERIFY_INPUT_BACKLOG_PEAK = "henyey_scp_verify_input_backlog_peak"
             => "Monotonic high-water mark of verifier input backlog (worker sampled)";
+
+        // SCP persist-worker backlog gauges (#3796). The emit hot path spawns
+        // one detached persist worker per envelope; these expose the in-flight
+        // count that #3796 §2 had to measure with a bespoke /proc sampler.
+        SCP_PENDING_PERSISTS = "henyey_scp_pending_persists"
+            => "SCP persist worker threads currently in flight (deferred SQLite writes)";
+        SCP_PENDING_PERSISTS_PEAK = "henyey_scp_pending_persists_peak"
+            => "Process-lifetime high-water mark of in-flight SCP persist workers";
         SCP_VERIFY_OUTPUT_BACKLOG = "henyey_scp_verify_output_backlog"
             => "Current depth of the verified-envelope output channel (envelopes awaiting the event loop)";
         SCP_VERIFIER_THREAD_STATE = "henyey_scp_verifier_thread_state"
@@ -593,6 +601,12 @@ metric_catalog! {
             => "Total bounded retries of a consensus-critical persist DB commit \
                 after a transient SQLITE_BUSY/LOCKED, before escalating to a \
                 clean recoverable shutdown; see issue #3640";
+        EVENT_LOOP_STALL_ERROR_TOTAL = "henyey_event_loop_stall_error_total"
+            => "Event-loop stalls of >=30s, counted loop-side exactly once per \
+                stall when the loop resumes (issue #3795). Complete by \
+                construction — unlike the phase-locked watchdog sampler, which \
+                deterministically misses recovering stalls in a fixed blind \
+                band. Do NOT sum with the sampler's repeated WATCHDOG log lines.";
 
         // SCP/herder counters.
         SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
@@ -809,6 +823,12 @@ metric_catalog! {
             => "Total SCP envelopes with invalid signature";
         SCP_ENVELOPE_SIGN_TOTAL = "stellar_scp_envelope_sign_total"
             => "Total SCP envelopes signed locally";
+        // SCP persist-worker spawn counters (#3796). `attempted - spawn_failed`
+        // is the number of persist worker threads actually spawned.
+        SCP_PERSIST_ATTEMPTED_TOTAL = "henyey_scp_persist_attempted_total"
+            => "Total SCP persist worker spawns attempted (counted before the spawn)";
+        SCP_PERSIST_SPAWN_FAILED_TOTAL = "henyey_scp_persist_spawn_failed_total"
+            => "Total SCP persist worker spawns that failed to launch (e.g. EAGAIN)";
         SCP_VALUE_VALID_TOTAL = "stellar_scp_value_valid_total"
             => "Total SCP value validations returning valid (includes MaybeValid and MaybeValidDeferred)";
         SCP_VALUE_INVALID_TOTAL = "stellar_scp_value_invalid_total"
@@ -903,6 +923,16 @@ metric_catalog! {
     }
 
     histograms {
+        // Event-loop stall distribution (issue #3795).
+        EVENT_LOOP_STALL_SECONDS = "henyey_event_loop_stall_seconds"
+            => "Event-loop inter-tick stall duration (seconds), recorded \
+                loop-side exactly once per stall when the loop resumes. \
+                TRUNCATED at >=15s by design (a partial distribution — shorter \
+                gaps are not recorded), and counts each stall EXACTLY ONCE, \
+                whereas the watchdog sampler's WARN/ERROR log lines fire \
+                repeatedly during one stall; the two must not be summed. See \
+                issue #3795.";
+
         // Phase 4: Ledger close histogram.
         LEDGER_CLOSE_DURATION_SECONDS = "stellar_ledger_close_duration_seconds"
             => "Ledger close wall-clock duration in seconds";
@@ -1493,6 +1523,14 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     SCP_VALUE_INVALID_TOTAL.absolute(snap.scp.value_invalid_total);
     SCP_NOMINATION_COMBINECANDIDATES_TOTAL.absolute(snap.scp.combine_candidates_total);
 
+    // SCP persist-worker backlog (#3796). Live + peak gauges plus monotonic
+    // attempt/failure counters (pushed with `.absolute` = fetch_max, matching
+    // the other cumulative SCP counters — both values are monotonic).
+    SCP_PENDING_PERSISTS.set(snap.scp_persist.pending as f64);
+    SCP_PENDING_PERSISTS_PEAK.set(snap.scp_persist.pending_peak as f64);
+    SCP_PERSIST_ATTEMPTED_TOTAL.absolute(snap.scp_persist.attempted_total);
+    SCP_PERSIST_SPAWN_FAILED_TOTAL.absolute(snap.scp_persist.spawn_failed_total);
+
     // Feed the medida-compat scp meters (`scp.value.valid`/`scp.value.invalid`)
     // for the stellar-core-compatible /metrics endpoint by delta-marking the
     // cumulative totals on this periodic refresh, so marks are spread over time
@@ -1831,6 +1869,70 @@ mod tests {
             assert!(
                 output.contains(&format!("{} 0", name)),
                 "counter {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    /// The SCP persist-worker series (#3796) are present in the catalog: two
+    /// gauges and two counters, all unlabeled and pre-registered at 0, with
+    /// HELP/TYPE emitted after `describe_metrics()` + `register_label_series()`.
+    #[test]
+    fn test_scp_persist_metrics_in_catalog() {
+        for name in [
+            "henyey_scp_pending_persists",
+            "henyey_scp_pending_persists_peak",
+        ] {
+            assert!(
+                ALL_GAUGE_NAMES.contains(&name),
+                "gauge {} missing from ALL_GAUGE_NAMES",
+                name
+            );
+            assert!(
+                ALL_PREREGISTERED_GAUGE_NAMES.contains(&name),
+                "gauge {} should be pre-registered",
+                name
+            );
+        }
+        for name in [
+            "henyey_scp_persist_attempted_total",
+            "henyey_scp_persist_spawn_failed_total",
+        ] {
+            assert!(
+                ALL_COUNTER_NAMES.contains(&name),
+                "counter {} missing from ALL_COUNTER_NAMES",
+                name
+            );
+            assert!(
+                ALL_PREREGISTERED_COUNTER_NAMES.contains(&name),
+                "counter {} should be pre-registered",
+                name
+            );
+        }
+
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+        assert!(
+            output.contains("# TYPE henyey_scp_pending_persists gauge"),
+            "pending gauge TYPE missing"
+        );
+        assert!(
+            output.contains("# TYPE henyey_scp_persist_attempted_total counter"),
+            "attempted counter TYPE missing"
+        );
+        for name in [
+            "henyey_scp_pending_persists",
+            "henyey_scp_pending_persists_peak",
+            "henyey_scp_persist_attempted_total",
+            "henyey_scp_persist_spawn_failed_total",
+        ] {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "{} should be pre-registered at 0",
                 name
             );
         }

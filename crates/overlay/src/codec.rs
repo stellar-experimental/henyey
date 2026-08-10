@@ -12,8 +12,13 @@
 //! # Length Field Format
 //!
 //! The length field uses XDR record marking semantics:
-//! - **Bit 31 (MSB)**: Final-fragment flag. Henyey emits and accepts only
-//!   single-fragment overlay messages, so this bit must be set.
+//! - **Bit 31 (MSB)**: Record-marking continuation ("last fragment") flag.
+//!   Henyey always sets it on send, since every overlay message is written as
+//!   a single XDR record fragment. On receive the bit is **masked off and
+//!   never rejected on**, matching stellar-core's
+//!   `TCPPeer::getIncomingMsgLength()` (`TCPPeer.cpp:673-686`), which does
+//!   `length &= 0x7f` and never inspects the bit. It is surfaced as
+//!   [`MessageFrame::is_last_fragment`] for diagnostics only.
 //! - **Bits 0-30**: Actual message body length in bytes.
 //!
 //! # Message Size Limits
@@ -163,17 +168,18 @@ impl Decoder for MessageCodec {
                         return Ok(None);
                     }
 
-                    // Read XDR record-marking prefix. Bit 31 is the final
-                    // fragment flag, not an authentication marker.
+                    // Read XDR record-marking prefix. Bit 31 is the
+                    // continuation ("last fragment") flag, not an
+                    // authentication marker. It is masked off and never
+                    // rejected on: stellar-core's
+                    // `TCPPeer::getIncomingMsgLength()` (TCPPeer.cpp:673-686)
+                    // does `length &= 0x7f` and never inspects the bit, so
+                    // rejecting a clear bit would drop peers stellar-core
+                    // keeps (#3776). The value is retained purely as
+                    // descriptive metadata on `MessageFrame`.
                     let raw_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
                     let is_last_fragment = (raw_len & 0x80000000) != 0;
                     let len = (raw_len & 0x7FFFFFFF) as usize;
-
-                    if !is_last_fragment {
-                        return Err(OverlayError::Message(
-                            "fragmented XDR records are not supported".into(),
-                        ));
-                    }
 
                     // Validate length
                     // OVERLAY_SPEC §3.3: len==0 is handled distinctly as
@@ -468,6 +474,71 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_accepts_continuation_bit_clear() {
+        // Regression for #3776: a frame whose XDR record-marking bit 31 is
+        // CLEAR must decode exactly like the bit-31-set equivalent.
+        // stellar-core's `TCPPeer::getIncomingMsgLength()` masks the bit off
+        // (`length &= 0x7f`) and never inspects it, and stellar-core's own
+        // writer (xdrpp `marshal.cc`) always sets it and never implements
+        // continuation fragments — so rejecting a clear bit is strictly
+        // stricter than upstream and drops peers stellar-core would keep.
+        let msg = make_test_message();
+
+        // Reference frame: bit 31 set (what `encode_message` emits).
+        let with_bit = MessageCodec::encode_message(&msg).unwrap();
+        let body = &with_bit[4..];
+
+        // Same frame, bit 31 cleared in the length prefix.
+        let mut without_bit = Vec::with_capacity(with_bit.len());
+        without_bit.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        without_bit.extend_from_slice(body);
+
+        // Sanity: the two differ only in bit 31 of the prefix.
+        let raw_len_set = u32::from_be_bytes([with_bit[0], with_bit[1], with_bit[2], with_bit[3]]);
+        let raw_len_clear = u32::from_be_bytes([
+            without_bit[0],
+            without_bit[1],
+            without_bit[2],
+            without_bit[3],
+        ]);
+        assert_eq!(raw_len_set & 0x80000000, 0x80000000);
+        assert_eq!(raw_len_clear & 0x80000000, 0);
+        assert_eq!(raw_len_set & 0x7FFFFFFF, raw_len_clear & 0x7FFFFFFF);
+
+        // Decode the bit-31-set frame for comparison.
+        let mut codec = MessageCodec::new();
+        let mut buf = BytesMut::from(&with_bit[..]);
+        let expected = codec
+            .decode(&mut buf)
+            .expect("bit-31-set frame should decode")
+            .expect("bit-31-set frame should yield a complete frame");
+        assert!(expected.is_last_fragment);
+
+        // Decode the bit-31-clear frame: must succeed identically, only with
+        // `is_last_fragment == false` as descriptive metadata.
+        let mut codec = MessageCodec::new();
+        let mut buf = BytesMut::from(&without_bit[..]);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("bit-31-clear frame must not be rejected (#3776)")
+            .expect("bit-31-clear frame should yield a complete frame");
+
+        assert!(
+            !frame.is_last_fragment,
+            "bit 31 clear should be reported as is_last_fragment == false"
+        );
+        assert_eq!(frame.raw_len, expected.raw_len);
+        match (frame.message, expected.message) {
+            (AuthenticatedMessage::V0(got), AuthenticatedMessage::V0(want)) => {
+                assert_eq!(got.sequence, want.sequence);
+                assert_eq!(got.mac.mac, want.mac.mac);
+                assert!(matches!(got.message, StellarMessage::Peers(_)));
+            }
+        }
+        assert!(buf.is_empty(), "the whole frame should have been consumed");
+    }
+
+    #[test]
     fn test_codec_streaming() {
         let msg = make_test_message();
         let mut codec = MessageCodec::new();
@@ -552,7 +623,7 @@ mod tests {
         // OVERLAY_SPEC §3.3: zero-length messages produce a distinct
         // "error during read" error, matching stellar-core TCPPeer.cpp:690-700.
         let mut codec = MessageCodec::new();
-        let len: u32 = 0 | 0x80000000;
+        let len: u32 = 0x80000000;
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&[0u8; 16]);

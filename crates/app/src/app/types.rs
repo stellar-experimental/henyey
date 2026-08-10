@@ -382,6 +382,8 @@ pub struct AppMetricsSnapshot {
     pub scp: henyey_herder::ScpMetricsSnapshot,
     pub scp_phase: u8,
     pub scp_cumulative_statements: u64,
+    /// SCP persist-worker backlog counters (#3796).
+    pub scp_persist: henyey_herder::ScpPersistStats,
     /// Event-driven consensus-trigger timer firings (#2702).
     pub consensus_trigger_timer_fires: u64,
     pub nomination_timeout_fires: u64,

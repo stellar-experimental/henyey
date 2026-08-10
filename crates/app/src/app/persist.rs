@@ -540,7 +540,7 @@ fn handle_persist_error(context: &str, error: &BucketError, shutdown: &Recoverab
 /// reclassified recoverable. Mirrors the `is_query_interrupted` shape in
 /// `henyey_db::queries` (matching the structured `ErrorCode`, NOT the message
 /// string).
-fn is_transient_db_busy(error: &henyey_db::DbError) -> bool {
+pub(crate) fn is_transient_db_busy(error: &henyey_db::DbError) -> bool {
     matches!(
         error,
         henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(

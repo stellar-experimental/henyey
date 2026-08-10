@@ -884,6 +884,11 @@ impl Herder {
                 })
                 .map_err(|e| {
                     // If spawn fails we still need to drop the pending count.
+                    // `record_spawn_failure` is ADDITIVE — it does not replace
+                    // the `pending_persist_end` decrement (#3796): dropping the
+                    // decrement would leak `pending_persists` upward forever and
+                    // hang `wait_for_pending_persists`.
+                    manager_for_cb.record_spawn_failure();
                     manager_for_cb.pending_persist_end();
                     warn!(error = %e, slot, "failed to spawn scp-persist worker");
                 })
@@ -1513,6 +1518,16 @@ impl Herder {
     /// Get a snapshot of the SCP event counters for the metrics scrape path.
     pub fn scp_metrics_snapshot(&self) -> crate::metrics::ScpMetricsSnapshot {
         self.scp_metrics.snapshot()
+    }
+
+    /// Get a snapshot of the SCP persist-worker backlog counters for the
+    /// metrics scrape path (#3796). Returns all-zero defaults when no
+    /// persistence manager is installed (non-validator / pre-bootstrap).
+    pub fn scp_persist_stats(&self) -> crate::persistence::ScpPersistStats {
+        let Some(manager) = self.scp_persistence.get() else {
+            return crate::persistence::ScpPersistStats::default();
+        };
+        manager.persist_stats()
     }
 
     /// Get the cumulative SCP statement count (retained-memory gauge).
@@ -10102,6 +10117,54 @@ mod tests {
         );
     }
 
+    /// End-to-end proof that the emit hot path feeds the SCP persist-worker
+    /// stats series (#3796): after a real emit + drain, `attempted_total >= 1`,
+    /// `pending == 0`, and `peak >= 1`.
+    #[tokio::test]
+    async fn test_scp_persist_stats_reports_after_emit() {
+        let (herder, _secret) = make_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(
+            herder.set_scp_persistence(Arc::clone(&manager)).is_ok(),
+            "install scp persistence"
+        );
+
+        herder.bootstrap(0);
+        herder
+            .trigger_next_ledger(1)
+            .expect("trigger_next_ledger should succeed");
+
+        assert!(
+            manager.wait_for_pending_persists(std::time::Duration::from_secs(5)),
+            "persist worker threads must drain within 5s"
+        );
+
+        let stats = herder.scp_persist_stats();
+        assert!(
+            stats.attempted_total >= 1,
+            "emit hot path must record at least one persist attempt; got {}",
+            stats.attempted_total
+        );
+        assert_eq!(stats.pending, 0, "backlog must have drained");
+        assert!(
+            stats.pending_peak >= 1,
+            "peak must reflect the in-flight worker; got {}",
+            stats.pending_peak
+        );
+    }
+
+    /// `scp_persist_stats` returns all-zero defaults (no panic) when no
+    /// persistence manager is installed.
+    #[test]
+    fn test_scp_persist_stats_default_without_manager() {
+        let (herder, _secret) = make_validator_herder();
+        // Intentionally DO NOT install a persistence manager.
+        assert_eq!(
+            herder.scp_persist_stats(),
+            crate::persistence::ScpPersistStats::default()
+        );
+    }
+
     /// End-to-end check: after a real emit triggers a real persist, the
     /// GC purge must keep referenced tx sets and remove orphans. Validates
     /// the full #2698 + #2768 persistence loop.
@@ -10603,7 +10666,7 @@ mod tests {
         // Live-replay is gated off: the future slot is NOT installed into SCP.
         assert!(
             Herder::RESTORE_LIVE_ENVELOPE_REPLAY
-                == !herder.get_current_state_for_slot(lcl + 1).is_empty(),
+                != herder.get_current_state_for_slot(lcl + 1).is_empty(),
             "future-slot installation must track the RESTORE_LIVE_ENVELOPE_REPLAY gate"
         );
     }

@@ -347,6 +347,14 @@ const MAINTENANCE_CHUNK_LEDGERS: u32 = 2;
 /// between chunks.
 const MAINTENANCE_CHUNK_PAUSE: Duration = Duration::from_millis(25);
 
+/// Bounded retry count for a transiently-busy maintenance delete chunk.
+/// Deliberately small and maintenance-local — NOT tied to
+/// `commit_with_busy_retry`'s consensus-continuation semantics (that path
+/// escalates to a recoverable shutdown when its budget is exhausted, which is
+/// disproportionate for a routine retention trim: the node should simply wait
+/// for the next scheduled maintenance cycle). See #3772.
+const MAINTENANCE_DELETE_MAX_ATTEMPTS: u32 = 3;
+
 /// Run one table's maintenance deletion in bounded chunks.
 ///
 /// Calls `delete_chunk` with at most [`MAINTENANCE_CHUNK_LEDGERS`] ledgers per
@@ -363,21 +371,56 @@ fn delete_in_chunks(
     let mut total_rows = 0u64;
     while remaining > 0 {
         let chunk = remaining.min(MAINTENANCE_CHUNK_LEDGERS);
-        // Per-chunk WAL write-lock instrumentation (#3702): the guard must
-        // wrap a single bounded statement, not the whole pass, so a reported
-        // long hold is a real single-transaction hold.
-        let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
-        match delete_chunk(chunk) {
+        // Retry a transiently-busy chunk a bounded number of times before
+        // giving up on this table's trim (#3772). Losing the SQLite
+        // write-lock race for the whole `busy_timeout` window must not
+        // silently abort the entire retention pass — that starves exactly the
+        // trimming that would relieve the contention. A genuine (non-transient)
+        // error still fails closed immediately, and the budget is small so a
+        // fully-stuck table costs at most MAINTENANCE_DELETE_MAX_ATTEMPTS
+        // attempts. This is deliberately NOT `commit_with_busy_retry`, whose
+        // exhausted-budget path triggers a recoverable shutdown — overkill for
+        // a routine trim that can wait for the next maintenance cycle.
+        let mut outcome: Result<u32, henyey_db::DbError> = Ok(0);
+        let mut attempts = 0u32;
+        while attempts < MAINTENANCE_DELETE_MAX_ATTEMPTS {
+            attempts += 1;
+            // Per-chunk WAL write-lock instrumentation (#3702): the guard must
+            // wrap a single bounded statement, not the whole pass, so a
+            // reported long hold is a real single-transaction hold. Each retry
+            // attempt is its own single delete statement, hence its own guard.
+            let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
+            match delete_chunk(chunk) {
+                Ok(rows) => {
+                    outcome = Ok(rows);
+                    break;
+                }
+                Err(e) if crate::app::is_transient_db_busy(&e) => {
+                    outcome = Err(e);
+                    drop(_write_ctx);
+                    // Back off before retrying, unless the budget is exhausted.
+                    if attempts < MAINTENANCE_DELETE_MAX_ATTEMPTS {
+                        std::thread::sleep(MAINTENANCE_CHUNK_PAUSE);
+                    }
+                }
+                Err(e) => {
+                    // Non-transient error: fail closed immediately, no retry.
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+
+        match outcome {
             Ok(0) => break,
             Ok(rows) => {
                 total_rows += rows as u64;
             }
             Err(e) => {
-                warn!(error = %e, "Failed to delete old {} entries", label);
+                warn!(error = %e, attempts, "Failed to delete old {} entries", label);
                 break;
             }
         }
-        drop(_write_ctx);
         remaining = remaining.saturating_sub(chunk);
         if remaining > 0 {
             std::thread::sleep(MAINTENANCE_CHUNK_PAUSE);
@@ -1472,5 +1515,88 @@ mod tests {
         });
         assert_eq!(calls, 2, "loop must stop at the failing chunk");
         assert_eq!(total, 2, "only the first chunk's rows are counted");
+    }
+
+    /// Build a transient `DatabaseBusy` (`SQLITE_BUSY`) error, the exact shape
+    /// `is_transient_db_busy` classifies as recoverable. Mirrors the persist.rs
+    /// test helper; extended_code is documented for traceability only — the
+    /// gate is the primary `DatabaseBusy` code.
+    fn busy_error() -> henyey_db::DbError {
+        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    /// #3772: a chunk that loses the SQLite write-lock race once (transient
+    /// busy) must be retried, not silently abort the whole table's trim. On the
+    /// unmodified single-shot code the first busy error `break`s the loop, so
+    /// the closure is called once and the chunk's rows are lost.
+    #[test]
+    fn test_delete_in_chunks_retries_transient_busy_then_succeeds() {
+        let mut calls = 0u32;
+        let total = delete_in_chunks(100, "test", |chunk| {
+            calls += 1;
+            match calls {
+                // First chunk: fail busy once, then succeed on retry.
+                1 => Err(busy_error()),
+                2 => Ok(chunk * 3),
+                // Second chunk reports no rows -> terminates the pass.
+                _ => Ok(0),
+            }
+        });
+        assert_eq!(
+            calls, 3,
+            "busy chunk must be retried (call 1 fails busy, call 2 succeeds, call 3 drains)"
+        );
+        assert_eq!(
+            total,
+            (MAINTENANCE_CHUNK_LEDGERS as u64) * 3,
+            "the retried chunk's rows must count toward the total"
+        );
+    }
+
+    /// #3772: a persistently-busy chunk must give up after exactly
+    /// `MAINTENANCE_DELETE_MAX_ATTEMPTS` attempts (bounded — no unbounded
+    /// spin), then break the pass. On the unmodified code the loop breaks after
+    /// a single call.
+    #[test]
+    fn test_delete_in_chunks_gives_up_after_max_attempts() {
+        let mut calls = 0u32;
+        let total = delete_in_chunks(100, "test", |_chunk| -> Result<u32, henyey_db::DbError> {
+            calls += 1;
+            Err(busy_error())
+        });
+        assert_eq!(
+            calls, MAINTENANCE_DELETE_MAX_ATTEMPTS,
+            "a persistently-busy chunk must be attempted exactly MAINTENANCE_DELETE_MAX_ATTEMPTS times"
+        );
+        assert_eq!(
+            total, 0,
+            "no rows are deleted when every attempt fails busy"
+        );
+    }
+
+    /// #3772: a genuine (non-transient) error must NOT be retried — the
+    /// fail-closed behavior for real corruption/integrity failures is
+    /// preserved. Exactly one call, then break.
+    #[test]
+    fn test_delete_in_chunks_does_not_retry_non_transient_error() {
+        let mut calls = 0u32;
+        let total = delete_in_chunks(100, "test", |_chunk| -> Result<u32, henyey_db::DbError> {
+            calls += 1;
+            Err(henyey_db::DbError::Integrity("boom".into()))
+        });
+        assert_eq!(
+            calls, 1,
+            "a non-transient error must not be retried (fail closed immediately)"
+        );
+        assert_eq!(
+            total, 0,
+            "no rows counted on immediate non-transient failure"
+        );
     }
 }

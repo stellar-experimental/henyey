@@ -10371,6 +10371,57 @@ BOARDEOF
     tap_not_ok "select_latest_green: green > MAX_DEPLOY_WALK ahead → empty + walk-exceeded (#3351)" "out='$_out6' err='$_err6'"
   fi
 
+  # Case 7 (#3740): a sha whose NEWEST Verify-Execution run concluded `failure`
+  # must be disqualified even though an OLDER run of the SAME sha succeeded.
+  # Records newest-first: G's newest is failure (supersedes G's older success),
+  # so the selector must fall through to the next green sha G_OLD, NOT return G.
+  # FAILS on main (main skips the failure row and returns G off the older success).
+  _records_newer_failure_same_sha() {
+    printf '%s\n' \
+      "G|completed|failure" \
+      "G|completed|success" \
+      "G_OLD|completed|success"
+  }
+  _sel7="$(_records_newer_failure_same_sha | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ "$_sel7" == "G_OLD" ]]; then
+    tap_ok "select_latest_green: sha with newer failure is disqualified (#3740)"
+  else
+    tap_not_ok "select_latest_green: sha with newer failure is disqualified (#3740)" "got '$_sel7' (expected 'G_OLD')"
+  fi
+
+  # Case 8 (#3740): newest run for the only candidate sha is a failure that
+  # supersedes an older success, and there is no other green → empty stdout +
+  # reason green-superseded-by-failure (the "note logged when a sha is skipped
+  # due to a newer failure" the issue asks for). FAILS on main (returns G).
+  _records_superseded_only() {
+    printf '%s\n' \
+      "G|completed|failure" \
+      "G|completed|success"
+  }
+  _err8="$(_records_superseded_only | select_latest_green_deploy_target "DEP" "HEAD" 2>&1 >/dev/null)"
+  _out8="$(_records_superseded_only | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ -z "$_out8" && "$_err8" == *"green-superseded-by-failure"* ]]; then
+    tap_ok "select_latest_green: newer failure + no other green → green-superseded-by-failure (#3740)"
+  else
+    tap_not_ok "select_latest_green: newer failure + no other green → green-superseded-by-failure (#3740)" "out='$_out8' err='$_err8'"
+  fi
+
+  # Case 9 (#3740, GUARD — passes on main too): a `cancelled` newest row is
+  # cancel-per-head noise, NOT a definitive verdict, so it must NOT disqualify an
+  # older success for the same sha. Guards the fix against over-disqualifying:
+  # only success/failure are definitive; cancelled/skipped/etc. are ignored.
+  _records_cancelled_newest_same_sha() {
+    printf '%s\n' \
+      "G|completed|cancelled" \
+      "G|completed|success"
+  }
+  _sel9="$(_records_cancelled_newest_same_sha | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ "$_sel9" == "G" ]]; then
+    tap_ok "select_latest_green: cancelled newest does not mask older green same sha (#3740)"
+  else
+    tap_not_ok "select_latest_green: cancelled newest does not mask older green same sha (#3740)" "got '$_sel9' (expected 'G')"
+  fi
+
   # ── #3581: select_latest_green_deploy_target runs under zsh ────────────────
   # The monitor-tick deploy gate invokes this selector INLINE in the tick shell,
   # which is zsh. Under zsh, `status` is a read-only special parameter (alias for

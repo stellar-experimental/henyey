@@ -2460,3 +2460,501 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
     let final_header = ledger_manager.current_header();
     assert_eq!(final_header.ledger_seq, target);
 }
+
+// ---------------------------------------------------------------------------
+// #3811 regression tests: persist-before-replay ordering.
+// ---------------------------------------------------------------------------
+
+/// Shared helper (#3811): serve a fixtures map over an ephemeral in-process
+/// axum archive and return its base URL. Returns `None` when TCP bind is not
+/// permitted in the sandbox, so callers early-return (skip) exactly like the
+/// existing per-test `TcpListener::bind` guards.
+async fn spawn_test_archive(fixtures: HashMap<String, Vec<u8>>) -> Option<String> {
+    let fixtures = Arc::new(fixtures);
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        let key = path.trim_start_matches('/');
+                        if let Some(body) = state.get(key) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            return None;
+        }
+        Err(err) => panic!("bind: {err}"),
+    };
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    Some(format!("http://{}/", addr))
+}
+
+/// Shared helper (#3811): build a synthetic empty-ledger archive spanning
+/// `[lcl_seq, target]`. Headers carry a correct hash chain and empty
+/// generalized tx sets; `bucket_list_hash` is left ZERO because callers of
+/// this helper disable bucket/header-hash verification. Returns the fixtures
+/// map plus the LCL header and its hash so the caller can pre-initialize the
+/// `LedgerManager` for the replay-only path.
+fn build_empty_chain_fixtures(
+    lcl_seq: u32,
+    target: u32,
+) -> (HashMap<String, Vec<u8>>, LedgerHeader, Hash256) {
+    use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
+
+    let empty_result_set = TransactionResultSet {
+        results: VecM::default(),
+    };
+    let empty_result_xdr = empty_result_set
+        .to_xdr(stellar_xdr::Limits::none())
+        .expect("tx result xdr");
+    let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
+
+    let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
+        let classic_phase = TransactionPhase::V0(VecM::default());
+        let soroban_phase = henyey_tx::tx_set_xdr::empty_soroban_phase();
+        let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(*prev_hash.as_bytes()),
+            phases: vec![classic_phase, soroban_phase]
+                .try_into()
+                .unwrap_or_default(),
+        });
+        let gen_set_variant = TransactionSetVariant::Generalized(gen_set);
+        henyey_history::verify::compute_tx_set_hash(&gen_set_variant).expect("tx set hash")
+    };
+
+    let mut headers: Vec<(u32, LedgerHeader, Hash256)> = Vec::new();
+    let header_lcl = make_header(
+        lcl_seq,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let hash_lcl = verify::compute_header_hash(&header_lcl).expect("lcl header hash");
+    headers.push((lcl_seq, header_lcl.clone(), hash_lcl));
+
+    let mut prev_hash = hash_lcl;
+    for seq in (lcl_seq + 1)..=target {
+        let tx_set_hash = compute_empty_gen_tx_set_hash(&prev_hash);
+        let header = make_header(
+            seq,
+            prev_hash,
+            Hash256::ZERO,
+            tx_set_hash,
+            empty_tx_result_hash,
+        );
+        let hash = verify::compute_header_hash(&header).expect("header hash");
+        headers.push((seq, header, hash));
+        prev_hash = hash;
+    }
+
+    // Group headers into their covering checkpoints (strict, as in the
+    // large-gap parity fixture).
+    let mut checkpoints: Vec<u32> = headers
+        .iter()
+        .map(|(seq, _, _)| henyey_history::checkpoint::checkpoint_containing(*seq))
+        .collect();
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+
+    let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
+    for &checkpoint in &checkpoints {
+        let entries: Vec<Vec<u8>> = headers
+            .iter()
+            .filter(|(seq, _, _)| {
+                henyey_history::checkpoint::checkpoint_containing(*seq) == checkpoint
+            })
+            .map(|(_, header, hash)| {
+                let entry = LedgerHeaderHistoryEntry {
+                    hash: Hash(*hash.as_bytes()),
+                    header: header.clone(),
+                    ext: LedgerHeaderHistoryEntryExt::default(),
+                };
+                entry
+                    .to_xdr(stellar_xdr::Limits::none())
+                    .expect("header xdr")
+            })
+            .collect();
+        if !entries.is_empty() {
+            fixtures.insert(
+                checkpoint_path("ledger", checkpoint, "xdr.gz"),
+                gzip_bytes(&record_marked(&entries)),
+            );
+        }
+        // Empty transaction/result files: download synthesizes empty tx sets.
+        fixtures.insert(
+            checkpoint_path("transactions", checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+        fixtures.insert(
+            checkpoint_path("results", checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+    }
+
+    register_published_target_has(&mut fixtures, target);
+    (fixtures, header_lcl, hash_lcl)
+}
+
+/// Regression test for #3811 (load-bearing).
+///
+/// A retriable persist failure — here the `ledgerheaders` table is dropped so
+/// `persist_ledger_history`'s first write (`store_ledger_header`) fails and
+/// maps to the retriable `HistoryError::CatchupFailed` — must NOT leave the
+/// in-memory LCL advanced past a batch whose history rows were never written,
+/// and must NOT report catchup success.
+///
+/// On `origin/main` (persist-AFTER-replay), attempt 0 replays the whole batch
+/// (advancing LCL to `target`), then persist fails retriably; the retry loop's
+/// next attempt computes `replay_first = target + 1 > target` and takes the
+/// early `Ok` return, so catchup reports SUCCESS with LCL at `target` and zero
+/// rows across `[lcl+1, target]` — the silent multi-table hole this issue is
+/// about (it also silently increments
+/// `stellar_history_apply_ledger_chain_success_total`). Both assertions below
+/// therefore FAIL on main.
+///
+/// After the fix (persist-BEFORE-replay), persist fails before any
+/// `close_ledger`, so LCL never moves off `lcl`, every retry fails identically,
+/// and catchup returns `Err`.
+///
+/// Note: on the fixed path this intentionally exhausts `REPLAY_RETRY_COUNT`
+/// (~6.2s of backoff sleep). Do NOT shrink the retry constants — they are
+/// parity-pinned by `test_replay_retry_count_matches_core`.
+#[tokio::test]
+async fn test_persist_failure_does_not_advance_lcl_or_report_catchup_success() {
+    use henyey_history::{CatchupManager, CatchupMode};
+
+    let lcl = 100u32;
+    // Single batch [101, 105] — all within checkpoint 127, so the whole batch
+    // is one persist transaction.
+    let target = 105u32;
+
+    let (fixtures, header_lcl, hash_lcl) = build_empty_chain_fixtures(lcl, target);
+    let Some(base_url) = spawn_test_archive(fixtures).await else {
+        return;
+    };
+
+    let archive = HistoryArchive::new(&base_url).expect("archive");
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+
+    // Shared single-connection in-memory DB (open_in_memory uses an r2d2 pool
+    // with max_size(1)), so the DROP below is visible to the later persist
+    // transaction. Keep our own Arc handle via new_with_arcs.
+    let db = Arc::new(Database::open_in_memory().expect("db"));
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+    let bucket_list = empty_bucket_list();
+    let hot_archive = henyey_bucket::HotArchiveBucketList::default();
+    ledger_manager
+        .initialize(bucket_list, hot_archive, header_lcl, hash_lcl)
+        .expect("initialize ledger manager at LCL");
+
+    let mut manager = CatchupManager::new_with_arcs(
+        vec![Arc::new(archive)],
+        Arc::new(bucket_manager),
+        Arc::clone(&db),
+    );
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
+        verify_header_hash: false,
+        ..Default::default()
+    });
+
+    // Inject the fault: drop `ledgerheaders` so `store_ledger_header` (the
+    // unconditional first write in `persist_ledger_history`) fails → retriable
+    // `CatchupFailed`. Nothing in the replay path READS `ledgerheaders`, so
+    // exactly persist fails. Do NOT hold the connection across catchup —
+    // max_size(1) would deadlock.
+    db.with_connection(|conn| {
+        conn.execute("DROP TABLE ledgerheaders", [])
+            .map_err(Into::into)
+    })
+    .expect("drop ledgerheaders");
+
+    let result = manager
+        .catchup_to_ledger_with_mode(target, CatchupMode::Recent(50), lcl, None, &ledger_manager)
+        .await;
+
+    // (b) LOAD-BEARING: LCL must not have advanced past the aborted batch.
+    assert_eq!(
+        ledger_manager.current_header().ledger_seq,
+        lcl,
+        "LCL must stay at the pre-batch value when the batch's persist fails"
+    );
+    // (a) Catchup must not report success.
+    assert!(
+        result.is_err(),
+        "catchup must return Err when a batch's history rows could not be persisted"
+    );
+}
+
+/// Regression test for #3811 (general invariant).
+///
+/// When replay aborts partway through a multi-ledger batch, every ledger that
+/// already advanced the LCL must have its history rows persisted. Here a batch
+/// spans three apply ledgers `[64, 66]`; the last ledger's archive
+/// `bucket_list_hash` is corrupted and `verify_header_hash` is enabled, so
+/// ledgers 64 and 65 close successfully (LCL advances to 65) and ledger 66
+/// raises `LedgerError::HashMismatch` → fatal `HistoryError::ReplayHashMismatch`
+/// mid-batch (close_ledger rejects the mismatch before mutating, so LCL stays
+/// at 65).
+///
+/// On `origin/main` (persist-AFTER-replay), the batch aborts before
+/// `persist_ledger_history` runs, so `get_ledger_header` is `None` across the
+/// whole advanced range — the final assertion FAILS. After the fix
+/// (persist-BEFORE-replay) the batch's rows were written up front, so every
+/// closed ledger has its header row.
+///
+/// Deviation from the plan: `verify_header_hash: true` is the only seam a
+/// corrupted *archive* header can trip — the `LedgerManager`'s
+/// `validate_bucket_hash` check compares the internally-computed hash against
+/// itself and so cannot be triggered from the archive (documented on
+/// `test_replay_with_validate_bucket_hash_enabled`). `verify_header_hash`
+/// compares the FULL header, so the non-corrupt ledgers' archive headers must
+/// exactly equal what `close_ledger` produces (bucket hash, `skip_list`, fees,
+/// …). Rather than hand-derive every field, a first "probe" pass replays the
+/// empty ledgers through a throwaway `LedgerManager` and captures the exact
+/// computed headers; the archive is then built from those (corrupting only the
+/// last), so the earlier ledgers pass verification by construction. Asserting
+/// on `get_ledger_header` (the unconditional write) rather than `txsets` keeps
+/// the test robust to empty-tx ledgers.
+#[tokio::test]
+async fn test_closed_ledgers_have_history_rows_when_replay_fails_midway() {
+    use henyey_history::{CatchupManager, CatchupMode};
+    use henyey_ledger::{LedgerCloseData, LedgerManager, LedgerManagerConfig};
+
+    let lcl = 63u32;
+    // Single batch [64, 66] (checkpoint_containing(64) == 127).
+    let target = 66u32;
+    let data_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+    let corrupt_seq = target; // Corrupt the LAST ledger's bucket_list_hash.
+
+    let passphrase = "Test SDF Network ; September 2015".to_string();
+
+    // LCL header (init state, never replayed — its bucket hash is irrelevant
+    // because we never enable a bucket-hash check on the LCL itself).
+    let header_lcl = make_header(
+        lcl,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let hash_lcl = verify::compute_header_hash(&header_lcl).expect("lcl hash");
+
+    let empty_result_set = TransactionResultSet {
+        results: VecM::default(),
+    };
+
+    // ---- Pass 1 (probe): replay empty CLASSIC ledgers through a throwaway
+    // LedgerManager to capture the exact computed headers. The archive is then
+    // built from these, so the non-corrupt ledgers match `verify_header_hash`
+    // by construction. Both passes initialize identically, so close_ledger is
+    // deterministic across them.
+    let probe = LedgerManager::new(
+        passphrase.clone(),
+        LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+    probe
+        .initialize(
+            empty_bucket_list(),
+            henyey_bucket::HotArchiveBucketList::default(),
+            header_lcl.clone(),
+            hash_lcl,
+        )
+        .expect("initialize probe manager");
+
+    let mut computed_header: HashMap<u32, LedgerHeader> = HashMap::new();
+    let mut tx_sets: HashMap<u32, TransactionSet> = HashMap::new();
+    for seq in (lcl + 1)..=target {
+        let prev = probe.current_header_hash();
+        let tx_set = TransactionSet {
+            previous_ledger_hash: Hash(*prev.as_bytes()),
+            txs: VecM::default(),
+        };
+        tx_sets.insert(seq, tx_set.clone());
+        let close_data = LedgerCloseData::new(seq, TransactionSetVariant::Classic(tx_set), 0, prev);
+        probe
+            .close_ledger(close_data, None)
+            .expect("probe close_ledger");
+        computed_header.insert(seq, probe.current_header());
+    }
+
+    // ---- Build the archive from the computed headers, corrupting only the
+    // last ledger's bucket_list_hash.
+    let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
+
+    // LCL checkpoint file (63): just the LCL header.
+    let lcl_entry = LedgerHeaderHistoryEntry {
+        hash: hash_lcl.into(),
+        header: header_lcl.clone(),
+        ext: LedgerHeaderHistoryEntryExt::default(),
+    };
+    fixtures.insert(
+        checkpoint_path("ledger", lcl, "xdr.gz"),
+        gzip_bytes(&record_marked(&[lcl_entry
+            .to_xdr(stellar_xdr::Limits::none())
+            .expect("lcl entry xdr")])),
+    );
+    fixtures.insert(
+        checkpoint_path("transactions", lcl, "xdr.gz"),
+        gzip_bytes(&[]),
+    );
+    fixtures.insert(checkpoint_path("results", lcl, "xdr.gz"), gzip_bytes(&[]));
+
+    // Data checkpoint file (127): apply headers 64..66 (66 corrupted).
+    let mut apply_header_xdrs: Vec<Vec<u8>> = Vec::new();
+    let mut tx_history_xdrs: Vec<Vec<u8>> = Vec::new();
+    let mut tx_result_xdrs: Vec<Vec<u8>> = Vec::new();
+    for seq in (lcl + 1)..=target {
+        let mut header = computed_header[&seq].clone();
+        if seq == corrupt_seq {
+            header.bucket_list_hash = Hash([0xFF; 32]);
+        }
+        let header_hash = verify::compute_header_hash(&header).expect("header hash");
+        let entry = LedgerHeaderHistoryEntry {
+            hash: header_hash.into(),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        apply_header_xdrs.push(
+            entry
+                .to_xdr(stellar_xdr::Limits::none())
+                .expect("entry xdr"),
+        );
+
+        let tx_history_entry = TransactionHistoryEntry {
+            ledger_seq: seq,
+            tx_set: tx_sets[&seq].clone(),
+            ext: TransactionHistoryEntryExt::V0,
+        };
+        tx_history_xdrs.push(
+            tx_history_entry
+                .to_xdr(stellar_xdr::Limits::none())
+                .expect("tx history xdr"),
+        );
+        let tx_result_entry = TransactionHistoryResultEntry {
+            ledger_seq: seq,
+            tx_result_set: empty_result_set.clone(),
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+        tx_result_xdrs.push(
+            tx_result_entry
+                .to_xdr(stellar_xdr::Limits::none())
+                .expect("tx result xdr"),
+        );
+    }
+    fixtures.insert(
+        checkpoint_path("ledger", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&record_marked(&apply_header_xdrs)),
+    );
+    fixtures.insert(
+        checkpoint_path("transactions", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&record_marked(&tx_history_xdrs)),
+    );
+    fixtures.insert(
+        checkpoint_path("results", data_checkpoint, "xdr.gz"),
+        gzip_bytes(&record_marked(&tx_result_xdrs)),
+    );
+
+    register_published_target_has(&mut fixtures, target);
+
+    let Some(base_url) = spawn_test_archive(fixtures).await else {
+        return;
+    };
+
+    // ---- Pass 2: real catchup with verify_header_hash enabled.
+    let archive = HistoryArchive::new(&base_url).expect("archive");
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = Arc::new(Database::open_in_memory().expect("db"));
+
+    let ledger_manager = LedgerManager::new(
+        passphrase.clone(),
+        LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+    ledger_manager
+        .initialize(
+            empty_bucket_list(),
+            henyey_bucket::HotArchiveBucketList::default(),
+            header_lcl.clone(),
+            hash_lcl,
+        )
+        .expect("initialize ledger manager at LCL");
+
+    let mut manager = CatchupManager::new_with_arcs(
+        vec![Arc::new(archive)],
+        Arc::new(bucket_manager),
+        Arc::clone(&db),
+    );
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
+        // Only header-hash verification is enabled: this is the seam a corrupt
+        // archive header can trip.
+        verify_header_hash: true,
+        ..Default::default()
+    });
+
+    let result = manager
+        .catchup_to_ledger_with_mode(target, CatchupMode::Recent(50), lcl, None, &ledger_manager)
+        .await;
+
+    // The batch must have aborted with a fatal hash mismatch at the last ledger.
+    assert!(
+        matches!(result, Err(HistoryError::ReplayHashMismatch { .. })),
+        "expected ReplayHashMismatch, got {result:?}"
+    );
+
+    // The earlier ledgers must have closed (LCL advanced) but the batch must
+    // have stopped before the corrupted last ledger — guards against the test
+    // becoming vacuous.
+    let current_lcl = ledger_manager.current_header().ledger_seq;
+    assert!(
+        current_lcl > lcl && current_lcl < target,
+        "expected a partial advance in ({lcl}, {target}), got {current_lcl}"
+    );
+
+    // Every ledger that advanced the LCL must have its header row persisted.
+    for seq in (lcl + 1)..=current_lcl {
+        assert!(
+            db.get_ledger_header(seq).expect("query header").is_some(),
+            "ledger {seq} closed (LCL advanced) but has no persisted header row"
+        );
+    }
+}
