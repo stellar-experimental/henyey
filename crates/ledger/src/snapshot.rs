@@ -725,6 +725,11 @@ impl SnapshotHandle {
         } else {
             self.inner.entries.values().cloned().collect()
         };
+        // Fast path (apply path, once per ledger over the full offer set):
+        // no overrides means nothing to retain against or extend with.
+        if self.overrides.is_empty() {
+            return Ok(entries);
+        }
         entries.retain(|entry| {
             !self
                 .overrides
