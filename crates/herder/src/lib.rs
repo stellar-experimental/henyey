@@ -167,8 +167,8 @@ pub use tx_queue::{
 
 // Persistence
 pub use persistence::{
-    get_tx_set_hashes, Database, PersistedSlotState, RestoredScpState, ScpPersistenceManager,
-    ScpStatePersistence, SqliteScpPersistence,
+    get_tx_set_hashes, Database, PersistedSlotState, RestoredScpState, ScpPersistStats,
+    ScpPersistenceManager, ScpStatePersistence, SqliteScpPersistence,
 };
 
 // HerderUtils

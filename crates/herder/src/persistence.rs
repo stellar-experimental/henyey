@@ -415,6 +415,46 @@ pub struct ScpPersistenceManager {
     pending_persists: std::sync::Mutex<usize>,
     /// Condvar signaled when `pending_persists` reaches zero.
     pending_persists_cv: std::sync::Condvar,
+    /// Lock-free mirror of `pending_persists`, published under the same mutex
+    /// (see `pending_persist_begin`/`_end`). The `/metrics` scrape path reads
+    /// this with `Ordering::Relaxed` and never touches the mutex, so it can
+    /// never contend with a persist worker. `pending_persists` remains the
+    /// single source of truth (it is paired with `pending_persists_cv`).
+    persist_pending: std::sync::atomic::AtomicU64,
+    /// Monotonic high-water mark of `persist_pending`. Process-lifetime; resets
+    /// on restart. Mirrors the accepted `SCP_VERIFY_INPUT_BACKLOG_PEAK`
+    /// precedent — a live gauge alone would read `0` on the large majority of
+    /// scrapes (see #3796 §2: concurrency was `0` for 82.9% of wall-clock).
+    persist_pending_peak: std::sync::atomic::AtomicU64,
+    /// Total persist worker spawns attempted (incremented in
+    /// `pending_persist_begin`, which runs BEFORE the thread is spawned).
+    /// `attempted - spawn_failed = threads actually spawned`.
+    persist_attempted_total: std::sync::atomic::AtomicU64,
+    /// Total persist worker spawns that failed (e.g. `EAGAIN` / thread-table
+    /// exhaustion). Bumped only by `record_spawn_failure`.
+    persist_spawn_failed_total: std::sync::atomic::AtomicU64,
+}
+
+/// Snapshot of the SCP persist-worker backlog counters for the `/metrics`
+/// scrape path (issue #3796).
+///
+/// - `pending`: persist workers currently in flight (live gauge).
+/// - `pending_peak`: process-lifetime high-water mark of `pending`.
+/// - `attempted_total`: cumulative persist spawns attempted.
+/// - `spawn_failed_total`: cumulative persist spawns that failed to launch.
+///
+/// `attempted_total - spawn_failed_total` is the number of persist worker
+/// threads actually spawned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScpPersistStats {
+    /// Persist workers currently in flight.
+    pub pending: u64,
+    /// Process-lifetime high-water mark of `pending`.
+    pub pending_peak: u64,
+    /// Cumulative persist spawns attempted (before the spawn).
+    pub attempted_total: u64,
+    /// Cumulative persist spawns that failed to launch.
+    pub spawn_failed_total: u64,
 }
 
 impl ScpPersistenceManager {
@@ -425,6 +465,10 @@ impl ScpPersistenceManager {
             last_slot_saved: parking_lot::RwLock::new(0),
             pending_persists: std::sync::Mutex::new(0),
             pending_persists_cv: std::sync::Condvar::new(),
+            persist_pending: std::sync::atomic::AtomicU64::new(0),
+            persist_pending_peak: std::sync::atomic::AtomicU64::new(0),
+            persist_attempted_total: std::sync::atomic::AtomicU64::new(0),
+            persist_spawn_failed_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -447,23 +491,62 @@ impl ScpPersistenceManager {
     /// Increment the pending-persist counter. Called by the emit callback's
     /// worker thread spawner BEFORE the thread is detached.
     pub(crate) fn pending_persist_begin(&self) {
+        use std::sync::atomic::Ordering;
         let mut pending = self
             .pending_persists
             .lock()
             .expect("pending mutex poisoned");
         *pending += 1;
+        // Publish the atomic mirrors WHILE the guard is still live, so the
+        // scrape path and any `wait_for_pending_persists` waiter observe a
+        // consistent view. `attempted_total` counts attempts (this runs before
+        // the spawn), and the peak is exact because it is taken under the lock.
+        let now = *pending as u64;
+        self.persist_pending.store(now, Ordering::Relaxed);
+        self.persist_pending_peak.fetch_max(now, Ordering::Relaxed);
+        self.persist_attempted_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement the pending-persist counter and notify waiters. Called by
     /// the worker thread on completion (success or error).
     pub(crate) fn pending_persist_end(&self) {
+        use std::sync::atomic::Ordering;
         let mut pending = self
             .pending_persists
             .lock()
             .expect("pending mutex poisoned");
         *pending = pending.saturating_sub(1);
+        // Store the mirror BEFORE `notify_all` and BEFORE dropping the guard —
+        // otherwise a waiter released by `notify_all` could observe
+        // `wait_for_pending_persists() == true` while `persist_stats().pending`
+        // is still nonzero (#3796 plan, Critic A).
+        self.persist_pending
+            .store(*pending as u64, Ordering::Relaxed);
         if *pending == 0 {
             self.pending_persists_cv.notify_all();
+        }
+    }
+
+    /// Record a persist worker spawn failure (e.g. `EAGAIN` / thread-table
+    /// exhaustion). Additive to — never a replacement for —
+    /// `pending_persist_end`, which the failure path must still call to release
+    /// the pending count.
+    pub(crate) fn record_spawn_failure(&self) {
+        use std::sync::atomic::Ordering;
+        self.persist_spawn_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot the SCP persist-worker backlog counters for the metrics scrape
+    /// path. Lock-free: reads the atomic mirrors with `Ordering::Relaxed` and
+    /// never touches the `pending_persists` mutex.
+    pub fn persist_stats(&self) -> ScpPersistStats {
+        use std::sync::atomic::Ordering;
+        ScpPersistStats {
+            pending: self.persist_pending.load(Ordering::Relaxed),
+            pending_peak: self.persist_pending_peak.load(Ordering::Relaxed),
+            attempted_total: self.persist_attempted_total.load(Ordering::Relaxed),
+            spawn_failed_total: self.persist_spawn_failed_total.load(Ordering::Relaxed),
         }
     }
 
@@ -688,6 +771,113 @@ mod tests {
                 .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         }
+    }
+
+    // --- SCP persist-worker stats (#3796) ---
+
+    #[test]
+    fn test_persist_stats_mirror_matches_pending_counter() {
+        let manager = ScpPersistenceManager::in_memory();
+        manager.pending_persist_begin();
+        manager.pending_persist_begin();
+        manager.pending_persist_begin();
+        manager.pending_persist_end();
+        manager.pending_persist_end();
+
+        let stats = manager.persist_stats();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.pending_peak, 3);
+        assert_eq!(stats.attempted_total, 3);
+        assert_eq!(stats.spawn_failed_total, 0);
+        // The atomic mirror must agree with the mutex source of truth.
+        assert_eq!(
+            stats.pending as usize,
+            *manager.pending_persists.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_persist_stats_peak_is_monotonic() {
+        let manager = ScpPersistenceManager::in_memory();
+        for _ in 0..3 {
+            manager.pending_persist_begin();
+        }
+        for _ in 0..3 {
+            manager.pending_persist_end();
+        }
+        assert_eq!(manager.persist_stats().pending, 0);
+        assert_eq!(manager.persist_stats().pending_peak, 3);
+
+        // Draining to zero must not reset the peak.
+        manager.pending_persist_begin();
+        let stats = manager.persist_stats();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.pending_peak, 3);
+    }
+
+    #[test]
+    fn test_persist_stats_end_saturates_at_zero() {
+        let manager = ScpPersistenceManager::in_memory();
+        // End with nothing pending must not underflow (a wrapped u64 would
+        // render as ~1.8e19 in the gauge).
+        manager.pending_persist_end();
+        assert_eq!(manager.persist_stats().pending, 0);
+    }
+
+    #[test]
+    fn test_persist_attempted_minus_spawn_failed_is_actual_spawns() {
+        let manager = ScpPersistenceManager::in_memory();
+        manager.pending_persist_begin();
+        manager.pending_persist_begin();
+        manager.pending_persist_begin();
+        manager.record_spawn_failure();
+
+        let stats = manager.persist_stats();
+        assert_eq!(stats.attempted_total, 3);
+        assert_eq!(stats.spawn_failed_total, 1);
+        // Documented arithmetic: attempted - spawn_failed == threads spawned.
+        assert_eq!(stats.attempted_total - stats.spawn_failed_total, 2);
+    }
+
+    #[test]
+    fn test_spawn_failure_path_does_not_leak_pending() {
+        let manager = ScpPersistenceManager::in_memory();
+        // Mirror the herder's `.map_err` arm: begin, then on spawn failure
+        // record the failure AND still end the pending count.
+        manager.pending_persist_begin();
+        manager.record_spawn_failure();
+        manager.pending_persist_end();
+
+        let stats = manager.persist_stats();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.spawn_failed_total, 1);
+    }
+
+    #[test]
+    fn test_persist_stats_concurrent_begin_end_settles_to_zero() {
+        use std::sync::Arc;
+        let manager = Arc::new(ScpPersistenceManager::in_memory());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = Arc::clone(&manager);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    m.pending_persist_begin();
+                    m.pending_persist_end();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let stats = manager.persist_stats();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.attempted_total, 400);
+        assert!(
+            stats.pending_peak >= 1 && stats.pending_peak <= 8,
+            "peak {} out of expected 1..=8 range",
+            stats.pending_peak
+        );
     }
 
     #[test]
