@@ -68,6 +68,18 @@ EOF
     echo "$script"
 }
 
+# extract_pubnet_matrix_block <workflow-file>
+# Emits the non-comment lines of the pubnet matrix block: from the
+# `network: pubnet` marker up to (but excluding) that shard's `steps:` line.
+extract_pubnet_matrix_block() {
+    # SIGPIPE-safe (#3835): the early `exit` lives in the awk that reads the file
+    # directly, so there is no upstream pipe writer to be killed when the reader
+    # stops early. The only downstream reader (grep) drains to EOF. Byte-identical
+    # to the original two-awk shape on the committed workflow.
+    awk '/network: pubnet/{f=1} f&&/^    steps:/{exit} f{print}' "$1" \
+        | grep -vE '^[[:space:]]*#'
+}
+
 # ============================================================
 # Test 1: test_real_horizon_core_up_probe_times_out_under_current_policy_and_succeeds_via_wrapper
 #
@@ -201,7 +213,7 @@ test_workflow_shard_probe_contract() {
     # appear within the entry's block (the next ~6 lines, before the next
     # matrix `- network:` entry).
     local galexie_line
-    galexie_line=$(grep -n 'enable: galexie$' "$WORKFLOW" | head -1 | cut -d: -f1)
+    galexie_line=$(grep -nm1 'enable: galexie$' "$WORKFLOW" | cut -d: -f1)
     if [[ -n "$galexie_line" ]]; then
         local galexie_block
         galexie_block=$(sed -n "$((galexie_line)),+6p" "$WORKFLOW")
@@ -251,8 +263,12 @@ test_workflow_shard_probe_contract() {
     fi
 
     # Check: pubnet shard does NOT include stellar_rpc_healthy (excluded upstream)
-    local pubnet_line
-    pubnet_line=$(grep -n 'pubnet' "$WORKFLOW" | grep -v '#' | head -1 | cut -d: -f1)
+    local pubnet_line pubnet_matches
+    # Capture the file-streaming stages fully (both drain to EOF), then run the
+    # early-exit `head -1` on the bounded variable — no file-reading writer is
+    # left holding a closed pipe (#3835).
+    pubnet_matches=$(grep -n 'pubnet' "$WORKFLOW" | grep -v '#')
+    pubnet_line=$(printf '%s\n' "$pubnet_matches" | head -1 | cut -d: -f1)
     if [[ -n "$pubnet_line" ]]; then
         # Get the probes line for the pubnet entry (within ~5 lines after)
         local pubnet_probes
@@ -283,7 +299,7 @@ test_workflow_shard_probe_contract() {
     # Check: local rpc shard includes test_friendbot.go (upstream runs friendbot
     # for any local shard whose enable contains rpc or horizon)
     local rpc_line
-    rpc_line=$(grep -n 'enable: rpc$' "$WORKFLOW" | head -1 | cut -d: -f1)
+    rpc_line=$(grep -nm1 'enable: rpc$' "$WORKFLOW" | cut -d: -f1)
     if [[ -n "$rpc_line" ]]; then
         local rpc_probes
         rpc_probes=$(sed -n "$((rpc_line)),+3p" "$WORKFLOW" | grep 'probes:')
@@ -721,7 +737,7 @@ test_workflow_uses_upstream_run_attempt_timeout_budget() {
     # (b) PROBE_TIMEOUT is computed from run_attempt * timeout_multiplier * 60.
     # `|| true` so a no-match doesn't abort under `set -e`.
     local probe_timeout_expr
-    probe_timeout_expr=$( (grep -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) | head -1)
+    probe_timeout_expr=$( (grep -m1 -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) )
     if echo "$probe_timeout_expr" | grep -q 'github.run_attempt' && \
        echo "$probe_timeout_expr" | grep -q 'timeout_multiplier' && \
        echo "$probe_timeout_expr" | grep -q '\* 60'; then
@@ -759,7 +775,7 @@ test_timeout_budget_matches_upstream_formula() {
     # All three formula terms present in the single PROBE_TIMEOUT expression.
     # `|| true` so a no-match doesn't abort under `set -e`.
     local probe_timeout_expr
-    probe_timeout_expr=$( (grep -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) | head -1)
+    probe_timeout_expr=$( (grep -m1 -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) )
     if echo "$probe_timeout_expr" | grep -q 'github.run_attempt' && \
        echo "$probe_timeout_expr" | grep -q 'timeout_multiplier' && \
        echo "$probe_timeout_expr" | grep -q '\* 60'; then
@@ -772,8 +788,8 @@ test_timeout_budget_matches_upstream_formula() {
     # The multiplier value equals upstream's 4.
     # `|| true` so a no-match doesn't abort under `set -e`.
     local workflow_multiplier
-    workflow_multiplier=$( (grep -E '^[[:space:]]*timeout_multiplier:[[:space:]]*[0-9]+' "$WORKFLOW" || true) \
-        | head -1 | sed -E 's/.*timeout_multiplier:[[:space:]]*([0-9]+).*/\1/')
+    workflow_multiplier=$( (grep -m1 -E '^[[:space:]]*timeout_multiplier:[[:space:]]*[0-9]+' "$WORKFLOW" || true) \
+        | sed -E 's/.*timeout_multiplier:[[:space:]]*([0-9]+).*/\1/')
     if [[ "$workflow_multiplier" == "4" ]]; then
         tap_ok "workflow_multiplier_equals_upstream_4"
     else
@@ -1281,7 +1297,7 @@ test_separate_workflow_run_retry_workflow() {
     # as declared by quickstart.yml's top-level `name:` field. A mismatch means
     # the trigger never fires.
     local quickstart_name
-    quickstart_name=$(grep -E '^name:' "$WORKFLOW" | head -1 | sed -E 's/^name:[[:space:]]*//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
+    quickstart_name=$(grep -m1 -E '^name:' "$WORKFLOW" | sed -E 's/^name:[[:space:]]*//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
     if [[ -n "$quickstart_name" ]] && grep -qF "$quickstart_name" "$retry_wf"; then
         tap_ok "retry_workflow_name_matches_quickstart_exactly"
     else
@@ -1539,8 +1555,7 @@ test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget() {
     # actual `soft_on_timeout: true` line), not prose inside a `#` comment that
     # mentions the flag — so strip comment lines before grepping.
     local pubnet_block non_galexie_local_blocks
-    pubnet_block=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
-        | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#')
+    pubnet_block=$(extract_pubnet_matrix_block "$WORKFLOW")
     # Non-galexie local blocks: from the first matrix include up to the testnet
     # entry, with the `enable: galexie` block (the line itself + its 3 override
     # keys) removed so the intentional #3563 de-gate doesn't trip this guard.
@@ -1954,8 +1969,67 @@ EOF
     pkill -f "$marker" 2>/dev/null || true
 }
 
+# ============================================================
+# Test: regression for #3835 — extract_pubnet_matrix_block must not SIGPIPE
+#
+# The harness runs under `set -euo pipefail`. A `producer-streams-file |
+# reader-exits-early` pipeline lets the reader tear the pipe down before the
+# producer's write() lands; the producer takes SIGPIPE, pipefail surfaces exit
+# 141, and set -e aborts the harness mid-plan (observed at test 88/101 in CI).
+# This guard drives the helper against a pubnet block whose post-`steps:`
+# remainder exceeds the 64 KB pipe buffer — the condition that makes the race
+# fire every time — and asserts the extraction does NOT die with SIGPIPE.
+# ============================================================
+test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow() {
+    local big="$TMPDIR_BASE/oversized-pubnet-workflow.yml"
+    local pad
+    pad=$(printf 'x%.0s' $(seq 1 60))
+    {
+        echo "    - network: pubnet"
+        echo "      probes: a"
+        echo "    steps:"
+        # >64 KB of matrix keys AFTER `steps:`, so the upstream producer keeps
+        # streaming long after the reader hits its exit condition.
+        local i
+        for i in $(seq 1 3000); do
+            printf '      key%d: value-%s\n' "$i" "$pad"
+        done
+    } > "$big"
+
+    local exit_code=0
+    ( set -euo pipefail; extract_pubnet_matrix_block "$big" >/dev/null ) || exit_code=$?
+
+    if [[ $exit_code -ne 141 ]]; then
+        tap_ok "test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow"
+    else
+        tap_not_ok "test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow" \
+            "SIGPIPE (exit 141) — pipe writer killed by early-exit reader"
+    fi
+}
+
+# ============================================================
+# Test: #3835 — extract_pubnet_matrix_block output preservation
+#
+# The SIGPIPE fix must be byte-identical to the original inline two-awk shape
+# on the committed workflow, so none of the other assertions that consume the
+# pubnet block change meaning. Reference = the original shape computed inline
+# (safe here because the real block is well under the 64 KB pipe buffer).
+# ============================================================
+test_pubnet_block_extraction_byte_identical_to_original_shape() {
+    local reference helper_out
+    reference=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
+        | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#')
+    helper_out=$(extract_pubnet_matrix_block "$WORKFLOW")
+    if [[ "$helper_out" == "$reference" ]]; then
+        tap_ok "test_pubnet_block_extraction_byte_identical_to_original_shape"
+    else
+        tap_not_ok "test_pubnet_block_extraction_byte_identical_to_original_shape" \
+            "helper output diverged from the original two-awk shape"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 101
+tap_plan 103
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1988,6 +2062,8 @@ test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
 test_testnet_hang_watchdog_emits_process_dump_before_step_kill
 test_testnet_shard_renders_step_timeout_25_others_360
 test_capture_diagnostics_docker_calls_are_time_bounded
+test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow
+test_pubnet_block_extraction_byte_identical_to_original_shape
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
