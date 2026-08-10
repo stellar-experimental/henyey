@@ -1449,6 +1449,7 @@ impl SnapshotBucketGcRegistry {
         for hash in &hashes {
             *reference_counts.entry(*hash).or_default() += 1;
         }
+        Self::update_pinned_gauge(reference_counts.len());
         drop(reference_counts);
 
         Arc::new(SnapshotBucketGcLease {
@@ -1459,6 +1460,16 @@ impl SnapshotBucketGcRegistry {
 
     fn active_hashes(&self) -> Vec<Hash256> {
         self.reference_counts.lock().keys().copied().collect()
+    }
+
+    /// Observability for the snapshot-retention accumulation hazard: observers
+    /// holding successive snapshots pin the UNION of every referenced bucket
+    /// file until their lookup closures drop. This gauge exposes how many
+    /// distinct bucket hashes are currently pinned as GC roots. (Only hash
+    /// count is exported: mapping a hash to its on-disk file size from here
+    /// would require a bucket-directory lookup per hash, which is not cheap.)
+    fn update_pinned_gauge(pinned: usize) {
+        metrics::gauge!("henyey_snapshot_gc_pinned_hashes").set(pinned as f64);
     }
 }
 
@@ -1480,11 +1491,21 @@ impl Drop for SnapshotBucketGcLease {
                 reference_counts.remove(hash);
             }
         }
+        SnapshotBucketGcRegistry::update_pinned_gauge(reference_counts.len());
     }
 }
 
 pub struct LedgerManager {
-    /// Serializes committed bucket state capture with ledger publication.
+    /// Serializes committed-market stream mutation (publish / reset /
+    /// initialize) with subscribe's atomic baseline capture.
+    ///
+    /// Scope is deliberately narrow: inside `commit_close()` it covers ONLY
+    /// the final consistency window (canonical `state.write()` publication +
+    /// committed-market event publication), never the long parts of commit
+    /// (tx-result hashing, bucket add_batch, Soroban recompute). Hot read
+    /// paths (`create_snapshot`, `is_initialized`, `begin_close`) do NOT
+    /// take this gate — blocking SCP tx-set validation or nomination behind
+    /// a full 1000+-tx commit would stall consensus.
     committed_state_gate: Mutex<()>,
     committed_market_generation: AtomicU64,
     committed_market_tx: tokio::sync::broadcast::Sender<CommittedMarketEvent>,
@@ -1541,7 +1562,12 @@ pub struct LedgerManager {
     /// Used by `load_pool_share_trustlines_for_account_and_asset` to find pool share
     /// trustlines without a full bucket list scan (mirroring stellar-core's SQL
     /// `SELECT * FROM trustlines WHERE account_id=? AND asset_type=POOL_SHARE`).
-    pool_share_tl_account_index: Arc<RwLock<PoolShareTlAccountIndex>>,
+    ///
+    /// The inner `Arc` makes this copy-on-write: snapshot capture is an O(1)
+    /// `Arc` clone (frozen-at-capture semantics), while mutation sites use
+    /// `Arc::make_mut` under the write lock — cloning the map at most once per
+    /// ledger where it is updated and only while snapshots still reference it.
+    pool_share_tl_account_index: Arc<RwLock<Arc<PoolShareTlAccountIndex>>>,
 
     /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
     ///
@@ -1597,6 +1623,15 @@ pub struct LedgerManager {
     #[allow(clippy::type_complexity)]
     begin_close_interpose: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 
+    /// Test-only: hook fired inside `commit_close()`'s gated publication
+    /// window, after canonical state publication and before the
+    /// committed-market event send. Used by the subscribe-during-commit
+    /// atomicity regression test. Behind `test-utils` so production builds
+    /// pay nothing and contain no hook branch.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::type_complexity)]
+    commit_publication_interpose: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+
     /// Optional invariant manager for runtime integrity checks.
     /// Shared with all executors created by this manager.
     invariant_manager: Option<Arc<henyey_invariant::InvariantManager>>,
@@ -1651,7 +1686,7 @@ impl LedgerManager {
             module_cache: RwLock::new(None),
             offers_initialized: Arc::new(RwLock::new(false)),
             offer_store: Arc::new(Mutex::new(OfferStore::new())),
-            pool_share_tl_account_index: Arc::new(RwLock::new(HashMap::new())),
+            pool_share_tl_account_index: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
             executor: Mutex::new(None),
             pending_eviction_scan: Mutex::new(None),
@@ -1660,6 +1695,8 @@ impl LedgerManager {
             snapshot_count: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             begin_close_interpose: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            commit_publication_interpose: Mutex::new(None),
             invariant_manager: None,
             last_close_wall_time: Mutex::new(std::time::Instant::now()),
         }
@@ -1701,9 +1738,16 @@ impl LedgerManager {
         *self.begin_close_interpose.lock() = Some(hook);
     }
 
+    /// Test-only: install a hook fired inside `commit_close()`'s gated
+    /// publication window, between canonical state publication and the
+    /// committed-market event send. See `commit_publication_interpose`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_commit_publication_interpose(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.commit_publication_interpose.lock() = Some(hook);
+    }
+
     /// Check if the ledger has been initialized.
     pub fn is_initialized(&self) -> bool {
-        let _committed_guard = self.committed_state_gate.lock();
         self.state.read().initialized
     }
 
@@ -2292,7 +2336,8 @@ impl LedgerManager {
 
         // Install pre-computed cache data.
         *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
-        *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
+        *self.pool_share_tl_account_index.write() =
+            Arc::new(cache_data.pool_share_tl_account_index);
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
@@ -2517,7 +2562,8 @@ impl LedgerManager {
         };
 
         *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
-        *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
+        *self.pool_share_tl_account_index.write() =
+            Arc::new(cache_data.pool_share_tl_account_index);
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
@@ -2571,7 +2617,6 @@ impl LedgerManager {
     /// Returns a LedgerCloseContext for applying transactions and
     /// committing the ledger. This is called by `close_ledger`.
     fn begin_close(&self, close_data: LedgerCloseData) -> Result<LedgerCloseContext<'_>> {
-        let _committed_guard = self.committed_state_gate.lock();
         let state = self.state.read();
         if !state.initialized {
             return Err(LedgerError::NotInitialized);
@@ -2759,7 +2804,6 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
-        let _committed_guard = self.committed_state_gate.lock();
         // Thin wrapper: acquire the state read lock exactly once and delegate.
         // Callers that already hold an outer `state` read guard (e.g.
         // `begin_close()`) must call `create_snapshot_locked()` directly to
@@ -3017,7 +3061,9 @@ impl LedgerManager {
         // queries SQL for all pool share trustlines owned by an account.  Without this
         // loader, `find_pool_share_trustlines_for_asset` would only find trustlines
         // already in the in-memory state, missing pool shares loaded from the bucket list.
-        let pool_share_idx = Arc::new(self.pool_share_tl_account_index.read().clone());
+        // O(1) copy-on-write capture: clone the Arc, not the map. Mutations in
+        // commit_close use Arc::make_mut, so this snapshot stays frozen.
+        let pool_share_idx = Arc::clone(&*self.pool_share_tl_account_index.read());
         let pool_share_tls_by_account_fn: crate::snapshot::PoolShareTrustlinesByAccountFn =
             Arc::new(move |account_id| {
                 Ok(pool_share_idx
@@ -3136,8 +3182,12 @@ impl LedgerManager {
                                     if let stellar_xdr::TrustLineAsset::PoolShare(ref pool_id) =
                                         tl.asset
                                     {
-                                        self.pool_share_tl_account_index
-                                            .write()
+                                        // Copy-on-write: clones the map only if a
+                                        // snapshot still references it, at most once
+                                        // per ledger (subsequent make_mut calls in
+                                        // this loop see a unique Arc).
+                                        let mut idx = self.pool_share_tl_account_index.write();
+                                        Arc::make_mut(&mut *idx)
                                             .entry(tl.account_id.clone())
                                             .or_default()
                                             .insert(pool_id.clone());
@@ -3150,7 +3200,9 @@ impl LedgerManager {
                                         tl.asset
                                     {
                                         let mut idx = self.pool_share_tl_account_index.write();
-                                        if let Some(pools) = idx.get_mut(&tl.account_id) {
+                                        if let Some(pools) =
+                                            Arc::make_mut(&mut *idx).get_mut(&tl.account_id)
+                                        {
                                             pools.remove(pool_id);
                                         }
                                     }
@@ -3169,17 +3221,50 @@ impl LedgerManager {
         // header paired with stale cached info.
         let soroban_info = self.compute_soroban_info_while_committing()?;
 
-        // Publish header, hash, and derived Soroban info atomically.
+        // Final consistency window: hold the committed-state gate ONLY across
+        // canonical state publication + committed-market event publication so
+        // subscribe's atomic baseline capture is serialized against them. The
+        // gate deliberately does NOT cover the earlier (long) parts of commit —
+        // tx-result hashing, bucket add_batch, Soroban recompute — so hot
+        // read paths (`create_snapshot`, `is_initialized`, `begin_close`,
+        // SCP tx-set validation, nomination) never block behind a full commit.
         {
-            let mut state = self.state.write();
-            state.header = new_header;
-            state.header_hash = new_header_hash;
-            state.soroban_network_info = soroban_info;
-        }
+            let _committed_guard = self.committed_state_gate.lock();
 
-        // Publish only after every committed component and the identity header agree.
-        // broadcast::send is synchronous/non-waiting; a slow receiver observes Lagged.
-        self.publish_committed_market_ledger(&offer_pool_changes)?;
+            // Publish header, hash, and derived Soroban info atomically.
+            {
+                let mut state = self.state.write();
+                state.header = new_header;
+                state.header_hash = new_header_hash;
+                state.soroban_network_info = soroban_info;
+            }
+
+            // Test-only interpose hook: fired inside the gated publication
+            // window, after canonical state publication and before the
+            // committed-market event send. Used by the subscribe-during-commit
+            // atomicity regression test. Compiled out of production.
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                let hook = self.commit_publication_interpose.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+
+            // Publish only after every committed component and the identity header agree.
+            // broadcast::send is synchronous/non-waiting; a slow receiver observes Lagged.
+            //
+            // Observer-only publication must never affect the close result: canonical
+            // state is already published above, so a failure here would otherwise fail
+            // close_ledger for a fully committed ledger.
+            if let Err(e) = self.publish_committed_market_ledger(&offer_pool_changes) {
+                tracing::warn!(
+                    error = %e,
+                    "committed market publication failed after canonical state publication; \
+                     observers may miss this ledger event"
+                );
+            }
+        }
 
         // Drop offer/pool changes on a background thread if non-trivial.
         if !offer_pool_changes.is_empty() {
@@ -3421,11 +3506,13 @@ impl LedgerManager {
         load_soroban_network_info(&snapshot)
     }
 
-    /// Compute Soroban configuration while the caller holds `committed_state_gate`.
+    /// Compute Soroban configuration for the committing path.
     ///
-    /// `LedgerCloseContext::commit` holds that non-reentrant gate across bucket
-    /// publication. Re-entering the public `create_snapshot()` path here would
-    /// deadlock, so reuse the guarded snapshot constructor directly.
+    /// Called from `commit_close()` (just before the gated publication window)
+    /// and from `initialize()`/`finish_initialization()`, which hold the
+    /// non-reentrant `committed_state_gate`. Uses the internal snapshot
+    /// constructor directly rather than the public `create_snapshot()` wrapper
+    /// so those paths stay reentrancy-safe.
     fn compute_soroban_info_while_committing(&self) -> Result<Option<SorobanNetworkInfo>> {
         let state = self.state.read();
         let snapshot = self.create_snapshot_locked(&state)?;
@@ -5659,7 +5746,6 @@ impl LedgerCloseContext<'_> {
     /// "Snapshot hook not yet wired") and is tracked as separate work, NOT part
     /// of #3066.
     fn commit(mut self, rss_before: u64) -> Result<LedgerCloseResult> {
-        let _committed_guard = self.manager.committed_state_gate.lock();
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             "LedgerCloseContext::commit starting"
@@ -5778,9 +5864,17 @@ impl LedgerCloseContext<'_> {
         // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
         // Drains entries from the current delta (moving instead of cloning), saving ~50K clone operations.
         // Metadata (fee_pool_delta, total_coins_delta) is preserved for build_and_hash_header.
-        let cat = self
-            .ltx
-            .drain_for_bucket_update(self.manager.committed_market_tx.receiver_count() != 0);
+        //
+        // Always collect liquidity-pool changes (a handful of small clones per
+        // ledger at most): the committed-state gate now covers only the final
+        // publication window, so a subscriber can arrive between this drain and
+        // publication. Gating collection on the receiver count here would let
+        // that subscriber receive a Ledger event with an under-reported
+        // pool_count_delta. Offer and pool-share-trustline changes are always
+        // collected regardless (canonical cache maintenance needs them), and
+        // the expensive no-subscriber skip (snapshot construction) still
+        // happens inside publish_committed_market_ledger.
+        let cat = self.ltx.drain_for_bucket_update(true);
         // Release snapshot lookup closures. After drain, no code in commit()
         // reads entries via self.ltx. Dropping these closures releases Arc
         // references to the soroban state snapshot, allowing Arc::make_mut on
@@ -8925,16 +9019,12 @@ mod tests {
         ));
         let first = stellar_xdr::PoolId(stellar_xdr::Hash([1; 32]));
         let second = stellar_xdr::PoolId(stellar_xdr::Hash([2; 32]));
-        manager
-            .pool_share_tl_account_index
-            .write()
+        Arc::make_mut(&mut *manager.pool_share_tl_account_index.write())
             .entry(account.clone())
             .or_default()
             .insert(first.clone());
         let snapshot = manager.create_snapshot().unwrap();
-        manager
-            .pool_share_tl_account_index
-            .write()
+        Arc::make_mut(&mut *manager.pool_share_tl_account_index.write())
             .entry(account.clone())
             .or_default()
             .insert(second);
@@ -9074,6 +9164,182 @@ mod tests {
         assert_eq!(reserve_a(&current_snapshot), 123);
     }
 
+    /// Drive more unconsumed publications than the bounded ring holds and
+    /// assert the subscriber observes an explicit `Lagged` error (with the
+    /// exact overflow count) instead of silently skipping ledgers, then
+    /// resumes at the oldest retained event.
+    #[tokio::test]
+    async fn committed_market_stream_reports_lag_after_ring_overflow() {
+        let manager = initialized_empty_market_manager();
+        let mut subscription = manager.subscribe_committed_market().unwrap();
+        subscription.bootstrap.take();
+
+        let overflow = 2u64;
+        let published = COMMITTED_MARKET_EVENT_CAPACITY as u64 + overflow;
+        for i in 0..published {
+            manager
+                .publish_committed_market_ledger_for_test(
+                    2 + i as u32,
+                    Hash256::from_bytes([(2 + i) as u8; 32]),
+                    &[],
+                )
+                .unwrap();
+        }
+
+        let err = match subscription.recv().await {
+            Err(err) => err,
+            Ok(_) => panic!("overflowing the ring must surface Lagged"),
+        };
+        assert_eq!(
+            err,
+            crate::snapshot::CommittedMarketStreamError::Lagged(overflow)
+        );
+
+        // After reporting lag, the stream resumes at the oldest retained
+        // event and delivers the rest in order through the final ledger.
+        let mut expected_seq = 2 + overflow as u32;
+        for _ in 0..COMMITTED_MARKET_EVENT_CAPACITY {
+            let CommittedMarketEvent::Ledger { identity, .. } = subscription.recv().await.unwrap()
+            else {
+                panic!("expected ordinary ledger event")
+            };
+            assert_eq!(identity.ledger_seq, expected_seq);
+            expected_seq += 1;
+        }
+        assert_eq!(expected_seq, 2 + published as u32);
+    }
+
+    /// `reset()` must emit `Reset` with an advanced generation, and a
+    /// subsequent re-initialization must emit `Initialized` with a
+    /// further-advanced generation, so observers can order epochs.
+    #[tokio::test]
+    async fn committed_market_reset_and_reinitialize_advance_generation() {
+        let manager = initialized_empty_market_manager();
+        let mut subscription = manager.subscribe_committed_market().unwrap();
+        let bootstrap = subscription.bootstrap.take().unwrap();
+        assert!(matches!(
+            bootstrap,
+            CommittedMarketEvent::Initialized { .. }
+        ));
+        let bootstrap_generation = bootstrap.generation();
+
+        manager.reset();
+        let CommittedMarketEvent::Reset {
+            generation: reset_generation,
+        } = subscription.recv().await.unwrap()
+        else {
+            panic!("expected reset event")
+        };
+        assert!(
+            reset_generation > bootstrap_generation,
+            "reset generation {reset_generation} must advance past bootstrap \
+             generation {bootstrap_generation}"
+        );
+
+        // Re-initialize (as catchup does after a reset).
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = 24;
+        let hash = crate::compute_header_hash(&header).unwrap();
+        manager
+            .initialize(
+                new_bl_with_config(),
+                henyey_bucket::HotArchiveBucketList::new(),
+                header,
+                hash,
+            )
+            .unwrap();
+        let CommittedMarketEvent::Initialized { identity, .. } = subscription.recv().await.unwrap()
+        else {
+            panic!("expected initialized event")
+        };
+        assert!(
+            identity.generation > reset_generation,
+            "re-init generation {} must advance past reset generation {reset_generation}",
+            identity.generation
+        );
+    }
+
+    /// Subscribe-during-commit atomicity: while `commit_close()` holds the
+    /// committed-state gate for its final publication window (canonical
+    /// `state.write()` done, event send pending), a concurrent
+    /// `subscribe_committed_market()` must block on the gate; once released,
+    /// its baseline must reflect the fully committed ledger with no
+    /// duplicate/lost event for it. Uses the same interpose-hook pattern as
+    /// the #3685 begin_close/reset deadlock regression test.
+    #[test]
+    fn subscribe_during_commit_publication_window_is_atomic() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let manager = Arc::new(initialized_empty_market_manager());
+
+        // hook_held: hook fired → gate is held, T1 parked mid-publication.
+        let (hook_held_tx, hook_held_rx) = mpsc::channel::<()>();
+        // release: test → hook, allow T1 to finish the publication window.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        manager.set_commit_publication_interpose(Box::new(move || {
+            let _ = hook_held_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        }));
+
+        // T1: drive the real gated publication window via commit_close.
+        let mut new_header = manager.current_header();
+        new_header.ledger_seq = 2;
+        let new_header_hash = crate::compute_header_hash(&new_header).unwrap();
+        let m1 = Arc::clone(&manager);
+        let (t1_done_tx, t1_done_rx) = mpsc::channel::<()>();
+        let t1 = std::thread::spawn(move || {
+            m1.commit_close(Vec::new(), new_header, new_header_hash, false, false)
+                .unwrap();
+            let _ = t1_done_tx.send(());
+        });
+
+        // Wait until T1 is parked inside the gated publication window.
+        hook_held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hook should fire inside the gated publication window");
+
+        // T2: subscribe concurrently; it must serialize on the gate.
+        let m2 = Arc::clone(&manager);
+        let (t2_done_tx, t2_done_rx) = mpsc::channel::<CommittedMarketSubscription>();
+        let t2 = std::thread::spawn(move || {
+            let subscription = m2.subscribe_committed_market().unwrap();
+            let _ = t2_done_tx.send(subscription);
+        });
+
+        // While the window is held, subscribe must NOT complete. On buggy
+        // (unserialized) code this recv succeeds and the assertion fails.
+        assert!(
+            t2_done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "subscribe completed while the commit publication window was held"
+        );
+
+        // Release the window; both threads must then make progress.
+        release_tx.send(()).unwrap();
+        t1_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("commit_close should complete after hook release");
+        let mut subscription = t2_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("subscribe should complete after the gate is released");
+
+        // Atomic baseline: the bootstrap reflects the committed ledger and no
+        // duplicate event for that same ledger is queued behind it.
+        let CommittedMarketEvent::Initialized { identity, .. } =
+            subscription.bootstrap.take().expect("initialized baseline")
+        else {
+            panic!("expected initialized baseline")
+        };
+        assert_eq!(identity.ledger_seq, 2);
+        assert_eq!(identity.ledger_hash, new_header_hash);
+        assert_eq!(subscription.queued_events(), 0);
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "mainnet-scale committed publication benchmark; run in release mode"]
     async fn benchmark_committed_market_publication_with_active_subscriber() {
@@ -9129,7 +9395,10 @@ mod tests {
             timings.push(
                 manager
                     .publish_committed_market_ledger_for_test(
-                        ledger as u32 + 2,
+                        // Continue monotonically after the first loop's final
+                        // sequence (ledgers + 2) so ledger_seq never regresses
+                        // mid-benchmark.
+                        (ledgers + ledger) as u32 + 3,
                         Hash256::from_bytes([(ledger & 0xff) as u8; 32]),
                         &template,
                     )

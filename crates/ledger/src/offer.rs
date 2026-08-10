@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_offer_descriptor_ordering() {
-        let mut offers = vec![
+        let mut offers = [
             make_descriptor(3, 4, 300), // price = 0.75
             make_descriptor(1, 2, 100), // price = 0.5
             make_descriptor(1, 2, 200), // price = 0.5, higher ID

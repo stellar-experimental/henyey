@@ -174,6 +174,15 @@ Snapshot bucket hashes remain garbage-collection roots until every shared
 handle releases its lookup closures or is dropped. Extraction and snapshot
 construction are skipped when there are no subscribers.
 
+**Accumulation hazard**: an observer that retains successive snapshots (the
+bootstrap baseline plus each ledger event's snapshot) pins the *union* of every
+bucket file those snapshots reference — across bucket-list spills and even
+`reset()` — until it drops the handles or calls `release_lookups()`. There is
+no internal cap on this retention. The gauge `henyey_snapshot_gc_pinned_hashes`
+exports the number of distinct bucket hashes currently pinned as snapshot GC
+roots; a monotonically growing value under a live subscriber indicates a
+consumer that is holding old snapshots instead of releasing them.
+
 Publication qualification:
 
 ```bash
