@@ -3,7 +3,15 @@
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
 **Overall Parity**: 94%
-**Last Updated**: 2026-04-26
+**Last Updated**: 2026-08-10
+
+`ClassicMarketSnapshot` and the generation-aware `CommittedMarketEvent` stream
+are read-only henyey extension APIs with no stellar-core observable-surface
+counterpart. Atomic bootstrap capture and non-blocking publication occur under
+the existing committed-state gate after canonical state publication; they do
+not alter ledger-close results or XDR. Captured disk-backed bucket hashes remain
+internal garbage-collection roots for the lifetime of shared snapshot lookup
+closures.
 
 ## Summary
 

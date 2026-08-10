@@ -23,12 +23,114 @@
 
 use crate::{LedgerError, Result};
 use henyey_common::Hash256;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stellar_xdr::{
-    AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, PoolId,
+    AccountEntry, AccountId, Asset, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey,
+    LiquidityPoolEntry, OfferEntry, PoolId,
 };
+
+/// Identity shared by every value in one committed-market epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedMarketIdentity {
+    pub generation: u64,
+    pub ledger_seq: u32,
+    pub ledger_hash: Hash256,
+    pub protocol_version: u32,
+    pub base_fee: u32,
+}
+
+/// Exact net offer mutation produced by the ledger delta.
+#[derive(Debug, Clone)]
+pub struct CommittedOfferDelta {
+    /// Complete prior record, including last-modified and sponsorship metadata.
+    pub previous: Option<LedgerEntry>,
+    /// Complete current record, including last-modified and sponsorship metadata.
+    pub current: Option<LedgerEntry>,
+}
+
+/// Bounded, generation-aware committed market stream payload.
+#[derive(Clone)]
+pub enum CommittedMarketEvent {
+    /// A complete immutable baseline. Full market enumeration is deliberately lazy
+    /// and runs from this snapshot after the commit gate has been released.
+    Initialized {
+        identity: CommittedMarketIdentity,
+        snapshot: SnapshotHandle,
+        published_at: std::time::Instant,
+    },
+    /// The current epoch was invalidated and no ordinary event may follow it.
+    Reset { generation: u64 },
+    /// One fully committed ledger, with no unrelated general-ledger changes.
+    Ledger {
+        identity: CommittedMarketIdentity,
+        snapshot: SnapshotHandle,
+        offer_deltas: Arc<[CommittedOfferDelta]>,
+        /// Signed exact change in committed liquidity-pool cardinality.
+        pool_count_delta: i64,
+        published_at: std::time::Instant,
+    },
+}
+
+impl CommittedMarketEvent {
+    pub fn identity(&self) -> Option<CommittedMarketIdentity> {
+        match self {
+            Self::Initialized { identity, .. } | Self::Ledger { identity, .. } => Some(*identity),
+            Self::Reset { .. } => None,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.identity().map_or_else(
+            || match self {
+                Self::Reset { generation } => *generation,
+                _ => unreachable!(),
+            },
+            |identity| identity.generation,
+        )
+    }
+
+    pub fn published_at(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Initialized { published_at, .. } | Self::Ledger { published_at, .. } => {
+                Some(*published_at)
+            }
+            Self::Reset { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CommittedMarketStreamError {
+    #[error("committed market stream lagged by {0} ledgers")]
+    Lagged(u64),
+    #[error("committed market stream closed")]
+    Closed,
+}
+
+/// Atomic subscribe-plus-bootstrap result.
+pub struct CommittedMarketSubscription {
+    pub bootstrap: Option<CommittedMarketEvent>,
+    pub(crate) receiver: tokio::sync::broadcast::Receiver<CommittedMarketEvent>,
+}
+
+impl CommittedMarketSubscription {
+    pub async fn recv(
+        &mut self,
+    ) -> std::result::Result<CommittedMarketEvent, CommittedMarketStreamError> {
+        self.receiver.recv().await.map_err(|error| match error {
+            tokio::sync::broadcast::error::RecvError::Lagged(count) => {
+                CommittedMarketStreamError::Lagged(count)
+            }
+            tokio::sync::broadcast::error::RecvError::Closed => CommittedMarketStreamError::Closed,
+        })
+    }
+
+    pub fn queued_events(&self) -> usize {
+        self.receiver.len()
+    }
+}
 
 use crate::execution::SorobanNetworkInfo;
 
@@ -262,8 +364,68 @@ impl Clone for LedgerSnapshot {
 /// Callback type for lazy entry lookup (e.g., from bucket list).
 pub type EntryLookupFn = Arc<dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync>;
 
-/// Callback type for full entry enumeration (e.g., bucket list scan).
+/// Callback type for canonical live offer enumeration used by ledger execution.
 pub type EntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Sync>;
+
+/// Callback that enumerates all offers from one captured committed bucket snapshot.
+pub type FrozenOfferEntriesLookupFn = Arc<dyn Fn() -> Result<Vec<LedgerEntry>> + Send + Sync>;
+
+/// Callback that filters complete committed offer records while traversing buckets.
+pub type FilteredOfferEntriesLookupFn =
+    Arc<dyn Fn(&[(Asset, Asset)]) -> Result<Vec<LedgerEntry>> + Send + Sync>;
+
+/// Callback that enumerates committed offers and liquidity pools.
+pub type MarketEntriesLookupFn =
+    Arc<dyn Fn() -> Result<(Vec<OfferEntry>, Vec<LiquidityPoolEntry>)> + Send + Sync>;
+
+/// Immutable Classic market state from one committed ledger.
+#[derive(Debug, Clone)]
+pub struct ClassicMarketSnapshot {
+    ledger_seq: u32,
+    ledger_hash: Hash256,
+    protocol_version: u32,
+    offers: Arc<[OfferEntry]>,
+    liquidity_pools: Arc<[LiquidityPoolEntry]>,
+}
+
+impl ClassicMarketSnapshot {
+    /// Construct a committed market snapshot from complete offer and pool sets.
+    pub fn new(
+        ledger_seq: u32,
+        ledger_hash: Hash256,
+        protocol_version: u32,
+        offers: Vec<OfferEntry>,
+        liquidity_pools: Vec<LiquidityPoolEntry>,
+    ) -> Self {
+        Self {
+            ledger_seq,
+            ledger_hash,
+            protocol_version,
+            offers: offers.into(),
+            liquidity_pools: liquidity_pools.into(),
+        }
+    }
+
+    pub fn ledger_seq(&self) -> u32 {
+        self.ledger_seq
+    }
+
+    pub fn ledger_hash(&self) -> Hash256 {
+        self.ledger_hash
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn offers(&self) -> &[OfferEntry] {
+        &self.offers
+    }
+
+    pub fn liquidity_pools(&self) -> &[LiquidityPoolEntry] {
+        &self.liquidity_pools
+    }
+}
 
 /// Batch entry lookup function for loading multiple entries in a single bucket list pass.
 pub type BatchEntryLookupFn = Arc<dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Send + Sync>;
@@ -286,7 +448,7 @@ pub type PoolShareTrustlinesByAccountFn =
 /// Two optional lookup functions can be configured:
 ///
 /// - **Entry lookup**: Fetches individual entries (e.g., from bucket list)
-/// - **Entries scan**: Returns all live entries (e.g., for full state analysis)
+/// - **Entries enumeration**: Returns canonical live offers for orderbook loading
 ///
 /// # Example
 ///
@@ -302,8 +464,15 @@ pub struct SnapshotHandle {
     inner: Arc<LedgerSnapshot>,
     /// Optional fallback for entry lookups not in cache.
     lookup_fn: Option<EntryLookupFn>,
-    /// Optional enumeration of all live entries.
+    /// Optional canonical live offer enumeration.
     entries_fn: Option<EntriesLookupFn>,
+    /// Complete offer enumeration from the committed bucket snapshot.
+    frozen_offer_entries_fn: Option<FrozenOfferEntriesLookupFn>,
+    /// Pair-filtered offer enumeration from the same committed epoch as `inner`.
+    filtered_offer_entries_fn: Option<FilteredOfferEntriesLookupFn>,
+    filtered_offer_entries_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Immutable enumeration from the same committed epoch as `inner`.
+    market_entries_fn: Option<MarketEntriesLookupFn>,
     /// Optional batch lookup for multiple entries in a single pass.
     batch_lookup_fn: Option<BatchEntryLookupFn>,
     /// Optional index-based lookup for pool share trustline pool IDs by account.
@@ -317,6 +486,13 @@ pub struct SnapshotHandle {
     /// "lookups were never configured" from "lookups were dropped on purpose"
     /// so post-release fallback paths return errors instead of silent None.
     lookups_released: bool,
+    /// Opaque lease keeping captured disk-backed bucket files in the ledger
+    /// manager's garbage-collection root set while lookup closures can use
+    /// them. Cloned handles and overlays share the lease.
+    bucket_gc_lease: Option<Arc<dyn Send + Sync>>,
+    /// Immutable point overrides used by isolated simulations. `None` masks a
+    /// fallback entry as deleted.
+    overrides: Arc<HashMap<LedgerKey, Option<LedgerEntry>>>,
 }
 
 impl SnapshotHandle {
@@ -326,11 +502,17 @@ impl SnapshotHandle {
             inner: Arc::new(snapshot),
             lookup_fn: None,
             entries_fn: None,
+            frozen_offer_entries_fn: None,
+            filtered_offer_entries_fn: None,
+            filtered_offer_entries_hook: None,
+            market_entries_fn: None,
             batch_lookup_fn: None,
             pool_share_tls_by_account_fn: None,
             prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             stats: Arc::new(SnapshotLookupStats::default()),
             lookups_released: false,
+            bucket_gc_lease: None,
+            overrides: Arc::new(HashMap::new()),
         }
     }
 
@@ -358,9 +540,32 @@ impl SnapshotHandle {
         self.lookup_fn = Some(lookup_fn);
     }
 
-    /// Set the full-entry lookup function.
+    /// Set canonical live offer enumeration for normal ledger execution.
     pub fn set_entries_lookup(&mut self, entries_fn: EntriesLookupFn) {
         self.entries_fn = Some(entries_fn);
+    }
+
+    /// Set complete offer enumeration from a captured committed bucket snapshot.
+    pub fn set_frozen_offer_entries_lookup(
+        &mut self,
+        frozen_offer_entries_fn: FrozenOfferEntriesLookupFn,
+    ) {
+        self.frozen_offer_entries_fn = Some(frozen_offer_entries_fn);
+    }
+
+    /// Set pair-filtered committed offer enumeration.
+    pub fn set_filtered_offer_entries_lookup(&mut self, f: FilteredOfferEntriesLookupFn) {
+        self.filtered_offer_entries_fn = Some(f);
+    }
+
+    #[doc(hidden)]
+    pub fn set_filtered_offer_entries_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.filtered_offer_entries_hook = Some(hook);
+    }
+
+    /// Set committed Classic market enumeration.
+    pub fn set_market_entries_lookup(&mut self, market_entries_fn: MarketEntriesLookupFn) {
+        self.market_entries_fn = Some(market_entries_fn);
     }
 
     /// Set the batch entry lookup function.
@@ -373,18 +578,57 @@ impl SnapshotHandle {
         self.pool_share_tls_by_account_fn = Some(f);
     }
 
+    /// Attach an opaque lifetime guard for resources captured by lookup
+    /// closures. The ledger manager uses this to keep disk-backed bucket files
+    /// rooted against garbage collection.
+    pub(crate) fn set_bucket_gc_lease(&mut self, lease: Arc<dyn Send + Sync>) {
+        self.bucket_gc_lease = Some(lease);
+    }
+
     /// Drop lookup closures to release captured resources (Arc references to
     /// soroban state snapshots, bucket list snapshots, etc.).
     ///
-    /// After calling this, `get_entry()` and `load_entries()` will only check
-    /// the snapshot cache and prefetch cache — any fallback to lookup_fn /
-    /// batch_lookup_fn for uncached keys returns an error.
+    /// After calling this, point and enumeration lookups backed by captured
+    /// snapshots are unavailable. `get_entry()` and `load_entries()` only check
+    /// the snapshot cache and prefetch cache; uncached fallback returns an error.
     ///
     /// Stats and prefetch cache are preserved for end-of-close reporting.
     pub fn release_lookups(&mut self) {
         self.lookup_fn = None;
         self.batch_lookup_fn = None;
+        self.frozen_offer_entries_fn = None;
+        self.filtered_offer_entries_fn = None;
+        self.filtered_offer_entries_hook = None;
+        self.market_entries_fn = None;
+        self.bucket_gc_lease = None;
         self.lookups_released = true;
+    }
+
+    /// Create an isolated read overlay over this committed snapshot.
+    ///
+    /// Fallback closures remain shared, while overrides, prefetch cache, and
+    /// lookup statistics are fresh and cannot affect this handle or its other
+    /// clones. A shared fallback bucket cache may still warm. A `None` value
+    /// masks an entry from fallback lookup.
+    pub fn with_overrides(&self, overrides: HashMap<LedgerKey, Option<LedgerEntry>>) -> Self {
+        let mut combined_overrides = self.overrides.as_ref().clone();
+        combined_overrides.extend(overrides);
+        Self {
+            inner: Arc::clone(&self.inner),
+            lookup_fn: self.lookup_fn.clone(),
+            entries_fn: self.entries_fn.clone(),
+            frozen_offer_entries_fn: self.frozen_offer_entries_fn.clone(),
+            filtered_offer_entries_fn: self.filtered_offer_entries_fn.clone(),
+            filtered_offer_entries_hook: self.filtered_offer_entries_hook.clone(),
+            market_entries_fn: self.market_entries_fn.clone(),
+            batch_lookup_fn: self.batch_lookup_fn.clone(),
+            pool_share_tls_by_account_fn: self.pool_share_tls_by_account_fn.clone(),
+            prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            stats: Arc::new(SnapshotLookupStats::default()),
+            lookups_released: self.lookups_released,
+            bucket_gc_lease: self.bucket_gc_lease.clone(),
+            overrides: Arc::new(combined_overrides),
+        }
     }
 
     /// Look up all pool IDs for pool share trustlines owned by `account_id`.
@@ -409,7 +653,11 @@ impl SnapshotHandle {
         let mut remaining = Vec::new();
         let prefetch = self.prefetch_cache.read();
         for key in keys {
-            if let Some(entry) = self.inner.get_entry(key) {
+            if let Some(entry) = self.overrides.get(key) {
+                if let Some(entry) = entry {
+                    result.push(entry.clone());
+                }
+            } else if let Some(entry) = self.inner.get_entry(key) {
                 self.stats
                     .snapshot_cache_hits
                     .fetch_add(1, Ordering::Relaxed);
@@ -470,12 +718,182 @@ impl SnapshotHandle {
         &self.inner
     }
 
-    /// Return all live entries when available, falling back to cached entries.
+    /// Return callback-provided live entries, falling back to cached entries.
     pub fn all_entries(&self) -> Result<Vec<LedgerEntry>> {
-        if let Some(entries_fn) = &self.entries_fn {
-            return entries_fn();
+        let mut entries = if let Some(entries_fn) = &self.entries_fn {
+            entries_fn()?
+        } else {
+            self.inner.entries.values().cloned().collect()
+        };
+        // Fast path (apply path, once per ledger over the full offer set):
+        // no overrides means nothing to retain against or extend with.
+        if self.overrides.is_empty() {
+            return Ok(entries);
         }
-        Ok(self.inner.entries.values().cloned().collect())
+        entries.retain(|entry| {
+            !self
+                .overrides
+                .contains_key(&henyey_common::entry_to_key(entry))
+        });
+        entries.extend(self.overrides.values().filter_map(Clone::clone));
+        Ok(entries)
+    }
+
+    /// Return all offers from the captured committed bucket snapshot.
+    ///
+    /// Unlike [`Self::all_entries`], this never reads the live `OfferStore`.
+    /// Overrides on this handle are applied to the frozen committed set.
+    pub fn frozen_offer_entries(&self) -> Result<Vec<LedgerEntry>> {
+        let entries = if let Some(frozen_offer_entries_fn) = &self.frozen_offer_entries_fn {
+            frozen_offer_entries_fn()?
+        } else if self.lookups_released {
+            return Err(crate::LedgerError::Internal(
+                "frozen offer enumeration attempted after release_lookups()".into(),
+            ));
+        } else {
+            self.inner
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.data, LedgerEntryData::Offer(_)))
+                .cloned()
+                .collect()
+        };
+        Ok(self.apply_offer_overrides(entries).into_values().collect())
+    }
+
+    /// Return complete committed offer records for only the requested directed books.
+    ///
+    /// Production snapshots apply the pair predicate before cloning each bucket entry.
+    pub fn filtered_offer_entries(&self, pairs: &[(Asset, Asset)]) -> Result<Vec<LedgerEntry>> {
+        if let Some(hook) = &self.filtered_offer_entries_hook {
+            hook();
+        }
+        let entries = if let Some(f) = &self.filtered_offer_entries_fn {
+            f(pairs)?
+        } else if self.lookups_released {
+            return Err(crate::LedgerError::Internal(
+                "filtered offer enumeration attempted after release_lookups()".into(),
+            ));
+        } else {
+            self.inner
+                .entries
+                .values()
+                .filter(|entry| match &entry.data {
+                    LedgerEntryData::Offer(offer) => pairs.iter().any(|(buying, selling)| {
+                        offer.buying == *buying && offer.selling == *selling
+                    }),
+                    _ => false,
+                })
+                .cloned()
+                .collect()
+        };
+        if self.overrides.is_empty() {
+            return Ok(entries);
+        }
+        Ok(self
+            .apply_offer_overrides(entries)
+            .into_values()
+            .filter(|entry| match &entry.data {
+                LedgerEntryData::Offer(offer) => pairs
+                    .iter()
+                    .any(|(buying, selling)| offer.buying == *buying && offer.selling == *selling),
+                _ => false,
+            })
+            .collect())
+    }
+
+    /// Materialize a complete, immutable Classic market view for this ledger.
+    pub fn classic_market_snapshot(&self) -> Result<ClassicMarketSnapshot> {
+        let (offers, pools) = if let Some(market_entries_fn) = &self.market_entries_fn {
+            market_entries_fn()?
+        } else if self.lookups_released {
+            return Err(crate::LedgerError::Internal(
+                "market enumeration attempted after release_lookups()".into(),
+            ));
+        } else {
+            let mut offers = Vec::new();
+            let mut pools = Vec::new();
+            for entry in self.inner.entries.values() {
+                match &entry.data {
+                    LedgerEntryData::Offer(offer) => offers.push(offer.clone()),
+                    LedgerEntryData::LiquidityPool(pool) => pools.push(pool.clone()),
+                    _ => {}
+                }
+            }
+            (offers, pools)
+        };
+        let offer_entries = offers
+            .into_iter()
+            .map(|offer| LedgerEntry {
+                last_modified_ledger_seq: self.ledger_seq(),
+                data: LedgerEntryData::Offer(offer),
+                ext: stellar_xdr::LedgerEntryExt::V0,
+            })
+            .collect();
+        let offers = self
+            .apply_offer_overrides(offer_entries)
+            .into_values()
+            .filter_map(|entry| match entry.data {
+                LedgerEntryData::Offer(offer) => Some(offer),
+                _ => None,
+            })
+            .collect();
+        let mut pools = pools
+            .into_iter()
+            .map(|pool| {
+                (
+                    LedgerKey::LiquidityPool(stellar_xdr::LedgerKeyLiquidityPool {
+                        liquidity_pool_id: pool.liquidity_pool_id.clone(),
+                    }),
+                    pool,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (key, override_entry) in self.overrides.iter() {
+            if !matches!(key, LedgerKey::LiquidityPool(_)) {
+                continue;
+            }
+            match override_entry {
+                Some(LedgerEntry {
+                    data: LedgerEntryData::LiquidityPool(pool),
+                    ..
+                }) => {
+                    pools.insert(key.clone(), pool.clone());
+                }
+                _ => {
+                    pools.remove(key);
+                }
+            }
+        }
+        Ok(ClassicMarketSnapshot::new(
+            self.ledger_seq(),
+            self.header_hash(),
+            self.header().ledger_version,
+            offers,
+            pools.into_values().collect(),
+        ))
+    }
+
+    fn apply_offer_overrides(&self, entries: Vec<LedgerEntry>) -> BTreeMap<LedgerKey, LedgerEntry> {
+        let mut offers = entries
+            .into_iter()
+            .filter(|entry| matches!(entry.data, LedgerEntryData::Offer(_)))
+            .map(|entry| (henyey_common::entry_to_key(&entry), entry))
+            .collect::<BTreeMap<_, _>>();
+        for (key, override_entry) in self.overrides.iter() {
+            if !matches!(key, LedgerKey::Offer(_)) {
+                continue;
+            }
+            match override_entry {
+                Some(entry) if matches!(entry.data, LedgerEntryData::Offer(_)) => {
+                    offers.insert(key.clone(), entry.clone());
+                }
+                _ => {
+                    offers.remove(key);
+                }
+            }
+        }
+        offers
     }
 
     /// Get the ledger sequence.
@@ -486,6 +904,11 @@ impl SnapshotHandle {
     /// Get the header.
     pub fn header(&self) -> &LedgerHeader {
         &self.inner.header
+    }
+
+    /// Get the base transaction fee captured by this snapshot.
+    pub fn base_fee(&self) -> u32 {
+        self.inner.base_fee()
     }
 
     /// Get the header hash.
@@ -506,6 +929,10 @@ impl SnapshotHandle {
     /// back to the lookup function if one is configured (e.g., for bucket
     /// list lookups).
     pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+        if let Some(entry) = self.overrides.get(key) {
+            return Ok(entry.clone());
+        }
+
         // 1. Check snapshot's built-in cache
         if let Some(entry) = self.inner.get_entry(key) {
             self.stats
@@ -569,7 +996,10 @@ impl SnapshotHandle {
         let cache = self.prefetch_cache.read();
 
         for key in keys {
-            if self.inner.get_entry(key).is_some() || cache.contains_key(key) {
+            if self.overrides.contains_key(key)
+                || self.inner.get_entry(key).is_some()
+                || cache.contains_key(key)
+            {
                 continue;
             }
             needed.push(key.clone());
@@ -757,8 +1187,8 @@ impl crate::EntryReader for SnapshotHandle {
 mod tests {
     use super::*;
     use stellar_xdr::{
-        AccountEntry, AccountEntryExt, LedgerEntryExt, PublicKey, SequenceNumber, Thresholds,
-        Uint256,
+        AccountEntry, AccountEntryExt, Asset, LedgerEntryExt, OfferEntry, OfferEntryExt, Price,
+        PublicKey, SequenceNumber, Thresholds, Uint256,
     };
 
     fn create_test_account(seed: u8) -> (LedgerKey, LedgerEntry) {
@@ -1211,12 +1641,24 @@ mod tests {
             let _ = &s2;
             Ok(vec![])
         }));
-        assert_eq!(Arc::strong_count(&shared), 4);
+        let s3 = shared.clone();
+        handle.set_frozen_offer_entries_lookup(Arc::new(move || {
+            let _ = &s3;
+            Ok(vec![])
+        }));
+        let s4 = shared.clone();
+        handle.set_market_entries_lookup(Arc::new(move || {
+            let _ = &s4;
+            Ok((vec![], vec![]))
+        }));
+        assert_eq!(Arc::strong_count(&shared), 6);
 
         handle.release_lookups();
         // Only our original + shared_clone should remain
         assert_eq!(Arc::strong_count(&shared), 2);
         assert!(handle.lookups_released);
+        assert!(handle.frozen_offer_entries().is_err());
+        assert!(handle.classic_market_snapshot().is_err());
         drop(shared_clone);
     }
 
@@ -1306,12 +1748,22 @@ mod tests {
             let _ = &data_for_batch;
             Ok(vec![])
         }));
-        assert_eq!(Arc::strong_count(&shared_data), 3);
+        let data_for_frozen_offers = shared_data.clone();
+        handle.set_frozen_offer_entries_lookup(Arc::new(move || {
+            let _ = &data_for_frozen_offers;
+            Ok(vec![])
+        }));
+        let data_for_market = shared_data.clone();
+        handle.set_market_entries_lookup(Arc::new(move || {
+            let _ = &data_for_market;
+            Ok((vec![], vec![]))
+        }));
+        assert_eq!(Arc::strong_count(&shared_data), 5);
 
         // Simulate executor loaders (clone of handle)
         let executor_handle = handle.clone();
-        // lookup/batch closures are Arc-shared, so strong count stays at 3
-        assert_eq!(Arc::strong_count(&shared_data), 3);
+        // Closures are Arc-shared, so cloning the handle adds no captures.
+        assert_eq!(Arc::strong_count(&shared_data), 5);
 
         // Simulate clearing executor loaders (Part 0)
         drop(executor_handle);
@@ -1422,5 +1874,64 @@ mod tests {
             handle.soroban_network_info().unwrap().max_contract_size,
             777
         );
+    }
+
+    #[test]
+    fn test_classic_market_snapshot_is_epoch_tied_and_immutable() {
+        let offer = OfferEntry {
+            seller_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([3; 32]))),
+            offer_id: 17,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 50,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        let hash = Hash256::from_bytes([9; 32]);
+        let mut header = LedgerHeader::default();
+        header.ledger_seq = 77;
+        header.ledger_version = 24;
+        let mut handle =
+            SnapshotHandle::new(LedgerSnapshot::new(header, hash, HashMap::new(), None));
+        let committed_offer = offer.clone();
+        handle.set_market_entries_lookup(Arc::new(move || {
+            Ok((vec![committed_offer.clone()], Vec::new()))
+        }));
+
+        let first = handle.classic_market_snapshot().unwrap();
+        assert_eq!(first.ledger_seq(), 77);
+        assert_eq!(first.ledger_hash(), hash);
+        assert_eq!(first.protocol_version(), 24);
+        assert_eq!(first.offers(), &[offer]);
+
+        let mut detached = first.offers()[0].clone();
+        detached.amount = 1;
+        assert_eq!(detached.amount, 1);
+        let second = handle.classic_market_snapshot().unwrap();
+        assert_eq!(second.offers()[0].amount, 50);
+    }
+
+    #[test]
+    fn test_override_handle_has_isolated_cache_and_masks_fallback() {
+        let (key, original) = create_test_account(8);
+        let fallback_entry = original.clone();
+        let base = SnapshotHandle::with_lookup(
+            LedgerSnapshot::empty(1),
+            Arc::new(move |_| Ok(Some(fallback_entry.clone()))),
+        );
+        assert_eq!(base.get_entry(&key).unwrap(), Some(original.clone()));
+        assert_eq!(base.prefetch_cache_len(), 1);
+
+        let masked = base.with_overrides(HashMap::from([(key.clone(), None)]));
+        assert_eq!(masked.prefetch_cache_len(), 0);
+        assert_eq!(masked.get_entry(&key).unwrap(), None);
+        assert_eq!(
+            masked.load_entries(std::slice::from_ref(&key)).unwrap(),
+            vec![]
+        );
+        assert_eq!(masked.prefetch_cache_len(), 0);
+        assert_eq!(base.get_entry(&key).unwrap(), Some(original));
+        assert_eq!(base.prefetch_cache_len(), 1);
     }
 }

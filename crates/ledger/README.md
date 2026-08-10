@@ -52,6 +52,9 @@ graph TD
 | `EntryChange` | Net effect for a single ledger key after delta coalescing. |
 | `LedgerSnapshot` | Immutable point-in-time ledger state used for validation and execution reads. |
 | `SnapshotHandle` | Shared snapshot wrapper with lazy point lookups, batch prefetch, and indexed helpers. |
+| `ClassicMarketSnapshot` | Immutable, complete offer and liquidity-pool view tied to one committed ledger sequence, hash, and protocol version. |
+| `CommittedMarketEvent` | Generation-tagged initialization/reset/ordinary committed market event with an exact snapshot, metadata-complete offer deltas, and a compact pool-count delta. |
+| `CommittedMarketSubscription` | Atomic subscribe-plus-bootstrap handle backed by a four-event non-blocking broadcast ring. Consumers must handle lag explicitly. |
 | `ConfigUpgradeSetFrame` | Loader, validator, and applier for Soroban config-upgrade sets stored in ledger state. |
 | `InMemorySorobanState` | O(1) cache of contract data, code, TTLs, and config settings for Soroban execution. |
 | `SorobanNetworkInfo` | `/sorobaninfo`-style view of ledger-configured Soroban limits and fee parameters. |
@@ -154,6 +157,37 @@ The close pipeline can deduct fees before transaction bodies run, including acro
 ### Restored entries are tracked explicitly
 
 When Soroban restores entries from the live bucket list or hot archive, metadata emission distinguishes `RESTORED` from normal `CREATED` or `UPDATED` changes. That keeps transaction meta aligned with CAP-0066 and upstream `TransactionMeta` behavior.
+
+### Committed market stream
+
+`subscribe_committed_market()` subscribes before capturing an immutable baseline
+under `committed_state_gate`; callers scan the baseline after the gate is
+released while closes buffer. Initialization is published only after bucket
+state, offer caches, Soroban configuration, and header/hash agree. Ordinary
+publication occurs at the same commit boundary and never awaits a consumer.
+Reset and reinitialization advance the stream generation. The fixed ring
+capacity is intentionally four because retained snapshots pin bucket and
+Soroban resources; broadcast lag is reported rather than silently skipped.
+Snapshot bucket hashes remain garbage-collection roots until every shared
+handle releases its lookup closures or is dropped. Extraction and snapshot
+construction are skipped when there are no subscribers.
+
+**Accumulation hazard**: an observer that retains successive snapshots (the
+bootstrap baseline plus each ledger event's snapshot) pins the *union* of every
+bucket file those snapshots reference — across bucket-list spills and even
+`reset()` — until it drops the handles or calls `release_lookups()`. There is
+no internal cap on this retention. The gauge `henyey_snapshot_gc_pinned_hashes`
+exports the number of distinct bucket hashes currently pinned as snapshot GC
+roots; a monotonically growing value under a live subscriber indicates a
+consumer that is holding old snapshots instead of releasing them.
+
+Publication qualification:
+
+```bash
+HENYEY_MARKET_PUBLICATION_SNAPSHOT_OFFERS=1250000 \
+HENYEY_MARKET_PUBLICATION_CHANGES=2000 HENYEY_MARKET_PUBLICATION_LEDGERS=1000 \
+cargo test --release -p henyey-ledger benchmark_committed_market_publication_with_active_subscriber -- --ignored --nocapture
+```
 
 ## stellar-core Mapping
 
