@@ -1,4 +1,26 @@
 //! Isolated, read-only Classic transaction execution.
+//!
+//! This API is **Classic-only**: envelopes containing any Soroban operation
+//! (`InvokeHostFunction`, `ExtendFootprintTtl`, `RestoreFootprint`) are
+//! rejected with [`IsolatedClassicSimulationError::SorobanUnsupported`]. Real
+//! Soroban execution requires the live network `SorobanConfig`, module cache,
+//! and per-transaction PRNG seed, none of which are available here; executing
+//! with placeholders would produce plausible-but-wrong results.
+//!
+//! # Exactness model
+//!
+//! The simulated transaction runs as if it were the next ledger after the
+//! committed snapshot (LCL): `ledger_seq = LCL + 1`, `close_time =
+//! LCL close_time + 1`, and the header's `base_fee`, unless overridden via
+//! [`IsolatedClassicSimulationRequest::close_time`] /
+//! [`IsolatedClassicSimulationRequest::base_fee`]. Fees are processed with the
+//! same two-phase flow as a real ledger close (fee pre-charge, then body
+//! execution with fees skipped), so `fee_charged` and the fee debit are exact
+//! even when the body fails apply-time validation (e.g. `txBAD_SEQ`).
+//!
+//! Byte-identical meta parity with an event-emitting node additionally
+//! requires passing that node's live classic-event flags via
+//! [`IsolatedClassicSimulationRequest::classic_events`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -12,7 +34,10 @@ use stellar_xdr::{
     TransactionEnvelope, TransactionMeta, TransactionResultPair,
 };
 
-use super::{build_tx_result_pair, load_frozen_key_config, TransactionExecutor};
+use super::{
+    build_tx_result_pair, load_frozen_key_config, FeeMode, TransactionExecutionRequest,
+    TransactionExecutor,
+};
 use crate::{LedgerError, SnapshotHandle};
 
 /// One isolated transaction plus ledger entries to overlay on the committed snapshot.
@@ -20,10 +45,46 @@ use crate::{LedgerError, SnapshotHandle};
 /// Overrides are private to this simulation. They may create synthetic accounts,
 /// mask committed entries, or replace committed entries without mutating canonical
 /// state or caches owned by the source snapshot.
+///
+/// Offers are controlled **solely** via the frozen offer base supplied to
+/// [`IsolatedClassicSimulationBase::prepare`] (plus the per-simulation overlay
+/// the executor builds on top of it). `LedgerKey::Offer` keys in
+/// `ledger_overrides` are rejected with
+/// [`IsolatedClassicSimulationError::OfferOverrideUnsupported`] because offer
+/// reads route exclusively through the offer store and would silently ignore
+/// such overrides.
 #[derive(Debug, Clone)]
 pub struct IsolatedClassicSimulationRequest {
+    /// Signed Classic envelope to execute. Soroban envelopes are rejected.
     pub envelope: TransactionEnvelope,
+    /// Non-offer ledger entries to mask/replace/create over the snapshot.
     pub ledger_overrides: HashMap<LedgerKey, Option<LedgerEntry>>,
+    /// Classic event emission flags. Meta parity with a live node requires
+    /// passing that node's config (`emit_classic_events`,
+    /// `backfill_stellar_asset_events`); the default (both false) matches a
+    /// node with events disabled.
+    pub classic_events: ClassicEventConfig,
+    /// Close time of the simulated ledger. Defaults to the committed header's
+    /// close time + 1 (the LCL+1 model). Pass the expected real close time to
+    /// match time-bound (`maxTime`) validity of the actual next ledger.
+    pub close_time: Option<u64>,
+    /// Effective base fee of the simulated ledger. Defaults to the committed
+    /// header's `base_fee`. Pass a surge-priced base fee to match
+    /// `fee_charged` of the actual next ledger.
+    pub base_fee: Option<u32>,
+}
+
+impl IsolatedClassicSimulationRequest {
+    /// Request with no overrides and default (LCL+1, events-off) parameters.
+    pub fn new(envelope: TransactionEnvelope) -> Self {
+        Self {
+            envelope,
+            ledger_overrides: HashMap::new(),
+            classic_events: ClassicEventConfig::default(),
+            close_time: None,
+            base_fee: None,
+        }
+    }
 }
 
 /// One ledger key's final simulated state relative to the committed snapshot.
@@ -80,6 +141,12 @@ pub enum IsolatedClassicSimulationError {
     NonOfferEntry,
     #[error("duplicate offer id {0} in simulation offer set")]
     DuplicateOfferId(i64),
+    #[error("offer id {0} exceeds the committed header id_pool {1}")]
+    OfferIdExceedsIdPool(i64, u64),
+    #[error("Soroban transactions are not supported by isolated Classic simulation")]
+    SorobanUnsupported,
+    #[error("offer ledger overrides are unsupported; supply offers via the frozen offer base")]
+    OfferOverrideUnsupported,
     #[error(transparent)]
     Ledger(#[from] LedgerError),
 }
@@ -106,12 +173,23 @@ impl IsolatedClassicSimulationBase {
             .checked_add(1)
             .ok_or(IsolatedClassicSimulationError::LedgerSequenceOverflow)?;
 
+        // Validate against the committed header's id_pool. The header is not a
+        // ledger entry, so per-request `ledger_overrides` cannot change it —
+        // the snapshot header is always the effective header. A synthetic
+        // offer above id_pool would collide with the first offer a simulated
+        // transaction creates (which allocates id_pool + 1).
+        let id_pool = snapshot.header().id_pool;
         let mut frozen_offers = HashMap::with_capacity(offer_entries.len());
         for entry in offer_entries {
             let LedgerEntryData::Offer(offer) = &entry.data else {
                 return Err(IsolatedClassicSimulationError::NonOfferEntry);
             };
             let offer_id = offer.offer_id;
+            if offer_id < 0 || offer_id as u64 > id_pool {
+                return Err(IsolatedClassicSimulationError::OfferIdExceedsIdPool(
+                    offer_id, id_pool,
+                ));
+            }
             if frozen_offers.insert(offer_id, entry).is_some() {
                 return Err(IsolatedClassicSimulationError::DuplicateOfferId(offer_id));
             }
@@ -131,10 +209,30 @@ impl IsolatedClassicSimulationBase {
     }
 
     /// Execute one signed envelope with a fresh ledger and offer overlay.
+    ///
+    /// The envelope must be Classic (no Soroban operations) and its fee source
+    /// account must exist in the committed snapshot or `ledger_overrides`,
+    /// mirroring the inclusion requirements of a real ledger close.
     pub fn simulate(
         &self,
         request: &IsolatedClassicSimulationRequest,
     ) -> Result<IsolatedClassicSimulation, IsolatedClassicSimulationError> {
+        // Classic-only: Soroban execution requires the live network config,
+        // module cache, and PRNG seed; placeholders would yield wrong results.
+        if henyey_tx::envelope_utils::is_soroban_envelope(&request.envelope) {
+            return Err(IsolatedClassicSimulationError::SorobanUnsupported);
+        }
+        // Offer reads route exclusively through the frozen offer base and the
+        // per-simulation overlay; an offer ledger override would be silently
+        // ignored, so reject it up front.
+        if request
+            .ledger_overrides
+            .keys()
+            .any(|key| matches!(key, LedgerKey::Offer(_)))
+        {
+            return Err(IsolatedClassicSimulationError::OfferOverrideUnsupported);
+        }
+
         let target_ledger = self
             .snapshot
             .ledger_seq()
@@ -148,10 +246,14 @@ impl IsolatedClassicSimulationBase {
         )));
 
         let header = self.snapshot.header();
+        let close_time = request
+            .close_time
+            .unwrap_or_else(|| header.scp_value.close_time.0.saturating_add(1));
+        let base_fee = request.base_fee.unwrap_or(header.base_fee);
         let mut context = LedgerContext::new(
             target_ledger,
-            header.scp_value.close_time.0.saturating_add(1),
-            header.base_fee,
+            close_time,
+            base_fee,
             header.base_reserve,
             header.ledger_version,
             self.network_id,
@@ -162,17 +264,37 @@ impl IsolatedClassicSimulationBase {
         };
         context.frozen_key_config = load_frozen_key_config(&overlay, header.ledger_version)?;
 
-        let frame =
-            TransactionFrame::with_network(Arc::new(request.envelope.clone()), self.network_id);
+        let envelope = Arc::new(request.envelope.clone());
+        let frame = TransactionFrame::with_network(Arc::clone(&envelope), self.network_id);
         let mut executor = TransactionExecutor::new(
             &context,
             header.id_pool,
             Default::default(),
-            ClassicEventConfig::default(),
+            request.classic_events,
         );
         executor.set_offer_store(Arc::clone(&offer_store));
-        let execution =
-            executor.execute_transaction(&overlay, &request.envelope, header.base_fee, None)?;
+
+        // Mirror the production ledger-close flow (run_transactions_on_executor
+        // with FeeStrategy::PreChargeInternally): pre-charge the fee for the
+        // included transaction, then execute the body with FeeMode::Skip. This
+        // keeps fee_charged and the fee debit exact even when the body fails
+        // apply-time validation (e.g. txBAD_SEQ).
+        let (fee_changes, charged_fee) =
+            executor.process_fee_only(&overlay, &envelope, base_fee)?;
+        executor.state.snapshot_delta();
+        let mut execution = executor.execute_transaction_with_arc(
+            &overlay,
+            TransactionExecutionRequest {
+                tx_envelope: Arc::clone(&envelope),
+                base_fee,
+                soroban_prng_seed: None,
+                fee_mode: FeeMode::Skip,
+            },
+        )?;
+        // With FeeMode::Skip, early validation failures report fee_charged=0.
+        // Override with the pre-charged amount, exactly as tx_set.rs does.
+        execution.fee_charged = charged_fee.saturating_sub(execution.fee_refund);
+        execution.fee_changes = Some(fee_changes);
         let transaction_overlay_offers = offer_store.lock().overlay_len();
         self.simulations.fetch_add(1, Ordering::Relaxed);
         self.max_transaction_overlay_offers
@@ -184,7 +306,7 @@ impl IsolatedClassicSimulationBase {
             &frame,
             &self.network_id,
             &execution,
-            header.base_fee as i64,
+            base_fee as i64,
             header.ledger_version,
         )?;
         let net_ledger_changes = collect_net_changes(
@@ -246,7 +368,16 @@ fn collect_net_changes(
         LedgerEntryChange::Removed(key) => {
             changes.entry(key.clone()).or_insert((None, None)).1 = None;
         }
-        LedgerEntryChange::Restored(_) => {}
+        LedgerEntryChange::Restored(_) => {
+            // Hot-archive restoration is Soroban-only; Soroban envelopes are
+            // rejected in simulate(), so this arm is unreachable for isolated
+            // Classic simulation. Keep it explicit rather than silently
+            // dropping a change kind.
+            debug_assert!(
+                false,
+                "Restored ledger change in Classic-only isolated simulation"
+            );
+        }
     };
     if let Some(fee) = fee {
         fee.iter().for_each(&mut apply);
@@ -374,6 +505,7 @@ mod tests {
         header.base_fee = 100;
         header.base_reserve = 5_000_000;
         header.scp_value.close_time.0 = 1_000;
+        header.id_pool = 100;
         let offers = vec![
             offer(
                 outbound.clone(),
@@ -414,21 +546,18 @@ mod tests {
         (snapshot, offers)
     }
 
-    fn request(snapshot: &SnapshotHandle) -> (LedgerKey, IsolatedClassicSimulationRequest) {
+    fn signed_envelope(fee: u32, cond: Preconditions) -> (LedgerKey, TransactionEnvelope) {
         let network_id = NetworkId::testnet();
         let secret =
             SecretKey::from_seed(sha256(b"henyey isolated classic simulation test").as_bytes());
         let public_key = Uint256(*secret.public_key().as_bytes());
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(public_key.clone()));
-        let source_key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: account_id.clone(),
-        });
-        let source = account(account_id, 20_000_000, 0, 0, 0);
+        let source_key = LedgerKey::Account(LedgerKeyAccount { account_id });
         let tx = Transaction {
             source_account: MuxedAccount::Ed25519(public_key.clone()),
-            fee: snapshot.base_fee(),
+            fee,
             seq_num: SequenceNumber(1),
-            cond: Preconditions::None,
+            cond,
             memo: Memo::None,
             operations: vec![Operation {
                 source_account: None,
@@ -462,13 +591,18 @@ mod tests {
         }]
         .try_into()
         .unwrap();
-        (
-            source_key.clone(),
-            IsolatedClassicSimulationRequest {
-                envelope,
-                ledger_overrides: HashMap::from([(source_key, Some(source))]),
-            },
-        )
+        (source_key, envelope)
+    }
+
+    fn request(snapshot: &SnapshotHandle) -> (LedgerKey, IsolatedClassicSimulationRequest) {
+        let (source_key, envelope) = signed_envelope(snapshot.base_fee(), Preconditions::None);
+        let LedgerKey::Account(key) = &source_key else {
+            unreachable!()
+        };
+        let source = account(key.account_id.clone(), 20_000_000, 0, 0, 0);
+        let mut request = IsolatedClassicSimulationRequest::new(envelope);
+        request.ledger_overrides = HashMap::from([(source_key.clone(), Some(source))]);
+        (source_key, request)
     }
 
     #[test]
@@ -523,6 +657,220 @@ mod tests {
             ),
             Err(IsolatedClassicSimulationError::DuplicateOfferId(1))
         ));
+    }
+
+    #[test]
+    fn rejects_soroban_envelopes() {
+        use stellar_xdr::{
+            ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, ScAddress,
+            ScSymbol,
+        };
+        let (snapshot, offers) = fixture();
+        let base = IsolatedClassicSimulationBase::prepare(&snapshot, NetworkId::testnet(), offers)
+            .unwrap();
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([5; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                        contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                        function_name: ScSymbol("test".try_into().unwrap()),
+                        args: VecM::default(),
+                    }),
+                    auth: VecM::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let request =
+            IsolatedClassicSimulationRequest::new(TransactionEnvelope::Tx(TransactionV1Envelope {
+                tx,
+                signatures: VecM::default(),
+            }));
+        assert!(matches!(
+            base.simulate(&request),
+            Err(IsolatedClassicSimulationError::SorobanUnsupported)
+        ));
+    }
+
+    #[test]
+    fn rejects_offer_ledger_overrides() {
+        let (snapshot, offers) = fixture();
+        let (_, mut request) = request(&snapshot);
+        request.ledger_overrides.insert(
+            LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
+                seller_id: id(1),
+                offer_id: 1,
+            }),
+            None,
+        );
+        let base = IsolatedClassicSimulationBase::prepare(&snapshot, NetworkId::testnet(), offers)
+            .unwrap();
+        assert!(matches!(
+            base.simulate(&request),
+            Err(IsolatedClassicSimulationError::OfferOverrideUnsupported)
+        ));
+    }
+
+    #[test]
+    fn rejects_offer_id_above_committed_id_pool() {
+        let (snapshot, _) = fixture();
+        // fixture header has id_pool = 100; offer id 101 would collide with
+        // the first offer a simulated transaction creates.
+        assert!(matches!(
+            IsolatedClassicSimulationBase::prepare(
+                &snapshot,
+                NetworkId::testnet(),
+                vec![offer(
+                    id(1),
+                    101,
+                    usd(),
+                    Asset::Native,
+                    100,
+                    Price { n: 1, d: 1 },
+                )],
+            ),
+            Err(IsolatedClassicSimulationError::OfferIdExceedsIdPool(
+                101, 100
+            ))
+        ));
+    }
+
+    #[test]
+    fn bad_seq_transaction_still_charges_full_fee_and_debits_balance() {
+        let (snapshot, offers) = fixture();
+        let (source_key, mut request) = request(&snapshot);
+        // Make the account's sequence far ahead of the envelope's seq_num 1 so
+        // apply-time validation fails with txBAD_SEQ.
+        let LedgerKey::Account(key) = &source_key else {
+            unreachable!()
+        };
+        let mut source = account(key.account_id.clone(), 20_000_000, 0, 0, 0);
+        let LedgerEntryData::Account(acc) = &mut source.data else {
+            unreachable!()
+        };
+        acc.seq_num = SequenceNumber(500);
+        request
+            .ledger_overrides
+            .insert(source_key.clone(), Some(source));
+
+        let base = IsolatedClassicSimulationBase::prepare(&snapshot, NetworkId::testnet(), offers)
+            .unwrap();
+        let result = base.simulate(&request).unwrap();
+        assert!(!result.success);
+        assert!(matches!(
+            result.result.result.result,
+            stellar_xdr::TransactionResultResult::TxBadSeq
+        ));
+        // Production pre-deducts the fee for every included transaction and
+        // reports it even on validation failure.
+        assert_eq!(result.fee_charged, 100);
+        assert_eq!(result.result.result.fee_charged, 100);
+        let change = result
+            .net_ledger_changes
+            .iter()
+            .find(|change| change.key == source_key)
+            .expect("fee debit must appear in net changes");
+        let LedgerEntryData::Account(before) = &change.before.as_ref().unwrap().data else {
+            unreachable!()
+        };
+        let LedgerEntryData::Account(after) = &change.after.as_ref().unwrap().data else {
+            unreachable!()
+        };
+        assert_eq!(before.balance, 20_000_000);
+        assert_eq!(after.balance, 19_999_900);
+        // txBAD_SEQ does not consume a sequence number.
+        assert_eq!(after.seq_num, SequenceNumber(500));
+    }
+
+    #[test]
+    fn close_time_override_controls_time_bound_validity() {
+        use stellar_xdr::{TimeBounds, TimePoint};
+        let (snapshot, offers) = fixture();
+        let (source_key, envelope) = signed_envelope(
+            snapshot.base_fee(),
+            Preconditions::Time(TimeBounds {
+                min_time: TimePoint(0),
+                max_time: TimePoint(1_500),
+            }),
+        );
+        let LedgerKey::Account(key) = &source_key else {
+            unreachable!()
+        };
+        let source = account(key.account_id.clone(), 20_000_000, 0, 0, 0);
+        let mut request = IsolatedClassicSimulationRequest::new(envelope);
+        request.ledger_overrides = HashMap::from([(source_key, Some(source))]);
+        let base = IsolatedClassicSimulationBase::prepare(&snapshot, NetworkId::testnet(), offers)
+            .unwrap();
+
+        // Default LCL+1 close time (1_001) is within the bounds.
+        let on_time = base.simulate(&request).unwrap();
+        assert!(on_time.success, "{:?}", on_time.error);
+
+        // Overriding the close time past maxTime must fail with txTOO_LATE.
+        request.close_time = Some(2_000);
+        let late = base.simulate(&request).unwrap();
+        assert!(!late.success);
+        assert!(matches!(
+            late.result.result.result,
+            stellar_xdr::TransactionResultResult::TxTooLate
+        ));
+        // The fee is still charged, as for any included transaction.
+        assert_eq!(late.fee_charged, 100);
+    }
+
+    #[test]
+    fn base_fee_override_controls_fee_charged() {
+        let (snapshot, offers) = fixture();
+        let (source_key, envelope) = signed_envelope(1_000, Preconditions::None);
+        let LedgerKey::Account(key) = &source_key else {
+            unreachable!()
+        };
+        let source = account(key.account_id.clone(), 20_000_000, 0, 0, 0);
+        let mut request = IsolatedClassicSimulationRequest::new(envelope);
+        request.ledger_overrides = HashMap::from([(source_key, Some(source))]);
+        let base = IsolatedClassicSimulationBase::prepare(&snapshot, NetworkId::testnet(), offers)
+            .unwrap();
+
+        // Default: header base_fee (100) is charged.
+        let default_fee = base.simulate(&request).unwrap();
+        assert_eq!(default_fee.fee_charged, 100);
+        assert_eq!(default_fee.result.result.fee_charged, 100);
+
+        // Surge-priced ledger: effective base fee 250 is charged.
+        request.base_fee = Some(250);
+        let surged = base.simulate(&request).unwrap();
+        assert_eq!(surged.fee_charged, 250);
+        assert_eq!(surged.result.result.fee_charged, 250);
+    }
+
+    #[test]
+    fn classic_event_config_changes_emitted_meta() {
+        let (snapshot, offers) = fixture();
+        let (_, mut request) = request(&snapshot);
+        let base = IsolatedClassicSimulationBase::prepare(&snapshot, NetworkId::testnet(), offers)
+            .unwrap();
+
+        let without_events = base.simulate(&request).unwrap();
+        assert!(without_events.success, "{:?}", without_events.error);
+
+        request.classic_events = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        let with_events = base.simulate(&request).unwrap();
+        assert!(with_events.success, "{:?}", with_events.error);
+        assert_ne!(
+            without_events.transaction_meta, with_events.transaction_meta,
+            "enabling classic events must change the emitted meta"
+        );
     }
 
     #[test]

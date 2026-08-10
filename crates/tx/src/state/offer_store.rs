@@ -872,6 +872,34 @@ mod tests {
     }
 
     #[test]
+    fn best_offer_equal_price_tie_prefers_lower_id_when_base_offer_is_older() {
+        // Base holds id 1, overlay inserts id 3 at the same price:
+        // the base offer (lower id) must win the tie.
+        let mut store = OfferStore::new();
+        store.insert_record(record(1, 1, 100));
+        let mut overlay = OfferStore::with_immutable_base(store.into_immutable_base());
+        overlay.insert_record(record(3, 1, 50));
+        assert_eq!(
+            overlay.best_offer(&Asset::Native, &usd()).unwrap().offer_id,
+            1
+        );
+    }
+
+    #[test]
+    fn best_offer_equal_price_tie_prefers_lower_id_when_local_offer_is_older() {
+        // Base holds id 3, overlay inserts id 1 at the same price:
+        // the overlay-local offer (lower id) must win the tie.
+        let mut store = OfferStore::new();
+        store.insert_record(record(3, 1, 100));
+        let mut overlay = OfferStore::with_immutable_base(store.into_immutable_base());
+        overlay.insert_record(record(1, 1, 50));
+        assert_eq!(
+            overlay.best_offer(&Asset::Native, &usd()).unwrap().offer_id,
+            1
+        );
+    }
+
+    #[test]
     fn filtered_lookup_skips_shadowed_base_offer_and_uses_local_offer() {
         let base = base();
         let mut overlay = OfferStore::with_immutable_base(base);
