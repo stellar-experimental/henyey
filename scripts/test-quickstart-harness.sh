@@ -72,11 +72,12 @@ EOF
 # Emits the non-comment lines of the pubnet matrix block: from the
 # `network: pubnet` marker up to (but excluding) that shard's `steps:` line.
 extract_pubnet_matrix_block() {
-    # NOTE (#3835): current *unsafe* two-awk shape, extracted verbatim so the
-    # regression test below can capture the SIGPIPE (exit 141) it produces on an
-    # oversized pubnet block. Made SIGPIPE-safe in the following commit.
-    awk '/network: pubnet/{f=1} f{print}' "$1" \
-        | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#'
+    # SIGPIPE-safe (#3835): the early `exit` lives in the awk that reads the file
+    # directly, so there is no upstream pipe writer to be killed when the reader
+    # stops early. The only downstream reader (grep) drains to EOF. Byte-identical
+    # to the original two-awk shape on the committed workflow.
+    awk '/network: pubnet/{f=1} f&&/^    steps:/{exit} f{print}' "$1" \
+        | grep -vE '^[[:space:]]*#'
 }
 
 # ============================================================
@@ -212,7 +213,7 @@ test_workflow_shard_probe_contract() {
     # appear within the entry's block (the next ~6 lines, before the next
     # matrix `- network:` entry).
     local galexie_line
-    galexie_line=$(grep -n 'enable: galexie$' "$WORKFLOW" | head -1 | cut -d: -f1)
+    galexie_line=$(grep -nm1 'enable: galexie$' "$WORKFLOW" | cut -d: -f1)
     if [[ -n "$galexie_line" ]]; then
         local galexie_block
         galexie_block=$(sed -n "$((galexie_line)),+6p" "$WORKFLOW")
@@ -262,8 +263,12 @@ test_workflow_shard_probe_contract() {
     fi
 
     # Check: pubnet shard does NOT include stellar_rpc_healthy (excluded upstream)
-    local pubnet_line
-    pubnet_line=$(grep -n 'pubnet' "$WORKFLOW" | grep -v '#' | head -1 | cut -d: -f1)
+    local pubnet_line pubnet_matches
+    # Capture the file-streaming stages fully (both drain to EOF), then run the
+    # early-exit `head -1` on the bounded variable — no file-reading writer is
+    # left holding a closed pipe (#3835).
+    pubnet_matches=$(grep -n 'pubnet' "$WORKFLOW" | grep -v '#')
+    pubnet_line=$(printf '%s\n' "$pubnet_matches" | head -1 | cut -d: -f1)
     if [[ -n "$pubnet_line" ]]; then
         # Get the probes line for the pubnet entry (within ~5 lines after)
         local pubnet_probes
@@ -294,7 +299,7 @@ test_workflow_shard_probe_contract() {
     # Check: local rpc shard includes test_friendbot.go (upstream runs friendbot
     # for any local shard whose enable contains rpc or horizon)
     local rpc_line
-    rpc_line=$(grep -n 'enable: rpc$' "$WORKFLOW" | head -1 | cut -d: -f1)
+    rpc_line=$(grep -nm1 'enable: rpc$' "$WORKFLOW" | cut -d: -f1)
     if [[ -n "$rpc_line" ]]; then
         local rpc_probes
         rpc_probes=$(sed -n "$((rpc_line)),+3p" "$WORKFLOW" | grep 'probes:')
@@ -732,7 +737,7 @@ test_workflow_uses_upstream_run_attempt_timeout_budget() {
     # (b) PROBE_TIMEOUT is computed from run_attempt * timeout_multiplier * 60.
     # `|| true` so a no-match doesn't abort under `set -e`.
     local probe_timeout_expr
-    probe_timeout_expr=$( (grep -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) | head -1)
+    probe_timeout_expr=$( (grep -m1 -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) )
     if echo "$probe_timeout_expr" | grep -q 'github.run_attempt' && \
        echo "$probe_timeout_expr" | grep -q 'timeout_multiplier' && \
        echo "$probe_timeout_expr" | grep -q '\* 60'; then
@@ -770,7 +775,7 @@ test_timeout_budget_matches_upstream_formula() {
     # All three formula terms present in the single PROBE_TIMEOUT expression.
     # `|| true` so a no-match doesn't abort under `set -e`.
     local probe_timeout_expr
-    probe_timeout_expr=$( (grep -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) | head -1)
+    probe_timeout_expr=$( (grep -m1 -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) )
     if echo "$probe_timeout_expr" | grep -q 'github.run_attempt' && \
        echo "$probe_timeout_expr" | grep -q 'timeout_multiplier' && \
        echo "$probe_timeout_expr" | grep -q '\* 60'; then
@@ -783,8 +788,8 @@ test_timeout_budget_matches_upstream_formula() {
     # The multiplier value equals upstream's 4.
     # `|| true` so a no-match doesn't abort under `set -e`.
     local workflow_multiplier
-    workflow_multiplier=$( (grep -E '^[[:space:]]*timeout_multiplier:[[:space:]]*[0-9]+' "$WORKFLOW" || true) \
-        | head -1 | sed -E 's/.*timeout_multiplier:[[:space:]]*([0-9]+).*/\1/')
+    workflow_multiplier=$( (grep -m1 -E '^[[:space:]]*timeout_multiplier:[[:space:]]*[0-9]+' "$WORKFLOW" || true) \
+        | sed -E 's/.*timeout_multiplier:[[:space:]]*([0-9]+).*/\1/')
     if [[ "$workflow_multiplier" == "4" ]]; then
         tap_ok "workflow_multiplier_equals_upstream_4"
     else
@@ -1292,7 +1297,7 @@ test_separate_workflow_run_retry_workflow() {
     # as declared by quickstart.yml's top-level `name:` field. A mismatch means
     # the trigger never fires.
     local quickstart_name
-    quickstart_name=$(grep -E '^name:' "$WORKFLOW" | head -1 | sed -E 's/^name:[[:space:]]*//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
+    quickstart_name=$(grep -m1 -E '^name:' "$WORKFLOW" | sed -E 's/^name:[[:space:]]*//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
     if [[ -n "$quickstart_name" ]] && grep -qF "$quickstart_name" "$retry_wf"; then
         tap_ok "retry_workflow_name_matches_quickstart_exactly"
     else
