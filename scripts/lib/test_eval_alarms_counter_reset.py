@@ -7,6 +7,8 @@ Also tests the eval_counter_dynamic baseline state change from "skipped"
 to "collecting_baseline".
 """
 
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -717,6 +719,165 @@ def test_same_pid_frozen_counter_reports_ok():
             f"Same-PID frozen counter must report ok, got {result['state']}"
         assert not result.get("post_restart"), \
             f"Same-PID frozen counter must not post-restart fire, got {result.get('post_restart')!r}"
+
+
+# ── missing-process-identity preservation tests (issue #3758) ────────────────
+
+def test_counter_streak_missing_identity_preserves_snapshot():
+    """A `missing process identity` skip (#3279) must NOT destroy the
+    counter-streak baseline — the guard in eval_counter_streak preserves it
+    in-function, so the caller-side cleanup hook must not delete it either.
+
+    Fails on origin/main two ways: (1) the 5-arg call raises TypeError because
+    maybe_reset_counter_snapshot has no skip_reason parameter there; and
+    (2) semantically, main's reason-blind reset clears the snapshot to {} on
+    any skipped counter-streak, erasing the whole breach_streak history.
+    Passes after: the identity-less reason is exempted before any write, so the
+    snapshot is byte-identical.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "1512116",
+            "start_ticks": "983181529",
+            "counter_value": "3413",
+            "breach_streak": "22",
+        })
+        before = snap_path.read_bytes()
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric")
+        # Identity-less evaluation → skipped, skip_reason="missing process identity".
+        result = eval_counter_streak(alarm, {}, state_dir, pid="", start_ticks="")
+        assert result["state"] == "skipped"
+        assert result["skip_reason"] == "missing process identity"
+
+        # Exactly as the fixed call site (eval-alarms.py:1644) invokes it.
+        maybe_reset_counter_snapshot(
+            alarm, "counter-streak", result["state"], state_dir,
+            result.get("skip_reason"),
+        )
+
+        assert snap_path.read_bytes() == before, \
+            "identity-less skip must leave the snapshot byte-identical"
+        snap = read_snapshot(snap_path)
+        assert snap["breach_streak"] == "22", \
+            f"breach_streak must be preserved, got {snap.get('breach_streak')!r}"
+
+
+def test_counter_ratio_missing_identity_preserves_streak():
+    """A `missing process identity` skip must not zero the counter-ratio
+    `<name>_streak` sub-field either, bringing the sibling family fully in line
+    with #3279 (previously it merely "degraded gracefully" by zeroing the streak
+    while keeping baselines).
+
+    Fails on origin/main: 5-arg call raises TypeError; and semantically the
+    reason-blind reset zeros myalarm_streak. Passes after: exempted before write.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "ratio_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "myalarm_streak": "4",
+            "myalarm_numerator": "100",
+            "myalarm_denominator": "500",
+        })
+
+        alarm = _make_alarm("myalarm", kind="counter-ratio")
+        maybe_reset_counter_snapshot(
+            alarm, "counter-ratio", "skipped", state_dir,
+            "missing process identity",
+        )
+
+        snap = read_snapshot(snap_path)
+        assert snap["myalarm_streak"] == "4", \
+            f"streak must be preserved on identity-less skip, got {snap['myalarm_streak']}"
+        assert snap["myalarm_numerator"] == "100", "baselines must be preserved"
+        assert snap["myalarm_denominator"] == "500", "baselines must be preserved"
+
+
+def test_counter_streak_gap_stale_still_clears():
+    """Control: a genuine coverage-gap skip (gap-stale) MUST still clear the
+    counter-streak snapshot. This guards the invariant the hook exists for and
+    proves the #3758 fix is a narrow exemption, not a blanket disable.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "123",
+            "start_ticks": "456",
+            "counter_value": "3413",
+            "breach_streak": "22",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak")
+        maybe_reset_counter_snapshot(
+            alarm, "counter-streak", "skipped", state_dir,
+            "gap-stale (prev age 5.0h)",
+        )
+
+        snap = read_snapshot(snap_path)
+        assert len(snap) == 0, \
+            f"gap-stale skip must still clear the snapshot, got {snap}"
+
+
+def test_missing_identity_warning_emitted():
+    """An identity-less validator-mode evaluator run must emit a loud stderr
+    warning (the issue's "silent, reads as health" harm), and must NOT emit it
+    when process identity is present.
+
+    Asserts on a stable substring only (not exact wording) to avoid brittleness.
+    Fails on origin/main: no such warning exists.
+    """
+    eval_script = Path(__file__).parent / "eval-alarms.py"
+    WARN_SUBSTR = "missing process identity"
+
+    def run(env_extra):
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = Path(d)
+            catalog = state_dir / "catalog.toml"
+            catalog.write_text("schema_version = 1\n")
+            current = state_dir / "current.prom"
+            current.write_text("# no metrics\n")
+
+            env = dict(os.environ)
+            env.pop("PID", None)
+            env.pop("START_TICKS", None)
+            env.update({
+                "MONITOR_MODE": "validator",
+                "FRESH_START": "no",
+                "CRASH_RECOVERY": "no",
+                "WARMUP_TICKS_REMAINING": "0",
+                "UPTIME_SECONDS": "999999",
+                "PREV_PROM_INVALID": "false",
+            })
+            env.update(env_extra)
+
+            proc = subprocess.run(
+                [sys.executable, str(eval_script),
+                 "--catalog", str(catalog),
+                 "--current", str(current),
+                 "--state-dir", str(state_dir)],
+                capture_output=True, text=True, env=env,
+            )
+            return proc.stderr
+
+    # Identity-less validator tick → warning fires.
+    stderr_missing = run({})
+    assert WARN_SUBSTR in stderr_missing, \
+        f"expected identity warning in stderr, got: {stderr_missing!r}"
+
+    # Identity present → warning must NOT fire.
+    stderr_present = run({"PID": "1512116", "START_TICKS": "983181529"})
+    assert WARN_SUBSTR not in stderr_present, \
+        f"warning must not fire when identity is present, got: {stderr_present!r}"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────
