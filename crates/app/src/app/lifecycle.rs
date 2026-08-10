@@ -3514,7 +3514,7 @@ mod scp_dedup_pipeline_tests {
         // Drain a full batch of DISTINCT token-bearing SCP messages. The herder
         // is in Booting → pre-filter rejects, but the flow-control token still
         // releases at the end of pump_scp_intake (Drop on every path).
-        for slot in 0..batch as u64 {
+        for slot in 0..batch {
             let envelope = make_test_envelope(1000 + slot, 2_000_000_000);
             let mut msg = make_overlay_scp_msg(envelope);
             msg.attach_test_flow_release(Arc::clone(&flow_control), grant_tx.clone());
@@ -3534,7 +3534,7 @@ mod scp_dedup_pipeline_tests {
              exactly one SEND_MORE_EXTENDED (got {grants:?})"
         );
         assert_eq!(
-            grants[0] as u64, batch as u64,
+            grants[0] as u64, batch,
             "the grant must request the full batch of flood messages"
         );
     }
