@@ -321,6 +321,7 @@ gates = ["warmup-2-ticks"]
 guard_metric = "henyey_jemalloc_resident_bytes"
 guard_op = ">"
 guard_threshold = 34359738368
+baseline_version = 2  # bumped in #3752: resident-memory guard added — alarm now suppressed when henyey_jemalloc_resident_bytes <= 32 GiB (semantic change; invalidates prior baselines)
 cooldown_key = "henyey_jemalloc_fragmentation_pct"
 cooldown_seconds = 3600
 filing_title = "metrics: henyey_jemalloc_fragmentation_pct — {value}% > {threshold}% (2 ticks)"
