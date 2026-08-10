@@ -34,6 +34,7 @@ flowchart TD
 | `AppState` | Node lifecycle state: `Initializing`, `CatchingUp`, `Synced`, `Validating`, or `ShuttingDown`. |
 | `RunMode` | Run behavior for `run_node`: full node, validator, or watcher. |
 | `RunOptions` | Startup options controlling catchup forcing, sync wait behavior, and extra server spawning. |
+| `App::operational_readiness` | Shared operational flag, monotonic transition generation, and read/write barrier for in-process extensions that must only act on fully synchronized state. |
 | `CatchupOptions` | CLI-style catchup target and replay mode selection for `run_catchup`. |
 | `CatchupMode` | History replay depth: minimal, recent, or complete. |
 | `NodeRunner` | Convenience wrapper around `App` for embedding the run loop in tests or binaries. |
@@ -156,6 +157,14 @@ assert!(!config.network.passphrase.is_empty());
 Buffered ledger application is intentionally interleaved with the main event loop rather than drained in one long synchronous pass. This keeps SCP and tx-set traffic flowing while the node catches up to live consensus and avoids the catchup/drain/fall-behind loop that occurs if peer caches are allowed to age out mid-drain.
 
 Metadata streaming has asymmetric failure semantics: writes to the configured main output stream are fatal and abort the node, while rotating debug stream failures are logged and ignored. This mirrors the requirement that primary ingestion output must never be silently dropped.
+
+In-process extensions spawned through `RunOptions::extra_server_spawner` can use
+`App::operational_readiness` to coordinate work with catchup and loss-of-sync
+transitions. The generation changes on every operational boundary. Holding the
+returned barrier's read side lets an extension atomically recheck the flag and
+generation before committing derived state; lifecycle transitions take the write
+side first. This is internal extension plumbing and does not change Stellar's
+observable protocol behavior.
 
 ### Catchup Crash Recovery (§14.5 parity)
 

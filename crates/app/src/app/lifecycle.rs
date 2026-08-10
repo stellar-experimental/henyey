@@ -485,7 +485,7 @@ impl App {
         });
 
         // Main run loop
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut shutdown_rx = self.take_initial_shutdown_receiver().await;
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2377,6 +2377,16 @@ impl App {
     /// Subscribe to shutdown notifications.
     pub fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
+    }
+
+    pub(super) async fn take_initial_shutdown_receiver(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<()> {
+        self.initial_shutdown_rx
+            .lock()
+            .await
+            .take()
+            .expect("App::run must take the initial shutdown receiver exactly once")
     }
 
     /// Drain the close pipeline on shutdown.

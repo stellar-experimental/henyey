@@ -9,7 +9,7 @@
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Application lifecycle and runtime wiring | Full | Init, run, catchup, shutdown, recovery loops; `lost_sync_count` metric matches stellar-core single-site `mLostSync.Mark()` (#2612) |
+| Application lifecycle and runtime wiring | Full | Init, run, catchup, shutdown, recovery loops; `lost_sync_count` metric matches stellar-core single-site `mLostSync.Mark()` (#2612). The operational readiness generation/barrier is henyey-only extension plumbing with no protocol-visible behavior. |
 | Configuration loading and compat translation | Partial | Core TOML and captive-core translation work; many stellar-core helpers omitted |
 | HTTP admin and query surfaces | Partial | Core endpoints exist including generateLoad; several compat admin routes are stubbed or absent |
 | Compat `/metrics` medida rates/percentiles | Partial | EWMA meter rates (`scp.value.valid`/`scp.value.invalid`, `ledger.ledger.close` rate fields) are an **exact** port of medida `ewma.cc`/`meter.cc`; timer/histogram percentiles (`ledger.ledger.close`, `ledger.transaction.count`) use an R7-over-256-sample-ring **documented approximation** of medida's CKMS-30s sample (#3296) — see [Compat `/metrics` medida accumulators](#compat-metrics-medida-accumulators-srcmedida_compatrs) |

@@ -419,11 +419,8 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         match app.load_last_known_ledger().await {
             Ok(RestoreResult::Restored) => {
                 let info = app.ledger_info();
-                tracing::info!(
-                    lcl_seq = info.ledger_seq,
-                    "Restored state from disk, skipping full catchup"
-                );
-                app.set_state(AppState::Synced).await;
+                tracing::info!(lcl_seq = info.ledger_seq, "Restored state from disk");
+                // Remain Initializing until catchup policy has been evaluated.
             }
             Ok(RestoreResult::NoState) => {
                 tracing::debug!("No persisted state available, will check catchup");
@@ -567,8 +564,7 @@ async fn check_needs_catchup(app: &App, options: &RunOptions) -> anyhow::Result<
         return Ok(true);
     }
 
-    let current_state = app.state().await;
-    if current_state == AppState::Initializing {
+    if app.ledger_info().ledger_seq == 0 {
         return Ok(true);
     }
 

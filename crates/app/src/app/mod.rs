@@ -581,6 +581,9 @@ pub struct App {
 
     /// Current application state.
     state: RwLock<AppState>,
+    operational: Arc<AtomicBool>,
+    operational_generation: Arc<AtomicU64>,
+    operational_transition: Arc<tokio::sync::RwLock<()>>,
 
     /// Database connection.
     db: henyey_db::Database,
@@ -641,8 +644,8 @@ pub struct App {
     /// Shutdown signal sender.
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 
-    /// Shutdown signal receiver.
-    _shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    /// Receiver created with the channel so shutdowns sent before `run()` are retained.
+    initial_shutdown_rx: tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<()>>>,
 
     /// Channel for outbound SCP envelopes.
     scp_envelope_tx: tokio::sync::mpsc::Sender<ScpEnvelope>,
@@ -1575,6 +1578,9 @@ impl App {
             clock,
             overlay_connection_factory,
             state: RwLock::new(AppState::Initializing),
+            operational: Arc::new(AtomicBool::new(false)),
+            operational_generation: Arc::new(AtomicU64::new(0)),
+            operational_transition: Arc::new(tokio::sync::RwLock::new(())),
             db,
             _db_lock: Some(db_lock),
             keypair,
@@ -1588,7 +1594,7 @@ impl App {
             pre_bound_listener: std::sync::Mutex::new(None),
             herder,
             shutdown_tx,
-            _shutdown_rx: shutdown_rx,
+            initial_shutdown_rx: tokio::sync::Mutex::new(Some(shutdown_rx)),
             scp_envelope_tx,
             scp_envelope_rx: TokioMutex::new(scp_envelope_rx),
             last_processed_slot: RwLock::new(0),
@@ -2041,12 +2047,37 @@ impl App {
         *self.state.read().await
     }
 
+    /// Return the operational signal, transition generation, and commit barrier.
+    pub fn operational_readiness(
+        &self,
+    ) -> (
+        Arc<AtomicBool>,
+        Arc<AtomicU64>,
+        Arc<tokio::sync::RwLock<()>>,
+    ) {
+        (
+            Arc::clone(&self.operational),
+            Arc::clone(&self.operational_generation),
+            Arc::clone(&self.operational_transition),
+        )
+    }
+
     /// Set the application state.
     pub(crate) async fn set_state(&self, state: AppState) {
         let mut current = self.state.write().await;
         if *current != state {
+            let _transition = self.operational_transition.write().await;
             tracing::info!(from = %*current, to = %state, "State transition");
-            *current = state;
+            let is_operational = matches!(state, AppState::Synced | AppState::Validating);
+            if !is_operational {
+                self.operational_generation.fetch_add(1, Ordering::AcqRel);
+                self.operational.store(false, Ordering::Release);
+                *current = state;
+            } else {
+                *current = state;
+                self.operational_generation.fetch_add(1, Ordering::AcqRel);
+                self.operational.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -4596,6 +4627,30 @@ mod tests {
 
         let app = App::new(config).await.unwrap();
         assert_eq!(app.state().await, AppState::Initializing);
+        let (operational, generation, transition) = app.operational_readiness();
+        assert!(!operational.load(Ordering::Acquire));
+        let initial_generation = generation.load(Ordering::Acquire);
+        let commit_guard = transition.read_owned().await;
+        let state_transition = app.set_state(AppState::Synced);
+        tokio::pin!(state_transition);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut state_transition)
+                .await
+                .is_err()
+        );
+        drop(commit_guard);
+        state_transition.await;
+        assert!(operational.load(Ordering::Acquire));
+        assert!(generation.load(Ordering::Acquire) > initial_generation);
+        app.set_state(AppState::CatchingUp).await;
+        assert!(!operational.load(Ordering::Acquire));
+
+        app.shutdown();
+        let mut shutdown_rx = app.take_initial_shutdown_receiver().await;
+        tokio::time::timeout(Duration::from_millis(10), shutdown_rx.recv())
+            .await
+            .expect("shutdown sent before main-loop startup must be retained")
+            .unwrap();
     }
 
     #[tokio::test]
