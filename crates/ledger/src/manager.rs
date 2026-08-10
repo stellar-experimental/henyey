@@ -38,7 +38,10 @@ use crate::{
         TransactionExecutionResult, TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header, NextHeaderFields},
-    snapshot::{LedgerSnapshot, SnapshotHandle},
+    snapshot::{
+        CommittedMarketEvent, CommittedMarketIdentity, CommittedMarketSubscription,
+        CommittedOfferDelta, LedgerSnapshot, SnapshotHandle,
+    },
     LedgerError, Result,
 };
 use henyey_bucket::{
@@ -55,6 +58,7 @@ use henyey_tx::state::offer_store::OfferStore;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellar_xdr::{
@@ -75,6 +79,7 @@ const PAGE_SIZE: u64 = 4096;
 /// Heuristic multiplier for estimating compiled module size from WASM byte size.
 /// Compiled modules are approximately 4× their raw WASM size.
 const WASM_COMPILED_SIZE_MULTIPLIER: u64 = 4;
+pub const COMMITTED_MARKET_EVENT_CAPACITY: usize = 4;
 
 /// Read current RSS (Resident Set Size) in bytes from /proc/self/statm.
 /// Returns 0 on non-Linux or on error.
@@ -1429,11 +1434,69 @@ struct LedgerState {
 ///
 /// All public methods are safe to call from multiple threads. Internal state
 /// is protected by RwLocks to allow concurrent reads during ledger processing.
+#[derive(Default)]
+struct SnapshotBucketGcRegistry {
+    reference_counts: Mutex<HashMap<Hash256, usize>>,
+}
+
+impl SnapshotBucketGcRegistry {
+    fn register(
+        self: &Arc<Self>,
+        hashes: impl IntoIterator<Item = Hash256>,
+    ) -> Arc<SnapshotBucketGcLease> {
+        let hashes = hashes.into_iter().collect::<HashSet<_>>();
+        let mut reference_counts = self.reference_counts.lock();
+        for hash in &hashes {
+            *reference_counts.entry(*hash).or_default() += 1;
+        }
+        drop(reference_counts);
+
+        Arc::new(SnapshotBucketGcLease {
+            registry: Arc::clone(self),
+            hashes,
+        })
+    }
+
+    fn active_hashes(&self) -> Vec<Hash256> {
+        self.reference_counts.lock().keys().copied().collect()
+    }
+}
+
+struct SnapshotBucketGcLease {
+    registry: Arc<SnapshotBucketGcRegistry>,
+    hashes: HashSet<Hash256>,
+}
+
+impl Drop for SnapshotBucketGcLease {
+    fn drop(&mut self) {
+        let mut reference_counts = self.registry.reference_counts.lock();
+        for hash in &self.hashes {
+            let Some(count) = reference_counts.get_mut(hash) else {
+                debug_assert!(false, "snapshot bucket GC reference count is missing");
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                reference_counts.remove(hash);
+            }
+        }
+    }
+}
+
 pub struct LedgerManager {
+    /// Serializes committed bucket state capture with ledger publication.
+    committed_state_gate: Mutex<()>,
+    committed_market_generation: AtomicU64,
+    committed_market_tx: tokio::sync::broadcast::Sender<CommittedMarketEvent>,
     /// Live bucket list containing all current ledger entries.
     ///
     /// Wrapped in Arc for efficient sharing with snapshots.
     bucket_list: Arc<RwLock<BucketList>>,
+
+    /// Bucket hashes captured by independent snapshots whose lookup closures
+    /// are still active. Disk-backed bucket GC must retain these even after the
+    /// live bucket list advances or resets.
+    snapshot_bucket_gc_registry: Arc<SnapshotBucketGcRegistry>,
 
     /// Hot archive bucket list for Protocol 23+ state archival.
     ///
@@ -1558,8 +1621,13 @@ impl LedgerManager {
     /// `initialize` before ledger close operations can begin.
     pub fn new(network_passphrase: String, config: LedgerManagerConfig) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
+        let (committed_market_tx, _) =
+            tokio::sync::broadcast::channel(COMMITTED_MARKET_EVENT_CAPACITY);
 
         Self {
+            committed_state_gate: Mutex::new(()),
+            committed_market_generation: AtomicU64::new(0),
+            committed_market_tx,
             bucket_list: Arc::new(RwLock::new({
                 // Install the BucketListDB config at construction so
                 // genesis-boot networks (no catchup/restore install path)
@@ -1570,6 +1638,7 @@ impl LedgerManager {
                 bl.set_bucket_list_db_config(config.bucket_list_db.clone());
                 bl
             })),
+            snapshot_bucket_gc_registry: Arc::new(SnapshotBucketGcRegistry::default()),
             hot_archive_bucket_list: Arc::new(RwLock::new(Some(HotArchiveBucketList::new()))),
             network_id,
             state: RwLock::new(LedgerState {
@@ -1634,7 +1703,227 @@ impl LedgerManager {
 
     /// Check if the ledger has been initialized.
     pub fn is_initialized(&self) -> bool {
+        let _committed_guard = self.committed_state_gate.lock();
         self.state.read().initialized
+    }
+
+    /// Subscribe before atomically capturing the current baseline. Any close after
+    /// this capture is buffered in the bounded ring while the caller scans it.
+    pub fn subscribe_committed_market(&self) -> Result<CommittedMarketSubscription> {
+        let _committed_guard = self.committed_state_gate.lock();
+        let receiver = self.committed_market_tx.subscribe();
+        let state = self.state.read();
+        let bootstrap = if state.initialized {
+            let snapshot = self.create_snapshot_locked(&state)?;
+            Some(CommittedMarketEvent::Initialized {
+                identity: self.committed_market_identity(&state),
+                snapshot,
+                published_at: std::time::Instant::now(),
+            })
+        } else {
+            None
+        };
+        Ok(CommittedMarketSubscription {
+            bootstrap,
+            receiver,
+        })
+    }
+
+    /// Test/benchmark hook that exercises the same bounded broadcast sender as
+    /// committed publication. It does not mutate canonical ledger state.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn publish_committed_market_event_for_test(&self, event: CommittedMarketEvent) -> bool {
+        let _committed_guard = self.committed_state_gate.lock();
+        self.committed_market_tx.send(event).is_ok()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn committed_market_receiver_count_for_test(&self) -> usize {
+        self.committed_market_tx.receiver_count()
+    }
+
+    /// Update only test identity and exercise event construction/publication.
+    /// This intentionally does not mutate buckets or caches and is reserved for
+    /// publication-path tests and benchmarks.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn publish_committed_market_ledger_for_test(
+        &self,
+        ledger_seq: u32,
+        ledger_hash: Hash256,
+        changes: &[EntryChange],
+    ) -> Result<Duration> {
+        let _committed_guard = self.committed_state_gate.lock();
+        {
+            let mut state = self.state.write();
+            if !state.initialized {
+                return Err(LedgerError::NotInitialized);
+            }
+            state.header.ledger_seq = ledger_seq;
+            state.header_hash = ledger_hash;
+        }
+        self.publish_committed_market_ledger(changes)
+    }
+
+    /// Apply market changes to canonical test state, then publish through the
+    /// exact helper used by `commit_close`. The ordering mirrors close: bucket
+    /// state, offer cache, identity header, snapshot construction, send.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn apply_and_publish_committed_market_ledger_for_test(
+        &self,
+        ledger_seq: u32,
+        ledger_hash: Hash256,
+        changes: &[EntryChange],
+    ) -> Result<Duration> {
+        let _committed_guard = self.committed_state_gate.lock();
+        let protocol = {
+            let state = self.state.read();
+            if !state.initialized {
+                return Err(LedgerError::NotInitialized);
+            }
+            state.header.ledger_version
+        };
+        let mut init_entries = Vec::new();
+        let mut live_entries = Vec::new();
+        let mut dead_keys = Vec::new();
+        for change in changes {
+            match change {
+                EntryChange::Created(entry) => {
+                    let mut entry = entry.clone();
+                    entry.last_modified_ledger_seq = ledger_seq;
+                    init_entries.push(entry);
+                }
+                EntryChange::Updated { current, .. } => {
+                    let mut entry = current.as_ref().clone();
+                    entry.last_modified_ledger_seq = ledger_seq;
+                    live_entries.push(entry);
+                }
+                EntryChange::Deleted { previous } => {
+                    dead_keys.push(henyey_common::entry_to_key(previous));
+                }
+            }
+        }
+        {
+            let mut bucket_list = self.bucket_list.write();
+            bucket_list.add_batch(
+                ledger_seq,
+                protocol,
+                BucketListType::Live,
+                init_entries,
+                live_entries,
+                dead_keys,
+            )?;
+        }
+        if *self.offers_initialized.read() {
+            let mut store = self.offer_store.lock();
+            for change in changes {
+                match change {
+                    EntryChange::Created(entry) => {
+                        if matches!(&entry.data, LedgerEntryData::Offer(_)) {
+                            store.insert_from_ledger_entry(entry);
+                        }
+                    }
+                    EntryChange::Updated { current, .. } => {
+                        if matches!(&current.data, LedgerEntryData::Offer(_)) {
+                            store.insert_from_ledger_entry(current);
+                        }
+                    }
+                    EntryChange::Deleted { previous } => {
+                        if let LedgerEntryData::Offer(offer) = &previous.data {
+                            store.remove_by_seller(&offer.seller_id, offer.offer_id);
+                        }
+                    }
+                }
+            }
+        }
+        let bucket_hash = self.bucket_list.read().hash();
+        {
+            let mut state = self.state.write();
+            state.header.ledger_seq = ledger_seq;
+            state.header.bucket_list_hash = stellar_xdr::Hash(*bucket_hash.as_bytes());
+            state.header_hash = ledger_hash;
+        }
+        self.publish_committed_market_ledger(changes)
+    }
+
+    fn publish_committed_market_ledger(&self, changes: &[EntryChange]) -> Result<Duration> {
+        if self.committed_market_tx.receiver_count() == 0 {
+            return Ok(Duration::ZERO);
+        }
+        let started = std::time::Instant::now();
+        let mut offer_deltas = Vec::new();
+        let mut pool_count_delta = 0i64;
+        for change in changes {
+            match change {
+                EntryChange::Created(entry) => match &entry.data {
+                    LedgerEntryData::Offer(_) => offer_deltas.push(CommittedOfferDelta {
+                        previous: None,
+                        current: Some(entry.clone()),
+                    }),
+                    LedgerEntryData::LiquidityPool(_) => pool_count_delta += 1,
+                    _ => {}
+                },
+                EntryChange::Updated { previous, current } => {
+                    if matches!(&previous.data, LedgerEntryData::Offer(_))
+                        && matches!(&current.data, LedgerEntryData::Offer(_))
+                    {
+                        offer_deltas.push(CommittedOfferDelta {
+                            previous: Some(previous.clone()),
+                            current: Some(current.as_ref().clone()),
+                        });
+                    }
+                }
+                EntryChange::Deleted { previous } => match &previous.data {
+                    LedgerEntryData::Offer(_) => offer_deltas.push(CommittedOfferDelta {
+                        previous: Some(previous.clone()),
+                        current: None,
+                    }),
+                    LedgerEntryData::LiquidityPool(_) => pool_count_delta -= 1,
+                    _ => {}
+                },
+            }
+        }
+        let state = self.state.read();
+        let event = CommittedMarketEvent::Ledger {
+            identity: self.committed_market_identity(&state),
+            snapshot: self.create_snapshot_locked(&state)?,
+            offer_deltas: offer_deltas.into(),
+            pool_count_delta,
+            published_at: std::time::Instant::now(),
+        };
+        let offer_delta_count = match &event {
+            CommittedMarketEvent::Ledger { offer_deltas, .. } => offer_deltas.len(),
+            _ => unreachable!(),
+        };
+        let queue_depth = self.committed_market_tx.len();
+        if queue_depth >= COMMITTED_MARKET_EVENT_CAPACITY {
+            metrics::counter!("henyey_committed_market_queue_full_total").increment(1);
+        }
+        metrics::gauge!("henyey_committed_market_queue_depth").set(queue_depth as f64);
+        let _ = self.committed_market_tx.send(event);
+        metrics::histogram!("henyey_committed_market_publication_seconds")
+            .record(started.elapsed().as_secs_f64());
+        tracing::debug!(
+            ledger = state.header.ledger_seq,
+            offer_deltas = offer_delta_count,
+            pool_count_delta,
+            publication_us = started.elapsed().as_micros() as u64,
+            "published committed market ledger"
+        );
+        Ok(started.elapsed())
+    }
+
+    fn committed_market_identity(&self, state: &LedgerState) -> CommittedMarketIdentity {
+        CommittedMarketIdentity {
+            generation: self.committed_market_generation.load(Ordering::Acquire),
+            ledger_seq: state.header.ledger_seq,
+            ledger_hash: state.header_hash,
+            protocol_version: state.header.ledger_version,
+            base_fee: state.header.base_fee,
+        }
     }
 
     /// Get the current ledger sequence number.
@@ -1807,7 +2096,7 @@ impl LedgerManager {
         self.hot_archive_bucket_list.write()
     }
 
-    /// Get all bucket hashes referenced by the live and hot archive bucket lists.
+    /// Get all bucket hashes referenced by live state or active snapshots.
     ///
     /// Used for garbage collection to determine which bucket files on disk
     /// are still needed.
@@ -1816,6 +2105,7 @@ impl LedgerManager {
         if let Some(ref hot_archive) = *self.hot_archive_bucket_list.read() {
             hashes.extend(hot_archive.all_referenced_hashes());
         }
+        hashes.extend(self.snapshot_bucket_gc_registry.active_hashes());
         hashes
     }
 
@@ -1923,6 +2213,7 @@ impl LedgerManager {
         header: LedgerHeader,
         header_hash: Hash256,
     ) -> Result<()> {
+        let _committed_guard = self.committed_state_gate.lock();
         let protocol_version = header.ledger_version;
         self.verify_and_install_bucket_lists(
             bucket_list,
@@ -1933,7 +2224,8 @@ impl LedgerManager {
         self.initialize_all_caches(protocol_version, 0)?;
 
         // Eagerly compute and cache Soroban network info from the initialized state.
-        self.state.write().soroban_network_info = self.compute_soroban_info()?;
+        self.finish_initialization()?;
+        self.publish_market_initialization()?;
 
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
@@ -1975,6 +2267,7 @@ impl LedgerManager {
         cache_data: CacheInitResult,
         skip_warm_cache: bool,
     ) -> Result<()> {
+        let _committed_guard = self.committed_state_gate.lock();
         self.verify_and_install_bucket_lists(
             bucket_list,
             hot_archive_bucket_list,
@@ -2006,7 +2299,8 @@ impl LedgerManager {
         crate::memory_report::log_startup_memory("after_cache_install");
 
         // Eagerly compute and cache Soroban network info from the initialized state.
-        self.state.write().soroban_network_info = self.compute_soroban_info()?;
+        self.finish_initialization()?;
+        self.publish_market_initialization()?;
 
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
@@ -2105,7 +2399,9 @@ impl LedgerManager {
 
         state.header = header;
         state.header_hash = header_hash;
-        state.initialized = true;
+        // The caller publishes initialized=true only after all canonical caches and
+        // derived Soroban state have been installed under committed_state_gate.
+        state.initialized = false;
 
         Ok(())
     }
@@ -2117,6 +2413,14 @@ impl LedgerManager {
     /// state while the ledger manager was already initialized (e.g., after
     /// falling behind in live mode).
     pub fn reset(&self) {
+        let _committed_guard = self.committed_state_gate.lock();
+        let generation = self
+            .committed_market_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let _ = self
+            .committed_market_tx
+            .send(CommittedMarketEvent::Reset { generation });
         debug!("Resetting ledger manager for catchup");
 
         // Mark as uninitialized FIRST, before clearing the bucket list.
@@ -2152,6 +2456,7 @@ impl LedgerManager {
         let _ = self.module_cache.write().take();
 
         *self.offers_initialized.write() = false;
+        *self.offer_store.lock() = OfferStore::new();
         self.soroban_state.write().clear();
 
         // Clear the persistent executor so offers are reloaded after re-initialization
@@ -2266,6 +2571,7 @@ impl LedgerManager {
     /// Returns a LedgerCloseContext for applying transactions and
     /// committing the ledger. This is called by `close_ledger`.
     fn begin_close(&self, close_data: LedgerCloseData) -> Result<LedgerCloseContext<'_>> {
+        let _committed_guard = self.committed_state_gate.lock();
         let state = self.state.read();
         if !state.initialized {
             return Err(LedgerError::NotInitialized);
@@ -2453,6 +2759,7 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
+        let _committed_guard = self.committed_state_gate.lock();
         // Thin wrapper: acquire the state read lock exactly once and delegate.
         // Callers that already hold an outer `state` read guard (e.g.
         // `begin_close()`) must call `create_snapshot_locked()` directly to
@@ -2539,10 +2846,18 @@ impl LedgerManager {
         let soroban_snapshot_elapsed = t1.elapsed();
         // --- Sub-timer: bucket list snapshot ---
         let t2 = std::time::Instant::now();
-        let bucket_list_snapshot = Arc::new({
+        let bucket_list_snapshot = {
             let bl = self.bucket_list.read();
             henyey_bucket::BucketListSnapshot::new(&bl, state.header.clone())
-        });
+        };
+        let bucket_gc_lease = self
+            .snapshot_bucket_gc_registry
+            .register(bucket_list_snapshot.all_referenced_hashes());
+        let searchable_bucket_snapshot =
+            Arc::new(henyey_bucket::SearchableBucketListSnapshot::new(
+                bucket_list_snapshot,
+                std::collections::BTreeMap::new(),
+            ));
         let bucket_list_snapshot_elapsed = t2.elapsed();
 
         // No `drop(state)` here: `state` is a borrowed `&LedgerState`, not an
@@ -2553,7 +2868,7 @@ impl LedgerManager {
         // --- Sub-timer: closure building + SnapshotHandle assembly ---
         let t3 = std::time::Instant::now();
         let soroban_for_lookup = soroban_snapshot.clone();
-        let bls_for_lookup = bucket_list_snapshot.clone();
+        let bls_for_lookup = searchable_bucket_snapshot.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
             // For Soroban entry types, check in-memory state first (O(1)),
             // then fall back to bucket list if not found.
@@ -2564,7 +2879,7 @@ impl LedgerManager {
                 // Fall through to bucket list for entries not in in-memory state
             }
             // Non-Soroban types or Soroban cache miss: use bucket list snapshot
-            Ok(bls_for_lookup.get_result(key)?)
+            Ok(bls_for_lookup.load_result(key)?)
         });
 
         // Batch lookup function for loading multiple entries in a single pass.
@@ -2573,7 +2888,7 @@ impl LedgerManager {
         // Soroban entries not found in the in-memory state, then batch-loads
         // remaining non-Soroban keys from the bucket list in a single traversal.
         let soroban_for_batch = soroban_snapshot.clone();
-        let bls_for_batch = bucket_list_snapshot.clone();
+        let bls_for_batch = searchable_bucket_snapshot.clone();
         let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
             Arc::new(move |keys: &[LedgerKey]| {
                 let mut result = Vec::new();
@@ -2606,14 +2921,95 @@ impl LedgerManager {
                 Ok(result)
             });
 
-        // Create entries function that reads from the in-memory offer store.
-        // This avoids expensive SQL queries or bucket list scans during orderbook operations.
-        // The in-memory store is populated at initialization and maintained incrementally.
-        // Offers are always initialized before the first ledger close, so no fallback is needed.
+        // Normal ledger execution must use the canonical live OfferStore. It is
+        // populated at initialization and maintained incrementally, avoiding a
+        // full bucket scan on every ledger close.
         let offer_store = self.offer_store.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
             let store = offer_store.lock();
             Ok(store.all_ledger_entries())
+        });
+
+        // Observer simulation needs a complete point-in-time offer set instead
+        // of the live OfferStore used by speculative ledger execution.
+        let bls_for_frozen_offers = searchable_bucket_snapshot.clone();
+        let frozen_offer_entries_fn: crate::snapshot::FrozenOfferEntriesLookupFn =
+            Arc::new(move || {
+                let mut offers = Vec::new();
+                bls_for_frozen_offers.scan_for_entries_of_type(
+                    stellar_xdr::LedgerEntryType::Offer,
+                    |entry| {
+                        if let stellar_xdr::BucketEntry::Liveentry(entry)
+                        | stellar_xdr::BucketEntry::Initentry(entry) = entry
+                        {
+                            offers.push(entry.clone());
+                        }
+                        true
+                    },
+                )?;
+                Ok(offers)
+            });
+
+        let bls_for_filtered_offers = searchable_bucket_snapshot.clone();
+        let filtered_offer_entries_fn: crate::snapshot::FilteredOfferEntriesLookupFn =
+            Arc::new(move |pairs| {
+                let pairs = pairs.iter().cloned().collect::<HashSet<_>>();
+                let mut offers = Vec::new();
+                let mut physical_entries = 0u64;
+                bls_for_filtered_offers.scan_for_entries_of_type(
+                    stellar_xdr::LedgerEntryType::Offer,
+                    |entry| {
+                        physical_entries += 1;
+                        if let stellar_xdr::BucketEntry::Liveentry(entry)
+                        | stellar_xdr::BucketEntry::Initentry(entry) = entry
+                        {
+                            if let LedgerEntryData::Offer(offer) = &entry.data {
+                                if pairs.contains(&(offer.buying.clone(), offer.selling.clone())) {
+                                    offers.push(entry.clone());
+                                }
+                            }
+                        }
+                        true
+                    },
+                )?;
+                metrics::counter!("henyey_filtered_offer_physical_entries_total")
+                    .increment(physical_entries);
+                metrics::counter!("henyey_filtered_offer_relevant_entries_total")
+                    .increment(offers.len() as u64);
+                Ok(offers)
+            });
+
+        let bls_for_market = searchable_bucket_snapshot.clone();
+        let market_entries_fn: crate::snapshot::MarketEntriesLookupFn = Arc::new(move || {
+            let mut offers = Vec::new();
+            let mut pools = Vec::new();
+            bls_for_market.scan_for_entries_of_type(
+                stellar_xdr::LedgerEntryType::Offer,
+                |entry| {
+                    if let stellar_xdr::BucketEntry::Liveentry(entry)
+                    | stellar_xdr::BucketEntry::Initentry(entry) = entry
+                    {
+                        if let stellar_xdr::LedgerEntryData::Offer(offer) = &entry.data {
+                            offers.push(offer.clone());
+                        }
+                    }
+                    true
+                },
+            )?;
+            bls_for_market.scan_for_entries_of_type(
+                stellar_xdr::LedgerEntryType::LiquidityPool,
+                |entry| {
+                    if let stellar_xdr::BucketEntry::Liveentry(entry)
+                    | stellar_xdr::BucketEntry::Initentry(entry) = entry
+                    {
+                        if let stellar_xdr::LedgerEntryData::LiquidityPool(pool) = &entry.data {
+                            pools.push(pool.clone());
+                        }
+                    }
+                    true
+                },
+            )?;
+            Ok((offers, pools))
         });
 
         // Create index-based lookup for pool share trustlines by account.
@@ -2621,19 +3017,22 @@ impl LedgerManager {
         // queries SQL for all pool share trustlines owned by an account.  Without this
         // loader, `find_pool_share_trustlines_for_asset` would only find trustlines
         // already in the in-memory state, missing pool shares loaded from the bucket list.
-        let pool_share_idx = self.pool_share_tl_account_index.clone();
+        let pool_share_idx = Arc::new(self.pool_share_tl_account_index.read().clone());
         let pool_share_tls_by_account_fn: crate::snapshot::PoolShareTrustlinesByAccountFn =
             Arc::new(move |account_id| {
-                let idx = pool_share_idx.read();
-                Ok(idx
+                Ok(pool_share_idx
                     .get(account_id)
                     .map(|pool_ids| pool_ids.iter().cloned().collect())
                     .unwrap_or_default())
             });
 
         let mut handle = SnapshotHandle::with_lookups_and_entries(snapshot, lookup_fn, entries_fn);
+        handle.set_frozen_offer_entries_lookup(frozen_offer_entries_fn);
+        handle.set_filtered_offer_entries_lookup(filtered_offer_entries_fn);
+        handle.set_market_entries_lookup(market_entries_fn);
         handle.set_batch_lookup(batch_lookup_fn);
         handle.set_pool_share_tls_by_account(pool_share_tls_by_account_fn);
+        handle.set_bucket_gc_lease(bucket_gc_lease);
         let closure_build_elapsed = t3.elapsed();
 
         tracing::debug!(
@@ -2768,7 +3167,7 @@ impl LedgerManager {
         // Eagerly recompute Soroban network info from the committed bucket-list state.
         // Computed BEFORE acquiring the state write lock so readers never see a new
         // header paired with stale cached info.
-        let soroban_info = self.compute_soroban_info()?;
+        let soroban_info = self.compute_soroban_info_while_committing()?;
 
         // Publish header, hash, and derived Soroban info atomically.
         {
@@ -2778,12 +3177,52 @@ impl LedgerManager {
             state.soroban_network_info = soroban_info;
         }
 
+        // Publish only after every committed component and the identity header agree.
+        // broadcast::send is synchronous/non-waiting; a slow receiver observes Lagged.
+        self.publish_committed_market_ledger(&offer_pool_changes)?;
+
         // Drop offer/pool changes on a background thread if non-trivial.
         if !offer_pool_changes.is_empty() {
             std::thread::spawn(move || drop(offer_pool_changes));
         }
 
         Ok(())
+    }
+
+    fn publish_market_initialization(&self) -> Result<()> {
+        let generation = self
+            .committed_market_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if self.committed_market_tx.receiver_count() == 0 {
+            return Ok(());
+        }
+        let state = self.state.read();
+        let snapshot = self.create_snapshot_locked(&state)?;
+        let mut identity = self.committed_market_identity(&state);
+        identity.generation = generation;
+        let _ = self
+            .committed_market_tx
+            .send(CommittedMarketEvent::Initialized {
+                identity,
+                snapshot,
+                published_at: std::time::Instant::now(),
+            });
+        Ok(())
+    }
+
+    fn finish_initialization(&self) -> Result<()> {
+        self.state.write().initialized = true;
+        match self.compute_soroban_info_while_committing() {
+            Ok(info) => {
+                self.state.write().soroban_network_info = info;
+                Ok(())
+            }
+            Err(error) => {
+                self.state.write().initialized = false;
+                Err(error)
+            }
+        }
     }
 
     /// Build a memory report with per-component heap estimates.
@@ -2979,6 +3418,17 @@ impl LedgerManager {
     /// Returns `Err` on data corruption (wrong types, IO errors).
     fn compute_soroban_info(&self) -> Result<Option<SorobanNetworkInfo>> {
         let snapshot = self.create_snapshot()?;
+        load_soroban_network_info(&snapshot)
+    }
+
+    /// Compute Soroban configuration while the caller holds `committed_state_gate`.
+    ///
+    /// `LedgerCloseContext::commit` holds that non-reentrant gate across bucket
+    /// publication. Re-entering the public `create_snapshot()` path here would
+    /// deadlock, so reuse the guarded snapshot constructor directly.
+    fn compute_soroban_info_while_committing(&self) -> Result<Option<SorobanNetworkInfo>> {
+        let state = self.state.read();
+        let snapshot = self.create_snapshot_locked(&state)?;
         load_soroban_network_info(&snapshot)
     }
 
@@ -5209,6 +5659,7 @@ impl LedgerCloseContext<'_> {
     /// "Snapshot hook not yet wired") and is tracked as separate work, NOT part
     /// of #3066.
     fn commit(mut self, rss_before: u64) -> Result<LedgerCloseResult> {
+        let _committed_guard = self.manager.committed_state_gate.lock();
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             "LedgerCloseContext::commit starting"
@@ -5327,7 +5778,9 @@ impl LedgerCloseContext<'_> {
         // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
         // Drains entries from the current delta (moving instead of cloning), saving ~50K clone operations.
         // Metadata (fee_pool_delta, total_coins_delta) is preserved for build_and_hash_header.
-        let cat = self.ltx.drain_for_bucket_update();
+        let cat = self
+            .ltx
+            .drain_for_bucket_update(self.manager.committed_market_tx.receiver_count() != 0);
         // Release snapshot lookup closures. After drain, no code in commit()
         // reads entries via self.ltx. Dropping these closures releases Arc
         // references to the soroban state snapshot, allowing Arc::make_mut on
@@ -8338,6 +8791,363 @@ mod tests {
         );
         // Should not panic — may fail for other reasons but NOT version
         let _result = manager.begin_close(close_data);
+    }
+
+    fn initialized_empty_market_manager() -> LedgerManager {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = 24;
+        let hash = crate::compute_header_hash(&header).unwrap();
+        manager
+            .initialize(
+                new_bl_with_config(),
+                henyey_bucket::HotArchiveBucketList::new(),
+                header,
+                hash,
+            )
+            .unwrap();
+        manager
+    }
+
+    fn initialized_populated_market_manager(offer_count: usize) -> LedgerManager {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let mut bucket_list = new_bl_with_config();
+        let mut entries = (0..offer_count)
+            .map(|index| make_offer_entry(index as i64 + 1, [(index & 0xff) as u8; 32]))
+            .collect::<Vec<_>>();
+        let pool = stellar_xdr::LiquidityPoolEntry::default();
+        let mut pool_share = stellar_xdr::TrustLineEntry::default();
+        pool_share.asset = stellar_xdr::TrustLineAsset::PoolShare(pool.liquidity_pool_id.clone());
+        entries.extend([
+            LedgerEntry {
+                last_modified_ledger_seq: 2,
+                data: LedgerEntryData::LiquidityPool(pool),
+                ext: LedgerEntryExt::V0,
+            },
+            LedgerEntry {
+                last_modified_ledger_seq: 2,
+                data: LedgerEntryData::Trustline(pool_share),
+                ext: LedgerEntryExt::V0,
+            },
+        ]);
+        bucket_list
+            .add_batch(2, 24, BucketListType::Live, entries, Vec::new(), Vec::new())
+            .unwrap();
+        let mut header = create_genesis_header();
+        header.ledger_seq = 2;
+        header.ledger_version = 24;
+        let hash = crate::compute_header_hash(&header).unwrap();
+        manager
+            .initialize(
+                bucket_list,
+                henyey_bucket::HotArchiveBucketList::new(),
+                header,
+                hash,
+            )
+            .unwrap();
+        manager
+    }
+
+    #[tokio::test]
+    async fn snapshot_bucket_hashes_remain_gc_roots_until_lookups_are_released() {
+        let manager = initialized_populated_market_manager(1);
+        let expected = manager
+            .all_referenced_bucket_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(!expected.is_empty());
+
+        let mut snapshot = manager.create_snapshot().unwrap();
+        let mut snapshot_clone = snapshot.clone();
+        manager.reset();
+
+        let active = manager
+            .all_referenced_bucket_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(
+            expected.is_subset(&active),
+            "captured bucket files must remain GC roots while snapshot lookups are active"
+        );
+
+        snapshot.release_lookups();
+        let retained_by_clone = manager
+            .all_referenced_bucket_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(
+            expected.is_subset(&retained_by_clone),
+            "one clone must retain bucket GC roots after another releases its lookups"
+        );
+
+        snapshot_clone.release_lookups();
+        let released = manager
+            .all_referenced_bucket_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(
+            expected.difference(&released).next().is_some(),
+            "releasing snapshot lookups must release snapshot-only bucket GC roots"
+        );
+    }
+
+    #[test]
+    fn committed_market_publication_does_no_snapshot_work_without_subscribers() {
+        let manager = initialized_empty_market_manager();
+        let snapshots_before = manager.test_snapshot_count();
+        assert_eq!(
+            manager
+                .publish_committed_market_ledger_for_test(2, Hash256::from_bytes([2; 32]), &[])
+                .unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(manager.test_snapshot_count(), snapshots_before);
+    }
+
+    #[test]
+    fn snapshot_pool_share_lookup_is_frozen_at_capture() {
+        let manager = initialized_empty_market_manager();
+        let account = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([7; 32]),
+        ));
+        let first = stellar_xdr::PoolId(stellar_xdr::Hash([1; 32]));
+        let second = stellar_xdr::PoolId(stellar_xdr::Hash([2; 32]));
+        manager
+            .pool_share_tl_account_index
+            .write()
+            .entry(account.clone())
+            .or_default()
+            .insert(first.clone());
+        let snapshot = manager.create_snapshot().unwrap();
+        manager
+            .pool_share_tl_account_index
+            .write()
+            .entry(account.clone())
+            .or_default()
+            .insert(second);
+
+        assert_eq!(
+            snapshot.pool_share_tls_by_account(&account).unwrap(),
+            vec![first]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_committed_market_publication_constructs_one_consistent_snapshot() {
+        let manager = initialized_empty_market_manager();
+        let mut subscription = manager.subscribe_committed_market().unwrap();
+        subscription.bootstrap.take();
+        let snapshots_before = manager.test_snapshot_count();
+        let elapsed =
+            manager
+                .publish_committed_market_ledger_for_test(
+                    2,
+                    Hash256::from_bytes([2; 32]),
+                    &[EntryChange::Created(LedgerEntry {
+                        last_modified_ledger_seq: 2,
+                        data: LedgerEntryData::LiquidityPool(
+                            stellar_xdr::LiquidityPoolEntry::default(),
+                        ),
+                        ext: LedgerEntryExt::V0,
+                    })],
+                )
+                .unwrap();
+        assert!(elapsed > Duration::ZERO);
+        assert_eq!(manager.test_snapshot_count(), snapshots_before + 1);
+        let CommittedMarketEvent::Ledger {
+            identity,
+            snapshot,
+            offer_deltas,
+            pool_count_delta,
+            ..
+        } = subscription.recv().await.unwrap()
+        else {
+            panic!("expected ordinary ledger event")
+        };
+        assert_eq!(identity.ledger_seq, 2);
+        assert_eq!(identity.ledger_hash, Hash256::from_bytes([2; 32]));
+        assert_eq!(snapshot.ledger_seq(), identity.ledger_seq);
+        assert_eq!(snapshot.header_hash(), identity.ledger_hash);
+        assert!(offer_deltas.is_empty());
+        assert_eq!(pool_count_delta, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_publish_snapshot_matches_delta_and_preserves_previous_epoch() {
+        let manager = initialized_populated_market_manager(1);
+        let mut subscription = manager.subscribe_committed_market().unwrap();
+        let CommittedMarketEvent::Initialized {
+            snapshot: previous_snapshot,
+            ..
+        } = subscription.bootstrap.take().unwrap()
+        else {
+            panic!("expected baseline")
+        };
+        let previous_offer = make_offer_entry(1, [0; 32]);
+        let mut current_offer = previous_offer.clone();
+        current_offer.last_modified_ledger_seq = 3;
+        current_offer.ext = LedgerEntryExt::V1(stellar_xdr::LedgerEntryExtensionV1 {
+            sponsoring_id: stellar_xdr::SponsorshipDescriptor(Some(AccountId(
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([9; 32])),
+            ))),
+            ext: stellar_xdr::LedgerEntryExtensionV1Ext::V0,
+        });
+        let LedgerEntryData::Offer(offer) = &mut current_offer.data else {
+            unreachable!()
+        };
+        offer.amount = 777;
+        let previous_pool = LedgerEntry {
+            last_modified_ledger_seq: 2,
+            data: LedgerEntryData::LiquidityPool(stellar_xdr::LiquidityPoolEntry::default()),
+            ext: LedgerEntryExt::V0,
+        };
+        let mut current_pool = previous_pool.clone();
+        let LedgerEntryData::LiquidityPool(pool) = &mut current_pool.data else {
+            unreachable!()
+        };
+        let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(body) =
+            &mut pool.body;
+        body.reserve_a = 123;
+
+        manager
+            .apply_and_publish_committed_market_ledger_for_test(
+                3,
+                Hash256::from_bytes([3; 32]),
+                &[
+                    EntryChange::Updated {
+                        previous: previous_offer.clone(),
+                        current: Box::new(current_offer.clone()),
+                    },
+                    EntryChange::Updated {
+                        previous: previous_pool,
+                        current: Box::new(current_pool),
+                    },
+                ],
+            )
+            .unwrap();
+        let CommittedMarketEvent::Ledger {
+            snapshot: current_snapshot,
+            offer_deltas,
+            ..
+        } = subscription.recv().await.unwrap()
+        else {
+            panic!("expected ledger event")
+        };
+        assert_eq!(offer_deltas.len(), 1);
+        assert_eq!(offer_deltas[0].previous.as_ref(), Some(&previous_offer));
+        assert_eq!(offer_deltas[0].current.as_ref(), Some(&current_offer));
+
+        let offer_amount = |snapshot: &SnapshotHandle| {
+            snapshot
+                .frozen_offer_entries()
+                .unwrap()
+                .into_iter()
+                .find_map(|entry| match entry.data {
+                    LedgerEntryData::Offer(offer) if offer.offer_id == 1 => Some(offer.amount),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let reserve_a = |snapshot: &SnapshotHandle| {
+            let market = snapshot.classic_market_snapshot().unwrap();
+            let pool = &market.liquidity_pools()[0];
+            let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(body) =
+                &pool.body;
+            body.reserve_a
+        };
+        assert_eq!(offer_amount(&previous_snapshot), 1_000);
+        assert_eq!(offer_amount(&current_snapshot), 777);
+        assert_eq!(reserve_a(&previous_snapshot), 0);
+        assert_eq!(reserve_a(&current_snapshot), 123);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "mainnet-scale committed publication benchmark; run in release mode"]
+    async fn benchmark_committed_market_publication_with_active_subscriber() {
+        let snapshot_offers = std::env::var("HENYEY_MARKET_PUBLICATION_SNAPSHOT_OFFERS")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("snapshot offers must be an integer")
+            })
+            .unwrap_or(100_000);
+        let changes = std::env::var("HENYEY_MARKET_PUBLICATION_CHANGES")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("changes must be an integer"))
+            .unwrap_or(2_000);
+        let ledgers = std::env::var("HENYEY_MARKET_PUBLICATION_LEDGERS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("ledgers must be an integer"))
+            .unwrap_or(1_000);
+        let manager = initialized_populated_market_manager(snapshot_offers);
+        let mut template = Vec::with_capacity(changes);
+        for index in 0..changes {
+            let previous = make_offer_entry(index as i64 + 1, [(index & 0xff) as u8; 32]);
+            let mut current = previous.clone();
+            let LedgerEntryData::Offer(offer) = &mut current.data else {
+                unreachable!();
+            };
+            offer.amount += 1;
+            template.push(EntryChange::Updated {
+                previous,
+                current: Box::new(current),
+            });
+        }
+        let rss_before = get_rss_bytes();
+        let mut no_subscriber_timings = Vec::with_capacity(ledgers);
+        for ledger in 0..ledgers {
+            let started = std::time::Instant::now();
+            assert_eq!(
+                manager
+                    .publish_committed_market_ledger_for_test(
+                        ledger as u32 + 3,
+                        Hash256::from_bytes([(ledger & 0xff) as u8; 32]),
+                        &template,
+                    )
+                    .unwrap(),
+                Duration::ZERO
+            );
+            no_subscriber_timings.push(started.elapsed());
+        }
+        let _subscription = manager.subscribe_committed_market().unwrap();
+        let mut timings = Vec::with_capacity(ledgers);
+        for ledger in 0..ledgers {
+            timings.push(
+                manager
+                    .publish_committed_market_ledger_for_test(
+                        ledger as u32 + 2,
+                        Hash256::from_bytes([(ledger & 0xff) as u8; 32]),
+                        &template,
+                    )
+                    .unwrap(),
+            );
+        }
+        no_subscriber_timings.sort_unstable();
+        timings.sort_unstable();
+        let no_subscriber_p50 = no_subscriber_timings[no_subscriber_timings.len() / 2];
+        let no_subscriber_p99 = no_subscriber_timings
+            [(no_subscriber_timings.len() * 99 / 100).min(no_subscriber_timings.len() - 1)];
+        let p50 = timings[timings.len() / 2];
+        let p99 = timings[(timings.len() * 99 / 100).min(timings.len() - 1)];
+        eprintln!(
+            "committed publication: snapshot_offers={snapshot_offers} ledgers={ledgers} raw_offer_changes={changes} no_subscriber_test_hook_p50={no_subscriber_p50:?} no_subscriber_test_hook_p99={no_subscriber_p99:?} active_helper_p50={p50:?} active_helper_p99={p99:?} rss_delta={} retained_ring_bound={} active_measured=raw_change_extraction+snapshot_construction+send active_excludes=synthetic_identity_update+canonical_bucket_commit+soroban_recompute no_subscriber_measured=synthetic_identity_update+helper_fast_path",
+            get_rss_bytes().saturating_sub(rss_before),
+            COMMITTED_MARKET_EVENT_CAPACITY
+        );
     }
 
     /// Parity: LedgerTests.cpp:15 "cannot close ledger with unsupported ledger version"

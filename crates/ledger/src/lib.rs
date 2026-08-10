@@ -107,13 +107,15 @@ pub use manager::build_genesis_soroban_config_entries;
 pub use manager::new_bucket_list_with_soroban_config;
 pub use manager::{
     prepend_fee_event, scan_level_pairs_for_caches, HeaderSnapshot, LedgerManager,
-    LedgerManagerConfig,
+    LedgerManagerConfig, COMMITTED_MARKET_EVENT_CAPACITY,
 };
 pub use memory_report::log_startup_memory;
 pub use peak_rss_sampler::{Phase as StartupPhase, StartupPeakRssSampler};
 pub use snapshot::{
-    EntriesLookupFn, EntryLookupFn, LedgerSnapshot, PoolShareTrustlinesByAccountFn,
-    SnapshotBuilder, SnapshotHandle,
+    ClassicMarketSnapshot, CommittedMarketEvent, CommittedMarketIdentity,
+    CommittedMarketStreamError, CommittedMarketSubscription, CommittedOfferDelta, EntriesLookupFn,
+    EntryLookupFn, FrozenOfferEntriesLookupFn, LedgerSnapshot, MarketEntriesLookupFn,
+    PoolShareTrustlinesByAccountFn, SnapshotBuilder, SnapshotHandle,
 };
 pub use soroban_state::{InMemorySorobanState, SharedSorobanState};
 

@@ -709,7 +709,10 @@ impl LedgerDelta {
     /// Moves entries instead of cloning, saving ~50K clone operations.
     /// Metadata (fee_pool_delta, total_coins_delta) is preserved.
     /// Offer and pool share trustline changes are collected separately for commit_close.
-    pub(crate) fn drain_categorization_for_bucket_update(&mut self) -> DeltaCategorization {
+    pub(crate) fn drain_categorization_for_bucket_update(
+        &mut self,
+        collect_liquidity_pools: bool,
+    ) -> DeltaCategorization {
         // Iterate using change_order for deterministic ordering.
         // drain() on a HashMap iterates in arbitrary order, which would
         // produce non-deterministic bucket list updates across nodes.
@@ -718,7 +721,7 @@ impl LedgerDelta {
         let changes = order
             .into_iter()
             .filter_map(|key| self.changes.remove(&key));
-        categorize_changes(changes, true, ledger_seq)
+        categorize_changes(changes, collect_liquidity_pools, ledger_seq)
     }
 
     /// Get a specific change by key.
@@ -882,8 +885,8 @@ impl LedgerDelta {
 
 /// Categorize an iterator of entry changes for bucket list update.
 ///
-/// When `collect_offer_pool` is true, offer and pool-share trustline changes
-/// are cloned into `offer_pool_changes` for commit_close processing.
+/// Offers and pool-share trustlines are always cloned for canonical cache maintenance.
+/// Liquidity pools are cloned only while a committed-market subscriber exists.
 ///
 /// `ledger_seq` is the current ledger sequence. Mirroring stellar-core
 /// `LedgerTxn::Impl::maybeUpdateLastModified()` (`LedgerTxn.cpp:2318`), every
@@ -899,7 +902,7 @@ impl LedgerDelta {
 /// bucket-list-bound entries.
 fn categorize_changes(
     changes: impl Iterator<Item = EntryChange>,
-    collect_offer_pool: bool,
+    collect_liquidity_pools: bool,
     ledger_seq: u32,
 ) -> DeltaCategorization {
     let mut init = Vec::new();
@@ -928,7 +931,7 @@ fn categorize_changes(
             EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
             EntryChange::Updated { current, .. } => current,
         };
-        let is_offer_or_pool = match &entry_ref.data {
+        let collect_for_commit = match &entry_ref.data {
             stellar_xdr::LedgerEntryData::Offer(_) => {
                 has_offers = true;
                 true
@@ -939,9 +942,10 @@ fn categorize_changes(
                 has_pool_share_trustlines = true;
                 true
             }
+            stellar_xdr::LedgerEntryData::LiquidityPool(_) => collect_liquidity_pools,
             _ => false,
         };
-        if collect_offer_pool && is_offer_or_pool {
+        if collect_for_commit {
             offer_pool_changes.push(change.clone());
         }
         match change {
@@ -1039,8 +1043,10 @@ fn emit_new_entry(changes: &mut Vec<LedgerEntryChange>, change: &EntryChange) {
 mod tests {
     use super::*;
     use stellar_xdr::{
-        AccountEntry, AccountEntryExt, AccountId, LedgerEntryChange, LedgerEntryData,
-        LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256,
+        AccountEntry, AccountEntryExt, AccountId, Asset, LedgerEntryChange, LedgerEntryData,
+        LedgerEntryExt, LiquidityPoolConstantProductParameters, LiquidityPoolEntry,
+        LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, PoolId, PublicKey,
+        SequenceNumber, Thresholds, Uint256,
     };
 
     fn create_test_account(seed: u8) -> LedgerEntry {
@@ -1063,6 +1069,56 @@ mod tests {
             }),
             ext: LedgerEntryExt::V0,
         }
+    }
+
+    fn test_pool(seed: u8, reserve: i64) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::LiquidityPool(LiquidityPoolEntry {
+                liquidity_pool_id: PoolId(stellar_xdr::Hash([seed; 32])),
+                body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                    LiquidityPoolEntryConstantProduct {
+                        params: LiquidityPoolConstantProductParameters {
+                            asset_a: Asset::Native,
+                            asset_b: Asset::Native,
+                            fee: 30,
+                        },
+                        reserve_a: reserve,
+                        reserve_b: reserve,
+                        total_pool_shares: reserve,
+                        pool_shares_trust_line_count: 0,
+                    },
+                ),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn publication_changes_include_pool_create_update_delete_only_for_subscribers() {
+        let mut created = LedgerDelta::new(2);
+        created.record_create(test_pool(1, 10)).unwrap();
+        let categorized = created.drain_categorization_for_bucket_update(true);
+        assert_eq!(categorized.offer_pool_changes.len(), 1);
+
+        let mut updated = LedgerDelta::new(3);
+        updated
+            .record_update(test_pool(1, 10), test_pool(1, 20))
+            .unwrap();
+        let categorized = updated.drain_categorization_for_bucket_update(true);
+        assert_eq!(categorized.offer_pool_changes.len(), 1);
+
+        let mut deleted = LedgerDelta::new(4);
+        deleted.record_delete(test_pool(1, 20)).unwrap();
+        let categorized = deleted.drain_categorization_for_bucket_update(true);
+        assert_eq!(categorized.offer_pool_changes.len(), 1);
+
+        let categorized = categorize_changes(
+            vec![EntryChange::Created(test_pool(1, 10))].into_iter(),
+            false,
+            42,
+        );
+        assert!(categorized.offer_pool_changes.is_empty());
     }
 
     #[test]
@@ -2035,7 +2091,7 @@ mod tests {
             delta.record_create(create_test_account(seed)).unwrap();
         }
 
-        let cat = delta.drain_categorization_for_bucket_update();
+        let cat = delta.drain_categorization_for_bucket_update(true);
 
         // init_entries must be in insertion order (10, 5, 20, 1, 15, 8, 25, 3)
         let seeds: Vec<u8> = cat
@@ -2081,7 +2137,7 @@ mod tests {
         updated.last_modified_ledger_seq = ledger_seq - 5;
         delta.record_update(prev, updated).unwrap();
 
-        let cat = delta.drain_categorization_for_bucket_update();
+        let cat = delta.drain_categorization_for_bucket_update(true);
 
         for entry in &cat.init_entries {
             assert_eq!(
@@ -2113,7 +2169,7 @@ mod tests {
         deleted.last_modified_ledger_seq = ledger_seq - 5;
         delta.record_delete(deleted).unwrap();
 
-        let cat = delta.drain_categorization_for_bucket_update();
+        let cat = delta.drain_categorization_for_bucket_update(true);
 
         // Deleted entries produce only dead keys, no init/live entries.
         assert!(cat.init_entries.is_empty());

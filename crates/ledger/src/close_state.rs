@@ -293,8 +293,12 @@ impl CloseLedgerState {
     /// This is the proper terminal operation — consumes the delta's entry
     /// changes for the bucket list, leaving the `CloseLedgerState` in a
     /// drained state.
-    pub(crate) fn drain_for_bucket_update(&mut self) -> DeltaCategorization {
-        self.current.drain_categorization_for_bucket_update()
+    pub(crate) fn drain_for_bucket_update(
+        &mut self,
+        collect_liquidity_pools: bool,
+    ) -> DeltaCategorization {
+        self.current
+            .drain_categorization_for_bucket_update(collect_liquidity_pools)
     }
 
     /// Release the snapshot's lookup closures to drop captured Arc references.
@@ -555,7 +559,7 @@ mod tests {
         assert_eq!(state.total_coins_delta(), -200);
 
         // Drain entry changes for bucket update
-        let categorization = state.drain_for_bucket_update();
+        let categorization = state.drain_for_bucket_update(false);
         assert_eq!(categorization.created_count, 1);
 
         // After drain, entry changes are gone but metadata deltas are preserved.
