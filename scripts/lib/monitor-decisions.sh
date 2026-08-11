@@ -1329,6 +1329,138 @@ classify_stuck_alive_sync() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# classify_obsrvr_radar INDEX_HTTP_CODE NODE_HTTP_CODE HAS_REQUIRED_FIELDS
+#
+# Decision logic for monitor-tick check (9) "OBSRVR Radar" (issue #3753). Maps
+# the result of the two Radar probes to exactly ONE of four stable literal
+# tokens — the codified fix for the 37-distinct-spelling watch-token spread that
+# made a 4+ day structural failure invisible. The emitted literal is what the
+# tick appends to the `watch` array as `obsrvr=<literal>`, so daily-summary can
+# aggregate a stable key.
+#
+# Arguments:
+#   INDEX_HTTP_CODE     - HTTP status from `GET /api/v1/nodes` (the index
+#                         endpoint). Empty string = timeout / no response.
+#   NODE_HTTP_CODE      - HTTP status from `GET /api/v1/nodes/<PUBLIC_KEY>` (the
+#                         per-node endpoint). Empty string = timeout / no response.
+#   HAS_REQUIRED_FIELDS - literal `true`/`false`: whether a 2xx per-node body
+#                         carried non-null `latestLedger` AND `updatedAt`.
+#
+# Prints exactly one literal on stdout (no trailing decoration):
+#   ok             - per-node 2xx with required fields present.
+#   api-incomplete - per-node 2xx but `latestLedger`/`updatedAt` missing/null
+#                    (stale partial response; do NOT evaluate `lag`).
+#   not-indexed    - per-node 404 AND index 200: the node is genuinely absent
+#                    from an otherwise-healthy index (permanent until the node is
+#                    registered with Radar — an out-of-band operator action).
+#   api-error      - anything else: any non-2xx/timeout that is NOT the
+#                    404-with-index-up signature, INCLUDING a per-node 404 while
+#                    the index endpoint is also down (a whole-API Radar outage —
+#                    gating `not-indexed` on index==200 is what keeps a genuine
+#                    outage distinguishable from node-not-indexed, per issue §5.2).
+#
+# Returns: 0 always.
+# Portability: POSIX-ish Bash/zsh; no external processes.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_obsrvr_radar() {
+  local index_code="$1"
+  local node_code="$2"
+  local has_fields="$3"
+
+  # Per-node 2xx: the node IS indexed; distinguish complete vs partial response.
+  if [[ "$node_code" =~ ^2[0-9][0-9]$ ]]; then
+    if [[ "$has_fields" == "true" ]]; then
+      printf 'ok'
+    else
+      printf 'api-incomplete'
+    fi
+    return 0
+  fi
+
+  # Per-node 404 while the index endpoint is up (200): node absent from index.
+  # This is the ONLY path to `not-indexed`; a 404 alongside a down index falls
+  # through to `api-error` below (whole-API outage, not a node-registration gap).
+  if [[ "$node_code" == "404" && "$index_code" == "200" ]]; then
+    printf 'not-indexed'
+    return 0
+  fi
+
+  # Everything else — timeouts, 5xx, 404-with-index-down — is a transient error.
+  printf 'api-error'
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# eval_obsrvr_not_indexed_streak CLASSIFICATION STATE_FILE [THRESHOLD]
+#
+# Escalation bookkeeping for a PERSISTENT `not-indexed` condition from
+# classify_obsrvr_radar (issue #3753). A persistent streak measures *Radar's
+# crawl coverage*, not our node's health (9 of 12 healthy stellar-core peers are
+# likewise absent from the index — issue §5.2), so the escalation is surfaced as
+# an external-observability notice and MUST NOT flip the node-health banner.
+#
+# This function is the sole reader/writer of STATE_FILE (same idiom as
+# classify_stuck_alive_sync). It counts consecutive `not-indexed` classifications
+# and fires a ONE-SHOT escalation the first tick the streak reaches THRESHOLD,
+# then stays silent while the streak persists. Any non-`not-indexed`
+# classification resets both the counter and the one-shot marker, so a future
+# streak can escalate again.
+#
+# Arguments:
+#   CLASSIFICATION - one of the classify_obsrvr_radar literals.
+#   STATE_FILE     - per-session scratch file (key=value lines).
+#   THRESHOLD      - consecutive-tick count that triggers escalation
+#                    (default 12 ≈ 4h at the current tick cadence; operator-retunable).
+#
+# Sets globals:
+#   OBSRVR_STREAK   - current consecutive-not-indexed count (0 if reset).
+#   OBSRVR_ESCALATE - `yes` on the single tick the streak first reaches
+#                     THRESHOLD, `no` otherwise.
+#
+# Returns: 0 always.
+# ─────────────────────────────────────────────────────────────────────────────
+eval_obsrvr_not_indexed_streak() {
+  local classification="$1"
+  local state_file="$2"
+  local threshold="${3:-12}"
+
+  OBSRVR_STREAK=0
+  OBSRVR_ESCALATE="no"
+
+  # ── Read prior state (sole reader/writer). ─────────────────────────────────
+  local streak=0 escalated="false"
+  if [[ -f "$state_file" ]]; then
+    local key val
+    while IFS='=' read -r key val; do
+      case "$key" in
+        streak)    streak="$val" ;;
+        escalated) escalated="$val" ;;
+      esac
+    done < "$state_file"
+  fi
+  [[ "$streak" =~ ^[0-9]+$ ]] || streak=0
+
+  if [[ "$classification" == "not-indexed" ]]; then
+    streak=$(( streak + 1 ))
+    # One-shot: fire only on the tick the streak first reaches THRESHOLD.
+    if [[ "$streak" -ge "$threshold" && "$escalated" != "true" ]]; then
+      OBSRVR_ESCALATE="yes"
+      escalated="true"
+    fi
+  else
+    # Any other classification breaks the streak and clears the one-shot marker.
+    streak=0
+    escalated="false"
+  fi
+
+  OBSRVR_STREAK="$streak"
+
+  printf 'streak=%s\nescalated=%s\n' "$streak" "$escalated" \
+    > "$state_file" 2>/dev/null || true
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # prune_rotated_logs LOGS_DIR [KEEP_PER_CATEGORY]
 #
 # Rotated-log retention for monitor-tick check (5). Keeps the newest

@@ -122,6 +122,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
 | `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
+| `obsrvr-not-indexed.state` | OBSRVR Radar `not-indexed` streak counter + one-shot escalation marker (`eval_obsrvr_not_indexed_streak`) | check 9 |
 | `metrics/archive/` | Per-tick snapshot dirs (current.prom + prev.prom + metadata.env), rolling 500, atomic write | check 12 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
 | `cargo-target/` | cached build tree | cargo |
@@ -1019,20 +1020,71 @@ Verify response is non-empty and `status` is `healthy`. Check pruning:
 
 **(9) OBSRVR Radar** (validator mode only — skip in watcher mode) — get
 public key from `curl -s http://localhost:$MONITOR_ADMIN_PORT/info`
-(extract `public_key`). Then `curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>`.
-Check:
-- `isValidating` — if false and node running > 30 min, flag NOT VALIDATING.
-- `validating24HoursPercentage` — if < 50 and running > 6 hours, flag LOW VALIDATION RATE.
-- `lag` — if > 500, flag HIGH LAG.
+(extract `public_key`), then probe **both** Radar endpoints and capture their
+HTTP status codes (`-o /dev/null -w '%{http_code}'`), the index endpoint FIRST
+so its code is available to the classifier:
 
-If the API errors out, emit `obsrvr: N/A (api-error)` instead of omitting the field.
+1. **Index probe** — `INDEX_CODE=$(curl -s -o /dev/null -w '%{http_code}' https://radar.withobsrvr.com/api/v1/nodes)`.
+   A `200` here means the API itself is up; this is the discriminator that keeps
+   a genuine whole-API Radar outage distinguishable from our node merely being
+   absent from the index. (Empty on timeout.)
+2. **Per-node probe** — `curl -s -w '\n%{http_code}' https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>`,
+   splitting off the trailing `NODE_CODE`. On a `2xx`, set
+   `HAS_REQUIRED_FIELDS=true` iff both `latestLedger` and `updatedAt` are
+   present and non-null, else `false`.
 
-If the API returns a response but `latestLedger` or `updatedAt` is missing/null
-(partial response), treat the entire radar result as stale / incomplete and
-emit `obsrvr: N/A (api-incomplete)`. Do NOT evaluate `lag` in this case — a
-`lag` value returned alongside a null `latestLedger`/`updatedAt` is a cached
-aggregate from a prior observation window (observed post-restart: lag=8754
-against a node that is in real-time sync with age=2s).
+Then classify with the shared helper (single source of truth, TAP-tested in
+`scripts/test-monitor-skill-snippets.sh`):
+
+```bash
+OBSRVR_CLASS=$(classify_obsrvr_radar "$INDEX_CODE" "$NODE_CODE" "$HAS_REQUIRED_FIELDS")
+```
+
+`classify_obsrvr_radar` returns **exactly one of four stable literals** — never
+free text. This is the codified fix for the 37-distinct-spelling watch-token
+spread (#3753) that hid a 4+ day structural failure: the literal is what the
+tick appends to the `watch` array as `obsrvr=<literal>`, so `daily-summary` can
+aggregate a stable key. **No `daily-summary` change is required** — it already
+aggregates whatever stable watch key appears; fixing the emit side is sufficient.
+
+- **`ok`** — per-node `2xx` with required fields present. Evaluate the health
+  signals:
+  - `isValidating` — if false and node running > 30 min, flag NOT VALIDATING.
+  - `validating24HoursPercentage` — if < 50 and running > 6 hours, flag LOW VALIDATION RATE.
+  - `lag` — if > 500, flag HIGH LAG.
+- **`api-incomplete`** — per-node `2xx` but `latestLedger`/`updatedAt`
+  missing/null (partial/stale response). Emit `obsrvr: N/A (api-incomplete)` and
+  append `obsrvr=api-incomplete` to `watch`. Do NOT evaluate `lag` — a `lag`
+  value returned alongside a null `latestLedger`/`updatedAt` is a cached
+  aggregate from a prior observation window (observed post-restart: lag=8754
+  against a node in real-time sync with age=2s).
+- **`api-error`** — any other non-2xx / timeout (including a per-node `404`
+  while the index endpoint is ALSO down — a whole-API outage). Emit
+  `obsrvr: N/A (api-error)` and append `obsrvr=api-error` to `watch`.
+- **`not-indexed`** — per-node `404` **and** index `200`: the node is genuinely
+  absent from an otherwise-healthy index. This is **permanent** until the node
+  is registered with Radar (an out-of-band operator action, not a code or node
+  fix). Emit `obsrvr: not-indexed` and append `obsrvr=not-indexed` to `watch`.
+
+**Escalation of a persistent `not-indexed` streak** — feed the classification to
+the streak escalator so a permanent gap surfaces once instead of recurring
+silently:
+
+```bash
+eval_obsrvr_not_indexed_streak "$OBSRVR_CLASS" \
+  "/home/tomer/data/$MONITOR_SESSION_ID/obsrvr-not-indexed.state" 12
+# sets OBSRVR_STREAK (count) and OBSRVR_ESCALATE (yes once at THRESHOLD, else no)
+```
+
+When `OBSRVR_ESCALATE=yes`, annotate the `obsrvr:` line as
+`not-indexed (external observability only) — persistent $OBSRVR_STREAK ticks`.
+This is a **one-shot** notice (fires once when the streak first reaches the
+THRESHOLD=12 ≈ 4h, operator-retunable), and it is surfaced as
+**external-observability-only**: a persistent `not-indexed` streak measures
+*Radar's crawl coverage*, not our node's health (9 of 12 healthy stellar-core
+peers are likewise absent from the index — issue #3753 §5.2). It therefore
+**MUST NOT flip the `MONITOR` banner to WARNING** — the banner policy below
+tracks node health, and this signal is not one.
 
 **(12) Metrics scan** — scrape `/metrics` and evaluate the alert catalog.
 
@@ -2280,7 +2332,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
            heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB peak=<startup_peak|N/A>MB
   disk:    <used>/<total> (<pct>%) | session+data=<size>
   rpc:     <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
-  obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
+  obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | not-indexed | not-indexed (external observability only) — persistent <N> ticks | N/A (watcher) | N/A (api-error) | N/A (api-incomplete)>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown | baselines skipped (<reason>) | baselines skipped (<reason>), N gauge alerts (<metric1>,...) — filed/commented #<N>>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   recovery_stalled: <ok (delta=0) | breach (delta=N, streak M/3) | WARNING delta=N (M ticks) — investigating | WARNING delta=N (burst) — investigating | skipped (<reason>) | collecting baseline>
