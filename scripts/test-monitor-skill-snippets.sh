@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=435
+TAP_PLAN=448
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2228,6 +2228,141 @@ PYEOF
     fi
   else
     tap_skip "stuck-alive: heartbeat-fallback under zsh (#3579)" "zsh not found"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # classify_obsrvr_radar + eval_obsrvr_not_indexed_streak (T63q–T63x) — #3753
+  # Source: scripts/lib/monitor-decisions.sh — monitor-tick check (9) OBSRVR Radar.
+  #
+  # classify_obsrvr_radar INDEX_HTTP_CODE NODE_HTTP_CODE HAS_REQUIRED_FIELDS
+  #   prints exactly one of the four stable literals on stdout:
+  #     ok | not-indexed | api-error | api-incomplete
+  #   HAS_REQUIRED_FIELDS is passed as the literal token `true`/`false`. The
+  #   `not-indexed` verdict requires per-node 404 AND index 200 so a whole-API
+  #   Radar outage classifies `api-error`, not `not-indexed` (comment §5.2).
+  #
+  # eval_obsrvr_not_indexed_streak CLASSIFICATION STATE_FILE [THRESHOLD]
+  #   sole reader/writer of STATE_FILE; sets OBSRVR_STREAK (current count) and
+  #   OBSRVR_ESCALATE ∈ yes|no. Fires `yes` exactly once when the streak first
+  #   reaches THRESHOLD (default 12), then `no` while the streak persists; a
+  #   single non-`not-indexed` tick resets counter + one-shot marker.
+  #
+  # RED on origin/main: neither function exists there, so any call aborts the
+  # harness with "command not found" (set -euo pipefail). GREEN after #3753.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 63q: node=404 + index=200 → not-indexed (permanent, API itself up) ─
+  local ob_c
+  ob_c=$(classify_obsrvr_radar 200 404 false)
+  if [[ "$ob_c" == "not-indexed" ]]; then
+    tap_ok "obsrvr-classify: node=404 index=200 → not-indexed"
+  else
+    tap_not_ok "obsrvr-classify: node=404 index=200 → not-indexed" "got '$ob_c'"
+  fi
+
+  # ── Test 63r: node=200 + required fields present → ok ──────────────────────
+  ob_c=$(classify_obsrvr_radar 200 200 true)
+  if [[ "$ob_c" == "ok" ]]; then
+    tap_ok "obsrvr-classify: node=200 fields=true → ok"
+  else
+    tap_not_ok "obsrvr-classify: node=200 fields=true → ok" "got '$ob_c'"
+  fi
+
+  # ── Test 63s: node=200 + required fields missing → api-incomplete ──────────
+  ob_c=$(classify_obsrvr_radar 200 200 false)
+  if [[ "$ob_c" == "api-incomplete" ]]; then
+    tap_ok "obsrvr-classify: node=200 fields=false → api-incomplete"
+  else
+    tap_not_ok "obsrvr-classify: node=200 fields=false → api-incomplete" "got '$ob_c'"
+  fi
+
+  # ── Test 63t: node=500 → api-error ─────────────────────────────────────────
+  ob_c=$(classify_obsrvr_radar 200 500 false)
+  if [[ "$ob_c" == "api-error" ]]; then
+    tap_ok "obsrvr-classify: node=500 → api-error"
+  else
+    tap_not_ok "obsrvr-classify: node=500 → api-error" "got '$ob_c'"
+  fi
+
+  # ── Test 63u: node=404 + index=500 (whole-API outage) → api-error ──────────
+  # The decisive discriminator (comment §5.2): a 404 alongside a DOWN index is a
+  # Radar outage, NOT node-not-indexed. Must classify api-error, not not-indexed.
+  ob_c=$(classify_obsrvr_radar 500 404 false)
+  if [[ "$ob_c" == "api-error" ]]; then
+    tap_ok "obsrvr-classify: node=404 index=500 (API outage) → api-error (NOT not-indexed)"
+  else
+    tap_not_ok "obsrvr-classify: node=404 index=500 → api-error" "got '$ob_c'"
+  fi
+
+  # ── Test 63v: empty/timeout code → api-error ───────────────────────────────
+  ob_c=$(classify_obsrvr_radar "" "" false)
+  if [[ "$ob_c" == "api-error" ]]; then
+    tap_ok "obsrvr-classify: empty/timeout code → api-error"
+  else
+    tap_not_ok "obsrvr-classify: empty/timeout code → api-error" "got '$ob_c'"
+  fi
+
+  # ── Test 63w: streak increments across consecutive not-indexed ticks ───────
+  local ob_streak_file="$sa_dir/obsrvr-streak.state"
+  rm -f "$ob_streak_file"
+  eval_obsrvr_not_indexed_streak not-indexed "$ob_streak_file" 12
+  local ob_s1="$OBSRVR_STREAK"
+  eval_obsrvr_not_indexed_streak not-indexed "$ob_streak_file" 12
+  eval_obsrvr_not_indexed_streak not-indexed "$ob_streak_file" 12
+  if [[ "$ob_s1" == "1" && "$OBSRVR_STREAK" == "3" && "$OBSRVR_ESCALATE" == "no" ]]; then
+    tap_ok "obsrvr-streak: increments across consecutive not-indexed (1→3), no escalate below threshold"
+  else
+    tap_not_ok "obsrvr-streak: increments across consecutive not-indexed" \
+      "s1=$ob_s1 streak=$OBSRVR_STREAK escalate=$OBSRVR_ESCALATE (want 1/3/no)"
+  fi
+
+  # ── Test 63x: escalation fires exactly once at THRESHOLD, then never again ──
+  # Continue the streak from 3 up to and past 12; escalate must fire once (at 12).
+  local ob_fires=0 ob_t
+  for ob_t in 4 5 6 7 8 9 10 11 12; do
+    eval_obsrvr_not_indexed_streak not-indexed "$ob_streak_file" 12
+    [[ "$OBSRVR_ESCALATE" == "yes" ]] && ob_fires=$((ob_fires + 1))
+  done
+  local ob_at12_streak="$OBSRVR_STREAK"
+  # One more tick past threshold — must NOT re-fire (one-shot marker set).
+  eval_obsrvr_not_indexed_streak not-indexed "$ob_streak_file" 12
+  if [[ "$ob_at12_streak" == "12" && "$ob_fires" == "1" \
+        && "$OBSRVR_STREAK" == "13" && "$OBSRVR_ESCALATE" == "no" ]]; then
+    tap_ok "obsrvr-streak: escalation fires exactly once at THRESHOLD=12, silent thereafter (one-shot)"
+  else
+    tap_not_ok "obsrvr-streak: escalation fires exactly once at THRESHOLD" \
+      "at12=$ob_at12_streak fires=$ob_fires streak13=$OBSRVR_STREAK escalate=$OBSRVR_ESCALATE"
+  fi
+
+  # ── Test 63y: a non-not-indexed tick resets counter + marker (re-escalates) ─
+  eval_obsrvr_not_indexed_streak ok "$ob_streak_file" 12
+  local ob_reset_streak="$OBSRVR_STREAK" ob_reset_esc="$OBSRVR_ESCALATE"
+  # After a reset the one-shot marker must clear so a fresh streak can escalate.
+  local ob_refire=0
+  for ob_t in $(seq 1 12); do
+    eval_obsrvr_not_indexed_streak not-indexed "$ob_streak_file" 12
+    [[ "$OBSRVR_ESCALATE" == "yes" ]] && ob_refire=$((ob_refire + 1))
+  done
+  if [[ "$ob_reset_streak" == "0" && "$ob_reset_esc" == "no" && "$ob_refire" == "1" ]]; then
+    tap_ok "obsrvr-streak: non-not-indexed tick resets counter+marker; fresh streak re-escalates once"
+  else
+    tap_not_ok "obsrvr-streak: reset + re-escalate" \
+      "reset_streak=$ob_reset_streak reset_esc=$ob_reset_esc refire=$ob_refire (want 0/no/1)"
+  fi
+
+  # ── Test 63z: consistency — SKILL.md check (9) references both functions ────
+  local tick_file_ob="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'classify_obsrvr_radar' "$tick_file_ob"; then
+    tap_ok "consistency: monitor-tick/SKILL.md references classify_obsrvr_radar"
+  else
+    tap_not_ok "consistency: monitor-tick/SKILL.md references classify_obsrvr_radar" \
+      "check (9) not wired to the shared classifier"
+  fi
+  if grep -q 'eval_obsrvr_not_indexed_streak' "$tick_file_ob"; then
+    tap_ok "consistency: monitor-tick/SKILL.md references eval_obsrvr_not_indexed_streak"
+  else
+    tap_not_ok "consistency: monitor-tick/SKILL.md references eval_obsrvr_not_indexed_streak" \
+      "check (9) not wired to the streak escalator"
   fi
 
   # ── Test 64: Tick history capture uses quoted heredoc + datetime.now ────────
