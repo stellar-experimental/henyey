@@ -375,6 +375,50 @@ pub fn log_startup_memory(phase: &str) {
     crate::peak_rss_sampler::note_checkpoint(phase);
 }
 
+/// Emit a cheap single-line memory *sample* every ledger close (#3759).
+///
+/// The full [`MemoryReport::log`] runs only every 64 ledgers (~5 min) and walks
+/// every component, so it is too heavy to run per-close and — sampling at an
+/// arbitrary phase relative to a 60 s allocation cycle — aliases short-period
+/// RSS swings. This function reuses the same `/proc` + jemalloc captures as the
+/// full report (process RSS split, jemalloc allocated/resident, the exact
+/// `arena_small`/`large`/`huge` size-class split, and fragmentation) and emits
+/// them as **one** structured line at ~5 s cadence — well under the Nyquist
+/// bound for a 60 s cycle — so both the trough and peak of the sawtooth land in
+/// the log stream.
+///
+/// The line carries a **distinct** `memory_sample = true` field. It deliberately
+/// does **not** emit the reserved `memory_report = true` field (see
+/// [`MEMORY_REPORT_FIELD`] and the `test_memory_report_emits_field_*` contract):
+/// monitoring consumers grep the two independently. There is no per-component
+/// walk — that is what keeps it cheap enough to run on every close.
+pub fn log_periodic_sample(ledger_seq: u32) {
+    let pm = ProcessMemory::capture();
+    let alloc = AllocatorStats::capture();
+    let (small, large, huge) = alloc.arena_split();
+    let to_mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let fragmentation_pct = if alloc.allocated > 0 {
+        (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    info!(
+        memory_sample = true,
+        ledger_seq = ledger_seq,
+        rss_mb = format!("{:.0}", to_mb(pm.rss_bytes)),
+        anon_rss_mb = format!("{:.0}", to_mb(pm.anon_rss_bytes)),
+        file_rss_mb = format!("{:.0}", to_mb(pm.file_rss_bytes)),
+        jemalloc_allocated_mb = format!("{:.0}", to_mb(alloc.allocated)),
+        jemalloc_resident_mb = format!("{:.0}", to_mb(alloc.resident)),
+        arena_small_mb = format!("{:.0}", to_mb(small)),
+        arena_large_mb = format!("{:.0}", to_mb(large)),
+        arena_huge_mb = format!("{:.0}", to_mb(huge)),
+        fragmentation_pct = format!("{:.1}", fragmentation_pct),
+        "Memory sample"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

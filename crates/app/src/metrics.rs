@@ -520,6 +520,20 @@ metric_catalog! {
         STARTUP_PEAK_ANON_RSS_MB = "henyey_startup_peak_anon_rss_mb"
             => "Peak anonymous RSS (MB) observed during startup restore + catchup";
 
+        // Live process RSS from /proc/self/status (issue #3759). Unlike the
+        // allocator-view henyey_jemalloc_resident_bytes and the one-shot
+        // startup-peak gauge, these track the OS-visible resident set every
+        // scrape, giving the metrics archive a retroactive view of the 60 s /
+        // ~2.76 GB arena_small RSS sawtooth. NOTE: the swing has a 60 s period,
+        // so a Prometheus scrape interval below ~30 s is required to resolve it
+        // (a 60 s scrape aliases it exactly like the old every-64-ledger report).
+        PROCESS_RESIDENT_MEMORY_BYTES = "henyey_process_resident_memory_bytes"
+            => "Resident set size (VmRSS) in bytes; scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
+        PROCESS_ANON_RESIDENT_MEMORY_BYTES = "henyey_process_anon_resident_memory_bytes"
+            => "Anonymous (heap+stack) resident bytes (RssAnon); scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
+        PROCESS_FILE_RESIDENT_MEMORY_BYTES = "henyey_process_file_resident_memory_bytes"
+            => "File-backed (mmap) resident bytes (RssFile); scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
+
         // ── Loadgen meters (#3569, reset on clearmetrics #3630) ────────
         //
         // Parity with stellar-core's medida loadgen meters
@@ -1363,6 +1377,15 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
             (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0;
         JEMALLOC_FRAGMENTATION_PCT.set(frag);
     }
+
+    // Live process RSS from /proc/self/status (#3759) — a single cheap syscall
+    // per scrape, sibling to the AllocatorStats::capture() above (zeros
+    // off-Linux, no panic). Gives the archive an OS-view RSS series so the 60 s
+    // arena_small sawtooth is resolvable retroactively.
+    let proc_mem = henyey_ledger::memory_report::ProcessMemory::capture();
+    PROCESS_RESIDENT_MEMORY_BYTES.set(proc_mem.rss_bytes as f64);
+    PROCESS_ANON_RESIDENT_MEMORY_BYTES.set(proc_mem.anon_rss_bytes as f64);
+    PROCESS_FILE_RESIDENT_MEMORY_BYTES.set(proc_mem.file_rss_bytes as f64);
 
     // Phase 3: Ledger apply cumulative counters.
     LEDGER_APPLY_SUCCESS_TOTAL.absolute(snap.cumulative_apply_success);
@@ -2639,10 +2662,7 @@ mod tests {
                 gauge_names.contains(name),
                 "{name} missing from gauge catalog"
             );
-            assert!(
-                prereg.contains(name),
-                "{name} must be pre-registered at 0"
-            );
+            assert!(prereg.contains(name), "{name} must be pre-registered at 0");
         }
     }
 
