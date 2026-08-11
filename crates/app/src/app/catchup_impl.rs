@@ -1564,6 +1564,38 @@ impl App {
             return None;
         }
 
+        // #3848: wall-clock, gap-independent escape. When every peer has been
+        // exhausted for the slot's tx_set past TX_SET_STUCK_FORCE_ESCAPE_SECS,
+        // the node is genuinely wedged, yet every gap signal below
+        // (latest_ext == current_ledger, effective_peer_gap == 0, archive
+        // confirmed behind) reads "at tip" — because those signals only advance
+        // when THIS node externalizes, which the missing tx_set prevents. The
+        // at-tip suppression guards would then wedge the node indefinitely
+        // (the incident: ~80 not_behind ticks over 5m39s). When wedged, bypass
+        // both at-tip guards so the full state-clearing reset (steps 2–7) runs:
+        // evicting the leading no-tx_set syncing entries + clearing pending
+        // tx_sets + reset_tx_set_tracking abandons the wedged evicted-hash
+        // tracking and re-drives a fresh SCP-state request. reset_tx_set_tracking
+        // zeroes tx_set_exhausted_since, so the wedge self-clears and cannot
+        // immediately re-fire (bounded further by the #1843 cooldown above and
+        // the #2389 livelock breaker below). Placed AFTER the cooldown check so
+        // a recent reset still throttles; the livelock breaker still arms.
+        let tx_set_wall_clock_wedged = self.tx_set_wall_clock_wedged();
+        if tx_set_wall_clock_wedged {
+            crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                .increment("tx_set_stuck_wall_clock_force_reset", 1);
+            tracing::warn!(
+                current_ledger,
+                latest_externalized = latest_ext,
+                tx_set_exhausted_since = self.tx_set_exhausted_since_offset(),
+                now_offset,
+                ?reason,
+                "#3848: tx_set wall-clock wedged past TX_SET_STUCK_FORCE_ESCAPE_SECS \
+                 — bypassing at-tip hard-reset suppression to force a \
+                 state-clearing reset"
+            );
+        }
+
         // Defense-in-depth (#2664, widened #3733): skip hard reset when the
         // node is at-tip. There is nothing to catch up to — any spawned
         // catchup would fail with "archive not ahead of min_ledger." Clear
@@ -1599,7 +1631,8 @@ impl App {
         let at_tip_exact = latest_ext == current_ledger as u64;
         let near_tip_peers_not_ahead =
             local_gap <= TX_SET_REQUEST_WINDOW && self.effective_peer_gap(current_ledger) == 0;
-        if latest_ext > 0 && (at_tip_exact || near_tip_peers_not_ahead) {
+        if latest_ext > 0 && (at_tip_exact || near_tip_peers_not_ahead) && !tx_set_wall_clock_wedged
+        {
             self.clear_archive_recovery_state(ArchiveRecoveryClear::DefenseSkip)
                 .await;
             tracing::debug!(
@@ -1662,10 +1695,10 @@ impl App {
             // up to, so a Cold cache is treated as not-known-ahead.
             CacheResult::Cold => true,
         };
-        let suppress_archive_behind_at_tip =
-            self.archive_recovery_snapshot().await.is_confirmed_behind()
-                && peer_gap < HARD_RESET_GAP_ESCALATION
-                && cache_not_known_ahead;
+        let suppress_archive_behind_at_tip = !tx_set_wall_clock_wedged
+            && self.archive_recovery_snapshot().await.is_confirmed_behind()
+            && peer_gap < HARD_RESET_GAP_ESCALATION
+            && cache_not_known_ahead;
 
         if suppress_archive_behind_at_tip {
             // Record cooldown so decision function routes to AttemptRecovery.

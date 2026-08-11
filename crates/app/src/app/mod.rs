@@ -286,6 +286,36 @@ const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 /// OUT_OF_SYNC_RECOVERY_TIMER_SECS.
 const HARD_RESET_STALL_SECS: u64 = 120;
 
+/// #3848: wall-clock, gap-independent escape for the tx_set-exhausted wedge.
+///
+/// When every peer has returned DontHave/disconnected for the slot's tx_set
+/// (`tx_set_all_peers_exhausted`) and that condition has persisted this many
+/// seconds, the node is genuinely wedged even though every gap signal
+/// (`latest_externalized`, `peer_gap`) reads "at tip" — because those signals
+/// only advance when *this* node externalizes, which the missing tx_set
+/// prevents. At that point the at-tip hard-reset suppression must be bypassed
+/// so the full state-clearing reset runs. Set below the 120s
+/// `HARD_RESET_STALL_SECS` and well above transient tx_set-fetch jitter; the
+/// `tx_set_all_peers_exhausted` gate makes a false fire unlikely. Tunable in
+/// the 60–120s band.
+const TX_SET_STUCK_FORCE_ESCAPE_SECS: u64 = 90;
+
+/// #3848: pure predicate for the tx_set wall-clock wedge escape. Kept a free
+/// function (no `&self`) so it is unit-testable without constructing an `App`.
+///
+/// True iff the node is exhausted AND the onset offset is a real stamp
+/// (`> 0`; `0` is the "not exhausted" sentinel written by
+/// `clear_tx_set_exhausted`) AND at least `threshold` seconds have elapsed
+/// since onset. `saturating_sub` guards a non-monotonic clock reading.
+fn tx_set_stuck_secs_exceeds(
+    exhausted: bool,
+    since_offset: u64,
+    now_offset: u64,
+    threshold: u64,
+) -> bool {
+    exhausted && since_offset > 0 && now_offset.saturating_sub(since_offset) >= threshold
+}
+
 /// Wall-clock deadline (seconds) the near-tip / archive-confirmed-behind
 /// recovery condition must persist with ZERO serviceable peers before the
 /// henyey-specific bounded *wider* peer-SCP pull is allowed to fire once
@@ -2243,6 +2273,24 @@ impl App {
         self.tx_set_last_request.write().await.clear();
         self.tx_set_exhausted_warned.write().await.clear();
         self.tx_set_last_retry.write().await.clear();
+    }
+
+    /// #3848: true when the node has been tx_set-exhausted (all peers said
+    /// DontHave for the slot's tx_set) for longer than
+    /// `TX_SET_STUCK_FORCE_ESCAPE_SECS`. This is the gap-independent wedge
+    /// signal: it does not read `latest_externalized` or `peer_gap` (both
+    /// structurally pinned during this stall), only the monotonic exhaustion
+    /// onset (`tx_set_exhausted_since_offset`) against wall-clock elapsed.
+    /// Consumed by `force_post_catchup_hard_reset` to bypass the at-tip
+    /// suppression guards. Self-clears after the reset because
+    /// `reset_tx_set_tracking` zeroes the onset stamp.
+    pub(crate) fn tx_set_wall_clock_wedged(&self) -> bool {
+        tx_set_stuck_secs_exceeds(
+            self.tx_set_all_peers_exhausted.load(Ordering::SeqCst),
+            self.tx_set_exhausted_since_offset(),
+            self.start_instant.elapsed().as_secs(),
+            TX_SET_STUCK_FORCE_ESCAPE_SECS,
+        )
     }
 
     /// Persist in-memory hot archive buckets to disk.
@@ -12082,6 +12130,41 @@ mod tests {
     // ============================================================
     // TxSet exhaustion retry and metric tests (#1929)
     // ============================================================
+
+    // #3848: pure-function table for the wall-clock wedge predicate.
+
+    #[test]
+    fn test_tx_set_stuck_secs_exceeds_not_exhausted_is_false() {
+        // Not exhausted → never wedged, regardless of elapsed.
+        assert!(!tx_set_stuck_secs_exceeds(false, 100, 100_000, 90));
+    }
+
+    #[test]
+    fn test_tx_set_stuck_secs_exceeds_zero_since_sentinel_is_false() {
+        // since_offset == 0 is the "not exhausted" sentinel written by
+        // clear_tx_set_exhausted; treat it as not wedged even if flagged.
+        assert!(!tx_set_stuck_secs_exceeds(true, 0, 100_000, 90));
+    }
+
+    #[test]
+    fn test_tx_set_stuck_secs_exceeds_below_threshold_is_false() {
+        // Exhausted but elapsed (89s) < threshold (90s) → not yet wedged.
+        assert!(!tx_set_stuck_secs_exceeds(true, 100, 189, 90));
+    }
+
+    #[test]
+    fn test_tx_set_stuck_secs_exceeds_at_and_above_threshold_is_true() {
+        // Exhausted && elapsed >= threshold → wedged (boundary and beyond).
+        assert!(tx_set_stuck_secs_exceeds(true, 100, 190, 90));
+        assert!(tx_set_stuck_secs_exceeds(true, 100, 500, 90));
+    }
+
+    #[test]
+    fn test_tx_set_stuck_secs_exceeds_non_monotonic_clock_is_false() {
+        // now_offset < since_offset (non-monotonic clock) saturates to 0
+        // elapsed → not wedged, no underflow panic.
+        assert!(!tx_set_stuck_secs_exceeds(true, 500, 100, 90));
+    }
 
     #[tokio::test]
     async fn test_mark_tx_set_exhausted_records_timestamp_on_first_transition() {
