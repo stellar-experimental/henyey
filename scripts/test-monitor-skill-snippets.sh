@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=448
+TAP_PLAN=446
 TAP_CURRENT=0
 TAP_FAILURES=0
 
