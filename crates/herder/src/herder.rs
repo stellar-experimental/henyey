@@ -879,8 +879,16 @@ impl Herder {
         // falling back to an inline (deadlocking) persist.
         match crate::persistence::ScpPersistWorker::spawn(Arc::clone(&queue), process) {
             Ok(worker) => {
-                // Store so `Herder::drop` joins the worker thread.
-                let _ = self.scp_persist_worker.set(worker);
+                // Store so `Herder::drop` joins the worker thread. `set` can
+                // only fail if the cell was already populated; the earlier
+                // `self.scp_persistence.set(..)?` guarantees this method runs
+                // exactly once, so this is the first (and only) `set`. Assert
+                // it in debug builds to catch any future reordering that would
+                // leave the worker un-stored (dropped/joined) while the enqueue
+                // callback below stays installed — which would leak the pending
+                // count and hang `wait_for_pending_persists`.
+                let stored = self.scp_persist_worker.set(worker).is_ok();
+                debug_assert!(stored, "scp_persist_worker set exactly once");
                 // The emit callback: enqueue only. This is the short,
                 // SQLite-free work that runs under SCP's `slots` write guard.
                 self.scp_driver.set_persist_callback(move |slot| {
