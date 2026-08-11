@@ -38,6 +38,7 @@ SEMANTIC_FIELDS = frozenset({
     "min_volume", "min_count_delta",
     "snapshot_file", "optional_counters",
     "exempt", "exempt_reason", "allow_duplicate_cooldown",
+    "guard_metric", "guard_op", "guard_threshold", "guard_extraction",
 })
 
 NON_SEMANTIC_FIELDS = frozenset({

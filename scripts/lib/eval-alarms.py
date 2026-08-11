@@ -509,6 +509,26 @@ def eval_gauge(
     for_ticks = alarm.get("for_ticks", 1)
     breaching = compare(val, op, threshold)
 
+    # Optional companion-metric guard (#3752): a tick counts as breaching only
+    # when the primary condition AND a second (guard) condition both hold. Used
+    # by jemalloc-frag-high so a high fragmentation ratio only fires when
+    # resident memory is *also* genuinely elevated — a bounded, oscillating
+    # frag% on a long-uptime node is informational, not actionable. If the
+    # guard metric is absent from this scrape we cannot confirm the guard
+    # condition, so we fail toward NOT firing. Folding the guard into
+    # `breaching` reuses the persistence/reset logic below verbatim: an unmet
+    # guard resets the streak and reports `ok`, exactly like a non-breaching
+    # primary. Alarms without guard_metric are unaffected (byte-for-byte).
+    guard_metric = alarm.get("guard_metric")
+    if guard_metric is not None:
+        guard_extraction = alarm.get("guard_extraction", "form1")
+        guard_val = extract_value(current, guard_metric, guard_extraction)
+        if guard_val is None:
+            guard_breaching = False
+        else:
+            guard_breaching = compare(guard_val, alarm["guard_op"], alarm["guard_threshold"])
+        breaching = breaching and guard_breaching
+
     if for_ticks <= 1:
         if breaching:
             return make_result(alarm, "firing", value=val, threshold=threshold, for_ticks_elapsed=1)
@@ -1482,6 +1502,16 @@ def validate_catalog(catalog: dict) -> list[str]:
                 errors.append(f"{name}: gauge requires valid 'op'")
             if "threshold" not in alarm:
                 errors.append(f"{name}: gauge requires 'threshold'")
+            # Optional companion-metric guard (#3752): if any guard_* field is
+            # present, the guard must be fully specified so it cannot be
+            # silently ignored at evaluation time.
+            if any(k in alarm for k in ("guard_metric", "guard_op", "guard_threshold", "guard_extraction")):
+                if "guard_metric" not in alarm:
+                    errors.append(f"{name}: gauge guard requires 'guard_metric'")
+                if "guard_op" not in alarm or alarm["guard_op"] not in VALID_OPS:
+                    errors.append(f"{name}: gauge guard requires valid 'guard_op'")
+                if "guard_threshold" not in alarm:
+                    errors.append(f"{name}: gauge guard requires 'guard_threshold'")
         elif kind == "gauge-ratio":
             for field in ("numerator_metric", "denominator_metric", "op", "threshold"):
                 if field not in alarm:

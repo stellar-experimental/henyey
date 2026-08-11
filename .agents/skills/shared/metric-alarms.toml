@@ -318,13 +318,18 @@ threshold = 50
 for_ticks = 2
 severity = "WARN"
 gates = ["warmup-2-ticks"]
+guard_metric = "henyey_jemalloc_resident_bytes"
+guard_op = ">"
+guard_threshold = 34359738368
+baseline_version = 2  # bumped in #3752: resident-memory guard added — alarm now suppressed when henyey_jemalloc_resident_bytes <= 32 GiB (semantic change; invalidates prior baselines)
 cooldown_key = "henyey_jemalloc_fragmentation_pct"
 cooldown_seconds = 3600
 filing_title = "metrics: henyey_jemalloc_fragmentation_pct — {value}% > {threshold}% (2 ticks)"
 filing_search = "metrics: henyey_jemalloc_fragmentation_pct"
 summary = "Jemalloc fragmentation high (sustained)"
 details = "fragmentation={value}% threshold={threshold}%"
-notes = "Post-restart frag ramps ~35-45%, settles to ~18%."
+semantic_change_date = "2026-08-10T00:00:00Z"
+notes = "Post-restart frag ramps ~35-45%, settles to ~18%. Resident guard (#3752): fires only when henyey_jemalloc_resident_bytes > 32 GiB, so a bounded, oscillating frag% at long uptime (#3759 — ~8pt/60s swing on stable ~18-21 GB resident) no longer false-fires. 32 GiB sits above the observed steady state and below the 40.6 GB (0.65x61 GB) high-mem guardrail; operator-tunable."
 
 [[alarm]]
 name = "scp-verify-backlog"
