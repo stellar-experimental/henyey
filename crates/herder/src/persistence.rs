@@ -29,6 +29,8 @@
 //! `persist_scp_state()` is called after each envelope emission to ensure the
 //! latest SCP state is durable. This enables recovery to the last externalized slot.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use stellar_xdr::{
     Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatementPledges, StellarValue, Value,
@@ -405,10 +407,14 @@ pub struct ScpPersistenceManager {
     storage: Box<dyn ScpStatePersistence>,
     /// Last slot that was persisted.
     last_slot_saved: parking_lot::RwLock<u64>,
-    /// Number of persist worker threads spawned by [`crate::herder::Herder`]'s
-    /// SCP-emit callback that have not yet returned. The callback defers the
-    /// gather + persist work onto a dedicated thread to avoid deadlocking on
-    /// SCP's internal slots lock (which is write-held while `emit` fires).
+    /// Number of *distinct pending persist operations* — the count maintained
+    /// as `queued.len() + processing.is_some()` by [`SharedPersistQueue`]. Since
+    /// #3813 the SCP-emit callback no longer spawns a thread per emit; it
+    /// enqueues the slot onto the single-worker queue, and same-slot emits
+    /// coalesce, so this counts operations rather than raw threads. The
+    /// gather + persist still runs off the emit thread (on the persist worker)
+    /// to avoid deadlocking on SCP's internal slots lock (write-held while
+    /// `emit` fires).
     ///
     /// Tests use [`Self::wait_for_pending_persists`] to synchronize on the
     /// background work completing before asserting `last_slot_saved`.
@@ -426,34 +432,36 @@ pub struct ScpPersistenceManager {
     /// precedent — a live gauge alone would read `0` on the large majority of
     /// scrapes (see #3796 §2: concurrency was `0` for 82.9% of wall-clock).
     persist_pending_peak: std::sync::atomic::AtomicU64,
-    /// Total persist worker spawns attempted (incremented in
-    /// `pending_persist_begin`, which runs BEFORE the thread is spawned).
-    /// `attempted - spawn_failed = threads actually spawned`.
+    /// Total distinct persist operations enqueued (incremented in
+    /// `pending_persist_begin`, which the queue calls once per newly-inserted
+    /// distinct slot). Same-slot coalesced emits do not bump this.
     persist_attempted_total: std::sync::atomic::AtomicU64,
-    /// Total persist worker spawns that failed (e.g. `EAGAIN` / thread-table
-    /// exhaustion). Bumped only by `record_spawn_failure`.
+    /// Total persist worker spawns that failed to launch. Since #3813 the worker
+    /// is spawned exactly once at install, so this is 0 or 1. Bumped only by
+    /// `record_spawn_failure`.
     persist_spawn_failed_total: std::sync::atomic::AtomicU64,
 }
 
-/// Snapshot of the SCP persist-worker backlog counters for the `/metrics`
-/// scrape path (issue #3796).
+/// Snapshot of the SCP persist backlog counters for the `/metrics` scrape path
+/// (issue #3796). Since #3813 these count distinct persist *operations* behind
+/// the single worker (`queued.len() + processing`), not raw threads — the
+/// intended validation signal is `pending_peak` falling from ~10 (the old
+/// thread-per-emit fan-out) toward ~1-2.
 ///
-/// - `pending`: persist workers currently in flight (live gauge).
+/// - `pending`: distinct persist operations currently queued or in flight.
 /// - `pending_peak`: process-lifetime high-water mark of `pending`.
-/// - `attempted_total`: cumulative persist spawns attempted.
-/// - `spawn_failed_total`: cumulative persist spawns that failed to launch.
-///
-/// `attempted_total - spawn_failed_total` is the number of persist worker
-/// threads actually spawned.
+/// - `attempted_total`: cumulative distinct persist operations enqueued.
+/// - `spawn_failed_total`: whether the single worker failed to spawn at install
+///   (0 or 1 since #3813).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScpPersistStats {
-    /// Persist workers currently in flight.
+    /// Distinct persist operations currently queued or in flight.
     pub pending: u64,
     /// Process-lifetime high-water mark of `pending`.
     pub pending_peak: u64,
-    /// Cumulative persist spawns attempted (before the spawn).
+    /// Cumulative distinct persist operations enqueued.
     pub attempted_total: u64,
-    /// Cumulative persist spawns that failed to launch.
+    /// Cumulative worker spawns that failed to launch (0 or 1 since #3813).
     pub spawn_failed_total: u64,
 }
 
@@ -488,8 +496,9 @@ impl ScpPersistenceManager {
         self.storage.has_tx_set(hash)
     }
 
-    /// Increment the pending-persist counter. Called by the emit callback's
-    /// worker thread spawner BEFORE the thread is detached.
+    /// Increment the pending-persist counter. Called by [`SharedPersistQueue`]
+    /// under its queue lock exactly once per newly-enqueued distinct slot, so
+    /// the counter tracks distinct pending persist operations.
     pub(crate) fn pending_persist_begin(&self) {
         use std::sync::atomic::Ordering;
         let mut pending = self
@@ -508,7 +517,8 @@ impl ScpPersistenceManager {
     }
 
     /// Decrement the pending-persist counter and notify waiters. Called by
-    /// the worker thread on completion (success or error).
+    /// [`SharedPersistQueue::finish`] when the worker clears `processing` after
+    /// a persist (success or error).
     pub(crate) fn pending_persist_end(&self) {
         use std::sync::atomic::Ordering;
         let mut pending = self
@@ -732,6 +742,233 @@ impl ScpPersistenceManager {
     }
 }
 
+/// Soft cap on the number of *distinct* un-persisted slots queued behind the
+/// single persist worker. This is a **diagnostic threshold, not a functional
+/// limit**: crossing it emits a rate-limited `warn!` but the slot is still
+/// enqueued (see [`SharedPersistQueue::enqueue`]).
+///
+/// Dropping a distinct slot is unsound — [`ScpPersistenceManager::restore_scp_state`]
+/// replays every row returned by `load_all_scp_states`, so dropping slot `s` in
+/// favour of `s+1` loses `s`'s `scpstate` row from crash-recovery replay. And
+/// *blocking* the producer is forbidden: the emit callback runs under SCP's
+/// `slots` write guard, so blocking it on a full queue would re-couple the emit
+/// path to the (contended) SQLite write — the very stall the off-thread hop
+/// exists to avoid. The only sound non-blocking policy is therefore
+/// coalesce-and-keep. In practice the backlog is structurally tiny: distinct
+/// un-persisted slots advance at ledger cadence (~5 s) while a single persist
+/// write is sub-second, so the cap should never be reached outside a pathology.
+const PERSIST_QUEUE_SOFT_CAP: usize = 512;
+
+/// Minimum interval between soft-cap `warn!`s, so a sustained deep backlog does
+/// not flood the log.
+const SOFT_CAP_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Mutable state of the SCP persist queue, guarded by [`SharedPersistQueue::inner`].
+///
+/// The pending-persist invariant maintained across all mutations is:
+///
+/// ```text
+/// ScpPersistenceManager::pending == queued.len() + processing.is_some() as usize
+/// ```
+///
+/// `queued` and `processing` are kept **separate** so that an emit arriving for
+/// the slot currently being persisted re-enters `queued` as a genuinely new
+/// pending unit — guaranteeing the freshest Externalize state for an in-flight
+/// slot is re-persisted rather than lost to coalescing.
+struct QueueState {
+    /// Distinct slots awaiting persistence, ordered ascending. Same-slot
+    /// re-enqueues coalesce into a single entry (the worker re-reads
+    /// `get_latest_messages_send(slot)` at execution time, so collapsing N
+    /// same-slot requests yields state at least as fresh as the last of them).
+    queued: std::collections::BTreeSet<u64>,
+    /// The slot the worker has popped and is currently persisting, if any.
+    processing: Option<u64>,
+    /// Set by [`ScpPersistWorker`]'s `Drop` to tell the worker to drain and exit.
+    shutdown: bool,
+    /// Last time a soft-cap warning was emitted (for rate-limiting).
+    last_soft_cap_warn: Option<std::time::Instant>,
+}
+
+/// Coalescing, non-blocking hand-off between the SCP emit callback (producer)
+/// and the single [`ScpPersistWorker`] (consumer).
+///
+/// The producer's only work under SCP's `slots` write guard is
+/// [`Self::enqueue`]: a short `std::Mutex` lock, a `BTreeSet::insert`, and a
+/// `Condvar::notify_one`. It never touches SQLite, so the load-bearing
+/// off-thread hop (which exists to avoid `parking_lot::RwLock` non-reentrancy
+/// self-deadlock in `SCP::get_latest_messages_send`) is preserved.
+pub(crate) struct SharedPersistQueue {
+    inner: std::sync::Mutex<QueueState>,
+    cv: std::sync::Condvar,
+    /// Drives the pending-persist counters so that `pending` reflects distinct
+    /// pending persist *operations* (`queued.len() + processing`), which is the
+    /// #3796 validation signal `henyey_scp_pending_persists_peak`.
+    manager: Arc<ScpPersistenceManager>,
+}
+
+impl SharedPersistQueue {
+    /// Build a new empty queue driving the given persistence manager's counters.
+    pub(crate) fn new(manager: Arc<ScpPersistenceManager>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(QueueState {
+                queued: std::collections::BTreeSet::new(),
+                processing: None,
+                shutdown: false,
+                last_soft_cap_warn: None,
+            }),
+            cv: std::sync::Condvar::new(),
+            manager,
+        })
+    }
+
+    /// Enqueue `slot` for persistence. Called by the SCP emit callback under the
+    /// `slots` write guard — must stay short and never block on SQLite.
+    ///
+    /// Coalesces same-slot requests: a slot already in `queued` is a no-op.
+    /// Increments the pending counter (`pending_persist_begin`) **iff the slot
+    /// was newly inserted**, unconditionally with respect to `processing` — so a
+    /// fresh emit for the currently-processing slot counts as a real new pending
+    /// unit and `wait_for_pending_persists` cannot return early while a queued
+    /// re-persist is still outstanding.
+    pub(crate) fn enqueue(&self, slot: u64) {
+        let mut st = self.inner.lock().expect("persist queue mutex poisoned");
+        // If we're shutting down, do not accept new work — otherwise we would
+        // call `pending_persist_begin` for a slot the worker will never drain
+        // (it may already have observed `shutdown` and exited), leaking the
+        // pending count upward forever and hanging `wait_for_pending_persists`.
+        if st.shutdown {
+            return;
+        }
+        let newly = st.queued.insert(slot);
+        if !newly {
+            // Same-slot coalescing: already queued, nothing to do.
+            return;
+        }
+        // New distinct pending unit — maintain `pending == queued + processing`.
+        self.manager.pending_persist_begin();
+
+        // Soft-cap diagnostic: warn (rate-limited) on a deep distinct-slot
+        // backlog, but still enqueue (never drop, never block — see
+        // `PERSIST_QUEUE_SOFT_CAP`).
+        let depth = st.queued.len();
+        if depth > PERSIST_QUEUE_SOFT_CAP {
+            let now = std::time::Instant::now();
+            let should_warn = match st.last_soft_cap_warn {
+                None => true,
+                Some(last) => now.duration_since(last) >= SOFT_CAP_WARN_INTERVAL,
+            };
+            if should_warn {
+                st.last_soft_cap_warn = Some(now);
+                warn!(
+                    backlog = depth,
+                    soft_cap = PERSIST_QUEUE_SOFT_CAP,
+                    "SCP persist queue backlog exceeds soft cap; persist worker is \
+                     falling behind (still enqueuing, not dropping)"
+                );
+            }
+        }
+
+        // Wake the worker. Notify while still holding the guard: the worker
+        // re-checks `queued` under the lock, so a notify that races the guard
+        // drop cannot be lost.
+        self.cv.notify_one();
+    }
+
+    /// Block until a slot is available to persist, moving it into `processing`
+    /// and returning it. Returns `None` only when `shutdown` is set AND the
+    /// queue is fully drained — the worker's loop-exit condition.
+    fn wait_for_next(&self) -> Option<u64> {
+        let mut st = self.inner.lock().expect("persist queue mutex poisoned");
+        loop {
+            if let Some(&slot) = st.queued.iter().next() {
+                st.queued.remove(&slot);
+                st.processing = Some(slot);
+                return Some(slot);
+            }
+            if st.shutdown {
+                return None;
+            }
+            st = self.cv.wait(st).expect("persist queue mutex poisoned");
+        }
+    }
+
+    /// Mark the in-flight persist complete: clear `processing` and drop the
+    /// pending count (`pending_persist_end`), keeping the invariant.
+    fn finish(&self) {
+        let mut st = self.inner.lock().expect("persist queue mutex poisoned");
+        st.processing = None;
+        self.manager.pending_persist_end();
+        if st.queued.is_empty() {
+            // Wake any shutdown-drain waiter blocked in `wait_for_next`.
+            self.cv.notify_all();
+        }
+    }
+}
+
+/// The single, long-lived SCP persist worker.
+///
+/// Replaces the previous unbounded thread-per-emit fan-out (#3813): live
+/// persist threads are now hard-bounded to exactly one. The worker owns its
+/// thread's `JoinHandle`; `Drop` signals shutdown, drains the queue, and joins,
+/// closing the "detached, never joined" shutdown race the previous design left
+/// open.
+pub(crate) struct ScpPersistWorker {
+    queue: Arc<SharedPersistQueue>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScpPersistWorker {
+    /// Spawn the persist worker. `process_fn` performs the gather + persist for
+    /// one slot (the work that previously ran on each detached thread) and runs
+    /// **outside** the queue lock. Returns an error only if the OS refuses to
+    /// spawn the (single) thread.
+    pub(crate) fn spawn<F>(
+        queue: Arc<SharedPersistQueue>,
+        mut process_fn: F,
+    ) -> std::io::Result<Self>
+    where
+        F: FnMut(u64) + Send + 'static,
+    {
+        let q = Arc::clone(&queue);
+        let handle = std::thread::Builder::new()
+            .name("scp-persist".to_string())
+            .spawn(move || {
+                while let Some(slot) = q.wait_for_next() {
+                    // Gather + persist happens here, outside the queue lock and
+                    // (critically) after the SCP `slots` write-lock chain that
+                    // triggered the emit has fully unwound.
+                    process_fn(slot);
+                    q.finish();
+                }
+            })?;
+        Ok(Self {
+            queue,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ScpPersistWorker {
+    fn drop(&mut self) {
+        {
+            let mut st = self
+                .queue
+                .inner
+                .lock()
+                .expect("persist queue mutex poisoned");
+            st.shutdown = true;
+        }
+        // Wake the worker if it is parked in `wait_for_next`.
+        self.queue.cv.notify_all();
+        if let Some(handle) = self.handle.take() {
+            // Drains any already-queued slots, then exits. May block up to the
+            // SQLite `BUSY_TIMEOUT_MS` if a persist is mid-write — bounded, and
+            // strictly better than the previous unjoined race.
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Restored SCP state from persistence.
 #[derive(Debug, Default)]
 pub struct RestoredScpState {
@@ -771,6 +1008,269 @@ mod tests {
                 .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         }
+    }
+
+    // --- SCP persist worker / coalescing queue (#3813) ---
+
+    /// Gate state for [`BlockingStorage`]: optionally blocks the *first*
+    /// `save_scp_state` call until the test releases it, so the concurrent
+    /// worker-scheduling cases are deterministic (no timing sleeps).
+    struct GateState {
+        block_first: bool,
+        first_entered: bool,
+        release: bool,
+    }
+
+    /// Test-only `ScpStatePersistence` seam: wraps an in-memory store, counts
+    /// `save_scp_state` calls, and can block the first save so a test can
+    /// observe the worker mid-persist and enqueue a re-persist deterministically.
+    #[derive(Clone)]
+    struct BlockingStorage {
+        inner: Arc<InMemoryScpPersistence>,
+        save_count: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
+    }
+
+    impl BlockingStorage {
+        fn new(block_first: bool) -> Self {
+            Self {
+                inner: Arc::new(InMemoryScpPersistence::new()),
+                save_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                gate: Arc::new((
+                    std::sync::Mutex::new(GateState {
+                        block_first,
+                        first_entered: false,
+                        release: false,
+                    }),
+                    std::sync::Condvar::new(),
+                )),
+            }
+        }
+
+        fn save_count(&self) -> usize {
+            self.save_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Slots present in the backing store, ascending.
+        fn saved_slots(&self) -> Vec<u64> {
+            let mut slots: Vec<u64> = self
+                .inner
+                .load_all_scp_states()
+                .unwrap()
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect();
+            slots.sort_unstable();
+            slots
+        }
+
+        /// Block until the first (gated) save has entered `save_scp_state`.
+        fn wait_until_first_entered(&self) {
+            let (m, cv) = &*self.gate;
+            let mut g = m.lock().unwrap();
+            while !g.first_entered {
+                g = cv.wait(g).unwrap();
+            }
+        }
+
+        /// Release the blocked first save.
+        fn release_first(&self) {
+            let (m, cv) = &*self.gate;
+            let mut g = m.lock().unwrap();
+            g.release = true;
+            cv.notify_all();
+        }
+    }
+
+    impl ScpStatePersistence for BlockingStorage {
+        fn save_scp_state(&self, slot: u64, state: &PersistedSlotState) -> Result<()> {
+            let n = self
+                .save_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                let (m, cv) = &*self.gate;
+                let mut g = m.lock().unwrap();
+                if g.block_first {
+                    g.first_entered = true;
+                    cv.notify_all();
+                    while !g.release {
+                        g = cv.wait(g).unwrap();
+                    }
+                }
+            }
+            self.inner.save_scp_state(slot, state)
+        }
+
+        fn load_scp_state(&self, slot: u64) -> Result<Option<PersistedSlotState>> {
+            self.inner.load_scp_state(slot)
+        }
+        fn load_all_scp_states(&self) -> Result<Vec<(u64, PersistedSlotState)>> {
+            self.inner.load_all_scp_states()
+        }
+        fn delete_scp_state_below(&self, slot: u64) -> Result<()> {
+            self.inner.delete_scp_state_below(slot)
+        }
+        fn save_tx_set(&self, hash: &Hash, tx_set: &[u8]) -> Result<()> {
+            self.inner.save_tx_set(hash, tx_set)
+        }
+        fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
+            self.inner.load_tx_set(hash)
+        }
+        fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>> {
+            self.inner.load_all_tx_sets()
+        }
+        fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
+            self.inner.has_tx_set(hash)
+        }
+        fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>> {
+            self.inner.get_all_tx_set_hashes()
+        }
+        fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()> {
+            self.inner.delete_tx_sets_by_hashes(hashes)
+        }
+    }
+
+    /// A `process_fn` that persists an empty state for the slot via the manager
+    /// (exercising the monotonic guard + `save_scp_state`), matching how the
+    /// real worker calls `persist_scp_state`.
+    fn persist_process(manager: Arc<ScpPersistenceManager>) -> impl FnMut(u64) + Send + 'static {
+        move |slot: u64| {
+            let _ = manager.persist_scp_state(slot, &[], &[], &[]);
+        }
+    }
+
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn test_persist_worker_same_slot_coalesces() {
+        // Enqueue slot 5 ten times BEFORE the worker exists, so all ten
+        // deterministically coalesce into a single BTreeSet entry — the
+        // production 10-deep same-slot fan-out collapsing to one persist.
+        let storage = BlockingStorage::new(false);
+        let manager = Arc::new(ScpPersistenceManager::new(Box::new(storage.clone())));
+        let queue = SharedPersistQueue::new(Arc::clone(&manager));
+
+        for _ in 0..10 {
+            queue.enqueue(5);
+        }
+        assert_eq!(
+            manager.persist_stats().pending,
+            1,
+            "ten enqueues coalesce to 1"
+        );
+        assert_eq!(manager.persist_stats().attempted_total, 1);
+
+        let worker =
+            ScpPersistWorker::spawn(Arc::clone(&queue), persist_process(Arc::clone(&manager)))
+                .unwrap();
+
+        assert!(manager.wait_for_pending_persists(DRAIN_TIMEOUT));
+        assert_eq!(storage.save_count(), 1, "slot 5 persisted exactly once");
+        assert_eq!(manager.persist_stats().pending, 0);
+        drop(worker);
+    }
+
+    #[test]
+    fn test_persist_worker_preserves_all_distinct_slots() {
+        // Distinct slots must never be dropped: restore replays every row.
+        let storage = BlockingStorage::new(false);
+        let manager = Arc::new(ScpPersistenceManager::new(Box::new(storage.clone())));
+        let queue = SharedPersistQueue::new(Arc::clone(&manager));
+
+        queue.enqueue(5);
+        queue.enqueue(6);
+        queue.enqueue(7);
+
+        let worker =
+            ScpPersistWorker::spawn(Arc::clone(&queue), persist_process(Arc::clone(&manager)))
+                .unwrap();
+
+        assert!(manager.wait_for_pending_persists(DRAIN_TIMEOUT));
+        assert_eq!(storage.saved_slots(), vec![5, 6, 7]);
+        assert_eq!(manager.persist_stats().pending, 0);
+        drop(worker);
+    }
+
+    #[test]
+    fn test_persist_worker_repersists_inflight_slot() {
+        // An emit for the slot currently being persisted must re-enter the
+        // queue as a new pending unit (freshest-state guarantee) and the
+        // pending counter must stay exact (`|queued| + processing`).
+        let storage = BlockingStorage::new(true); // block the first save
+        let manager = Arc::new(ScpPersistenceManager::new(Box::new(storage.clone())));
+        let queue = SharedPersistQueue::new(Arc::clone(&manager));
+
+        let worker =
+            ScpPersistWorker::spawn(Arc::clone(&queue), persist_process(Arc::clone(&manager)))
+                .unwrap();
+
+        queue.enqueue(5); // worker pops 5 → enters save → blocks
+        storage.wait_until_first_entered();
+
+        // While slot 5 is mid-persist, enqueue it again.
+        queue.enqueue(5);
+        assert_eq!(
+            manager.persist_stats().pending,
+            2,
+            "processing(1) + re-queued(1)"
+        );
+
+        storage.release_first();
+        assert!(manager.wait_for_pending_persists(DRAIN_TIMEOUT));
+        assert_eq!(storage.save_count(), 2, "in-flight slot re-persisted");
+        assert_eq!(manager.persist_stats().pending, 0);
+        drop(worker);
+    }
+
+    #[test]
+    fn test_persist_worker_pending_counter_coalesced() {
+        // Coalesced same-slot enqueues must not double-count pending; distinct
+        // slots each add one.
+        let storage = BlockingStorage::new(false);
+        let manager = Arc::new(ScpPersistenceManager::new(Box::new(storage.clone())));
+        let queue = SharedPersistQueue::new(Arc::clone(&manager));
+
+        queue.enqueue(5);
+        queue.enqueue(5);
+        queue.enqueue(5);
+        assert_eq!(manager.persist_stats().pending, 1);
+        assert_eq!(manager.persist_stats().attempted_total, 1);
+
+        queue.enqueue(6);
+        assert_eq!(manager.persist_stats().pending, 2);
+        assert_eq!(manager.persist_stats().attempted_total, 2);
+
+        let worker =
+            ScpPersistWorker::spawn(Arc::clone(&queue), persist_process(Arc::clone(&manager)))
+                .unwrap();
+
+        assert!(manager.wait_for_pending_persists(DRAIN_TIMEOUT));
+        assert_eq!(manager.persist_stats().pending, 0);
+        assert!(manager.persist_stats().pending_peak >= 2);
+        drop(worker);
+    }
+
+    #[test]
+    fn test_persist_worker_joins_on_drop() {
+        // Dropping the worker with queued work must drain it, then join without
+        // panic — closing the detached-never-joined race.
+        let storage = BlockingStorage::new(false);
+        let manager = Arc::new(ScpPersistenceManager::new(Box::new(storage.clone())));
+        let queue = SharedPersistQueue::new(Arc::clone(&manager));
+
+        for s in 10..15 {
+            queue.enqueue(s);
+        }
+
+        let worker =
+            ScpPersistWorker::spawn(Arc::clone(&queue), persist_process(Arc::clone(&manager)))
+                .unwrap();
+
+        // Drop drains the queue, then joins the thread.
+        drop(worker);
+
+        assert_eq!(manager.persist_stats().pending, 0);
+        assert_eq!(storage.saved_slots(), vec![10, 11, 12, 13, 14]);
     }
 
     // --- SCP persist-worker stats (#3796) ---
