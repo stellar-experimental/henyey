@@ -7056,6 +7056,105 @@ mod tests {
         );
     }
 
+    /// #3848: when the node is at/near tip with `tx_set_all_peers_exhausted`
+    /// set and the exhaustion has persisted past
+    /// `TX_SET_STUCK_FORCE_ESCAPE_SECS`, the wall-clock wedge escape must
+    /// BYPASS the at-tip / near-tip suppression guards so the full
+    /// state-clearing hard reset runs. Same pinned gap signals as
+    /// `test_hard_reset_skipped_near_tip_peer_gap_zero` (latest_ext one ahead,
+    /// verified peers not ahead → peer_gap 0, archive confirmed behind), but
+    /// with the wedge set — flipping the expected outcome from "skipped" to
+    /// "proceeds."
+    ///
+    /// Fails on origin/main: the unmodified `near_tip_peers_not_ahead` guard
+    /// returns `None` and never increments `post_catchup_hard_reset_total`.
+    #[tokio::test]
+    async fn test_hard_reset_proceeds_when_tx_set_wall_clock_wedged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Pinned near-tip signals identical to the sibling suppression test:
+        // latest_ext one ahead, verified peers NOT ahead (peer_gap == 0).
+        app.herder.scp_driver().record_externalized(
+            current_ledger as u64 + 1,
+            Default::default(),
+            None,
+        );
+        app.herder
+            .scp_driver()
+            .publish_externalized(current_ledger as u64 + 1);
+        app.max_verified_scp_slot
+            .store(current_ledger as u64, Ordering::Relaxed);
+
+        // Archive confirmed behind (the same steady-state as the incident).
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            };
+        }
+
+        // A pending tx_set to prove step 3 of the reset clears it.
+        let pending_hash = henyey_common::Hash256::from_bytes([7u8; 32]);
+        app.herder
+            .scp_driver()
+            .request_tx_set(pending_hash, current_ledger as u64 + 1);
+        assert!(
+            !app.herder.get_pending_tx_sets().is_empty(),
+            "precondition: a pending tx_set is tracked"
+        );
+
+        // Backdate start_instant so the cooldown does not block and the
+        // wall-clock elapsed is large (~500s).
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        // The wedge: all peers exhausted, onset well past the escape deadline
+        // (elapsed ~500s, onset offset 100s → 400s stuck >= TX_SET_STUCK_FORCE_ESCAPE_SECS).
+        app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
+        app.tx_set_exhausted_since.store(100, Ordering::SeqCst);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let _ = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindTxSetExhausted,
+            )
+            .await;
+
+        // The reset MUST have proceeded past the at-tip suppression: the
+        // counter increments only in the reset body (step 7).
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before + 1,
+            "wall-clock wedge must bypass the at-tip guard and run the reset"
+        );
+
+        // Step 3: pending tx_sets cleared.
+        assert!(
+            app.herder.get_pending_tx_sets().is_empty(),
+            "pending tx_sets must be cleared by the reset"
+        );
+
+        // Step 4 / self-clear (Critic A): reset_tx_set_tracking zeroes the
+        // wedge so it cannot immediately re-fire.
+        assert!(
+            !app.tx_set_all_peers_exhausted.load(Ordering::SeqCst),
+            "tx_set_all_peers_exhausted must be cleared by the reset"
+        );
+        assert_eq!(
+            app.tx_set_exhausted_since.load(Ordering::SeqCst),
+            0,
+            "tx_set_exhausted_since must be zeroed so the wedge self-clears"
+        );
+    }
+
     /// #3733 negative: when the node is genuinely behind the network — peers
     /// verifiably ahead (`effective_peer_gap >= 3`) even though `latest_ext`
     /// is only 1 ahead — the widened near-tip guard must NOT fire; the hard
