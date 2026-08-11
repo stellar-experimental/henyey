@@ -513,12 +513,17 @@ jobs:
             --enable ${{ matrix.enable }}
 
       - name: Run probes through wrapper
-        # DIAGNOSTIC fail-fast bound (#3286). Testnet sets
+        # Fail-fast bound (#3286) + hang unwedge (#3768). Testnet sets
         # matrix.step_timeout_minutes: 25 (tighter than its ~20-min healthy
-        # budget) so a hang here FAILS the STEP at ~25 min instead of running
-        # to the 45-min JOB cancel — a step-timeout marks the step *failed*, so
-        # the "Upload diagnostics" step (if: failure()) actually runs and the
-        # watchdog's process-tree dump is uploaded. All other shards have no
+        # budget) as a BACKSTOP. The primary defence is now the hang watchdog
+        # launched below: it unwedges the step at ~22 min (dump 1200s + escalate
+        # 120s) so the step reaches a terminal conclusion — a neutral-green
+        # soft-skip on this shard (#3272) — before EITHER this 25-min step bound
+        # or the 45-min JOB cancel. That matters because a job cancel loses the
+        # log blob, discards the watchdog dump, and disables the auto-retry
+        # (#3768); reaching any terminal conclusion avoids all three. The
+        # "Upload diagnostics" step below is `if: always()`, so the dump is
+        # retained on the green soft-skip path too. All other shards have no
         # step_timeout_minutes set and inherit the generous 360-min default
         # (a no-op under the job's 45-min cap), so they stay byte-identical.
         timeout-minutes: ${{ matrix.step_timeout_minutes || 360 }}
@@ -561,23 +566,29 @@ jobs:
           fi
           DIAG_DIR="/tmp/quickstart-diagnostics"
 
-          # ---- DIAGNOSTIC hang watchdog (#3286), testnet shard only ----
+          # ---- hang watchdog + unwedge (#3286 dump, #3768 unwedge), testnet ----
           # Capture the step shell's PID HERE, in the step body — NOT inside a
           # subshell and NOT via $BASHPID — so the backgrounded watchdog can
           # dump the fds THIS shell holds. The watchdog sleeps WATCHDOG_DELAY
-          # (default 1200s = 20 min, < the 25-min step_timeout_minutes bound)
-          # then writes a process-tree + open-fd snapshot to the diagnostics
-          # dir, so on the next hang the dump is on disk BEFORE the step kill
-          # and gets swept into the uploaded artifact. It is reaped on the
-          # healthy path (trap EXIT + explicit kill after the loop) so it never
-          # lingers or emits a spurious dump on a passing run. This does NOT fix
-          # the hang — its deliverable is DATA from the next hang.
+          # (default 1200s = 20 min) then writes a process-tree + open-fd
+          # snapshot, and after WATCHDOG_ESCALATE_DELAY (default 120s) escalates:
+          # `docker kill quickstart` + `pkill -9` of the lingering probe, so the
+          # foreground probe returns and the step reaches a terminal conclusion
+          # (a neutral-green soft-skip on this shard, #3272) BEFORE the 45-min job
+          # cancel that would otherwise lose the log blob + dump + auto-retry.
+          # Timing invariant: healthy budget 1200s < dump 1200s + escalate 120s =
+          # 1320s < 25-min step bound 1500s < 45-min job cap 2700s. The escalation
+          # is destructive, so it fires only after the healthy budget; on a
+          # passing run the probe loop finishes early and the trap/explicit kill
+          # below reaps the whole subshell before EITHER timer fires, so neither
+          # the dump nor the docker kill ever happens. The `quickstart` 3rd arg
+          # is the container `Run quickstart container` created above.
           STEP_PID=$$
           WATCHDOG_PID=""
           if [[ "$NETWORK" == "testnet" ]]; then
             ( sleep "${WATCHDOG_DELAY:-1200}"; \
               bash scripts/ci/quickstart-hang-watchdog.sh \
-                "$DIAG_DIR/testnet-hang-watchdog" "$STEP_PID" ) &
+                "$DIAG_DIR/testnet-hang-watchdog" "$STEP_PID" quickstart ) &
             WATCHDOG_PID=$!
             # Reap the watchdog on any step exit so a passing run never leaks
             # the backgrounded sleep.
@@ -608,18 +619,25 @@ jobs:
             kill "$WATCHDOG_PID" 2>/dev/null || true
           fi
 
-      - name: Upload diagnostics on failure
-        # DIAGNOSTIC instrumentation (#3286): upload on BOTH a step-timeout
-        # failure (the primary path — a testnet step_timeout_minutes kill marks
-        # the step failed, so failure() fires) AND a residual job-level cancel
-        # (belt-and-suspenders). The watchdog writes its dump before the step
-        # kill, so the artifact exists for either disposition.
-        if: ${{ failure() || cancelled() }}
+      - name: Upload diagnostics
+        # Upload on `if: always()` (#3768). The testnet hang's intended terminal
+        # disposition is a NEUTRAL GREEN soft-skip (#3272) — the correct call for
+        # an environmental testnet wedge, and the one that keeps the merge gate
+        # unblocked — so gating the upload on `failure() || cancelled()` (as
+        # #3286 did) silently discarded the watchdog dump and soft-skip
+        # diagnostics on exactly that green path. `always()` is a strict superset:
+        # it fires on the green soft-skip AND on any residual failure/cancel, so
+        # the dump + attempt-* dirs are retained in every case. The watchdog
+        # writes its dump before the step concludes, so the artifact exists.
+        # `if-no-files-found: ignore` keeps the now-unconditional upload quiet on
+        # all-green non-testnet shards whose diagnostics dir is empty.
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: quickstart-diagnostics-${{ matrix.network }}-${{ matrix.enable }}
           path: /tmp/quickstart-diagnostics/
           retention-days: 7
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
