@@ -8,6 +8,8 @@
 //! tracing fields for machine parsing.
 
 use henyey_common::memory::ComponentMemory;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 /// Name of the structured tracing field emitted by [`MemoryReport::log`].
@@ -375,6 +377,89 @@ pub fn log_startup_memory(phase: &str) {
     crate::peak_rss_sampler::note_checkpoint(phase);
 }
 
+/// Emit a cheap single-line memory *sample* every ledger close (#3759).
+///
+/// The full [`MemoryReport::log`] runs only every 64 ledgers (~5 min) and walks
+/// every component, so it is too heavy to run per-close and — sampling at an
+/// arbitrary phase relative to a 60 s allocation cycle — aliases short-period
+/// RSS swings. This function reuses the same `/proc` + jemalloc captures as the
+/// full report (process RSS split, jemalloc allocated/resident, the exact
+/// `arena_small`/`large`/`huge` size-class split, and fragmentation) and emits
+/// them as **one** structured line at ~5 s cadence — well under the Nyquist
+/// bound for a 60 s cycle — so both the trough and peak of the sawtooth land in
+/// the log stream.
+///
+/// The line carries a **distinct** `memory_sample = true` field. It deliberately
+/// does **not** emit the reserved `memory_report = true` field (see
+/// [`MEMORY_REPORT_FIELD`] and the `test_memory_report_emits_field_*` contract):
+/// monitoring consumers grep the two independently. There is no per-component
+/// walk — that is what keeps it cheap enough to run on every close.
+///
+/// **Wall-clock throttle.** Steady-state closes are ~5 s apart, so every close
+/// emits a sample. But `LedgerCloseContext::commit` also runs on the catchup
+/// replay path (`replay_via_close_ledger`), where many ledgers close per second
+/// — a per-close `info!` line there is pure log-volume noise. To avoid that
+/// (flagged in PR #3843 review), samples are throttled to at most one per
+/// [`MIN_SAMPLE_INTERVAL_MS`]. That interval (1 s) is far under the Nyquist
+/// bound for the 60 s RSS sawtooth, so the steady-state sampling this exists for
+/// is unaffected, while catchup collapses to ≤1 line/s.
+pub fn log_periodic_sample(ledger_seq: u32) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last_ms = LAST_SAMPLE_UNIX_MS.load(Ordering::Relaxed);
+    if !should_emit_sample(now_ms, last_ms) {
+        return;
+    }
+    LAST_SAMPLE_UNIX_MS.store(now_ms, Ordering::Relaxed);
+    emit_memory_sample(ledger_seq);
+}
+
+/// Minimum wall-clock spacing between emitted memory samples (see
+/// [`log_periodic_sample`]).
+const MIN_SAMPLE_INTERVAL_MS: u64 = 1_000;
+
+/// Wall-clock time (ms since UNIX epoch) the last sample was emitted; `0` = never.
+static LAST_SAMPLE_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Pure throttle decision, factored out for deterministic testing. Emits when at
+/// least [`MIN_SAMPLE_INTERVAL_MS`] has elapsed since the last sample. A `now_ms`
+/// of `0` (clock read failed) fails open so a broken clock degrades to per-close
+/// emission rather than silence.
+fn should_emit_sample(now_ms: u64, last_ms: u64) -> bool {
+    now_ms == 0 || now_ms.saturating_sub(last_ms) >= MIN_SAMPLE_INTERVAL_MS
+}
+
+/// Emit the actual single-line memory sample (unthrottled). Split out from
+/// [`log_periodic_sample`] so the throttle wrapper stays testable in isolation.
+fn emit_memory_sample(ledger_seq: u32) {
+    let pm = ProcessMemory::capture();
+    let alloc = AllocatorStats::capture();
+    let (small, large, huge) = alloc.arena_split();
+    let to_mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let fragmentation_pct = if alloc.allocated > 0 {
+        (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    info!(
+        memory_sample = true,
+        ledger_seq = ledger_seq,
+        rss_mb = format!("{:.0}", to_mb(pm.rss_bytes)),
+        anon_rss_mb = format!("{:.0}", to_mb(pm.anon_rss_bytes)),
+        file_rss_mb = format!("{:.0}", to_mb(pm.file_rss_bytes)),
+        jemalloc_allocated_mb = format!("{:.0}", to_mb(alloc.allocated)),
+        jemalloc_resident_mb = format!("{:.0}", to_mb(alloc.resident)),
+        arena_small_mb = format!("{:.0}", to_mb(small)),
+        arena_large_mb = format!("{:.0}", to_mb(large)),
+        arena_huge_mb = format!("{:.0}", to_mb(huge)),
+        fragmentation_pct = format!("{:.1}", fragmentation_pct),
+        "Memory sample"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +770,117 @@ mod memory_report_field_tests {
             output.contains("\"memory_report\":true"),
             "JSON format must render field as '\"memory_report\":true' for grep. Got: {output}"
         );
+    }
+
+    /// Issue #3759: `log_periodic_sample` emits exactly one event carrying the
+    /// distinct `memory_sample = true` field, and must NOT emit the reserved
+    /// `memory_report = true` field (whose exclusivity contract is guarded by
+    /// `test_memory_report_emits_field_structured`). This is the cheap per-close
+    /// line that resolves the 60 s RSS sawtooth in the log stream.
+    #[test]
+    fn test_periodic_sample_emits_distinct_field() {
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct FieldFlags {
+            has_sample: bool,
+            has_report: bool,
+        }
+        impl Visit for FieldFlags {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if value && field.name() == "memory_sample" {
+                    self.has_sample = true;
+                }
+                if value && field.name() == MEMORY_REPORT_FIELD {
+                    self.has_report = true;
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct SampleFieldSubscriber {
+            sample_count: Arc<AtomicUsize>,
+            report_count: Arc<AtomicUsize>,
+            total_events: Arc<AtomicUsize>,
+        }
+        impl Subscriber for SampleFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                self.total_events.fetch_add(1, Ordering::SeqCst);
+                let mut flags = FieldFlags::default();
+                event.record(&mut flags);
+                if flags.has_sample {
+                    self.sample_count.fetch_add(1, Ordering::SeqCst);
+                }
+                if flags.has_report {
+                    self.report_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let sub = SampleFieldSubscriber::default();
+        let sample_count = sub.sample_count.clone();
+        let report_count = sub.report_count.clone();
+        let total_events = sub.total_events.clone();
+
+        // Reset the wall-clock throttle so this call is guaranteed to emit,
+        // independent of any other sample this test binary may have taken.
+        LAST_SAMPLE_UNIX_MS.store(0, Ordering::Relaxed);
+        with_default(sub, || {
+            log_periodic_sample(4242);
+        });
+
+        assert_eq!(
+            sample_count.load(Ordering::SeqCst),
+            1,
+            "log_periodic_sample() must emit exactly one event with memory_sample=true"
+        );
+        assert_eq!(
+            report_count.load(Ordering::SeqCst),
+            0,
+            "log_periodic_sample() must NOT emit the reserved {MEMORY_REPORT_FIELD} field"
+        );
+        assert_eq!(
+            total_events.load(Ordering::SeqCst),
+            1,
+            "log_periodic_sample() must emit exactly one (single-line) event"
+        );
+    }
+
+    /// Issue #3759 / PR #3843: the wall-clock throttle in `log_periodic_sample`
+    /// suppresses back-to-back samples closer than `MIN_SAMPLE_INTERVAL_MS`.
+    /// This is what keeps catchup replay (many closes/sec) from emitting one
+    /// info line per replayed ledger, while leaving steady-state per-close
+    /// sampling (closes ~5 s apart) untouched.
+    #[test]
+    fn test_periodic_sample_throttle_decision() {
+        // Never sampled before ⇒ emit.
+        assert!(should_emit_sample(1_000_000, 0));
+        // Exactly at the interval boundary ⇒ emit.
+        assert!(should_emit_sample(10_000 + MIN_SAMPLE_INTERVAL_MS, 10_000));
+        // Just under the interval (catchup: many closes/sec) ⇒ suppress.
+        assert!(!should_emit_sample(
+            10_000 + MIN_SAMPLE_INTERVAL_MS - 1,
+            10_000
+        ));
+        // Same-millisecond close ⇒ suppress.
+        assert!(!should_emit_sample(10_000, 10_000));
+        // Clock read failed (now_ms == 0) ⇒ fail open (emit).
+        assert!(should_emit_sample(0, 10_000));
     }
 
     /// A `Write` adapter that appends to a shared `Vec<u8>`.

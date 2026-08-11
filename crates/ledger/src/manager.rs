@@ -7022,6 +7022,11 @@ impl LedgerCloseContext<'_> {
             "Ledger close timing"
         );
 
+        // Cheap per-close memory sample (~5 s cadence). One structured line
+        // (`memory_sample = true`), no per-component walk — resolves the 60 s
+        // RSS sawtooth (#3759) that the every-64-ledger full report aliases.
+        crate::memory_report::log_periodic_sample(new_header.ledger_seq);
+
         // Periodic memory report (every 64 ledgers, ~5 minutes)
         if new_header.ledger_seq % 64 == 0 {
             let report = self.manager.build_memory_report(new_header.ledger_seq);
