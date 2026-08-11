@@ -145,6 +145,15 @@ jobs:
       - name: Verify shell-lib helpers source clean under bash and zsh
         run: bash scripts/test-shell-lib-cross-shell.sh
 
+  cargo-target-reaper:
+    name: Cargo-Target Reaper
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cargo-target-reaper test harness
+        run: bash scripts/cargo-target-reaper.test.sh
+
   quickstart-harness:
     name: Quickstart Harness
     runs-on: ubuntu-latest
