@@ -121,7 +121,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/scrape_identity` | process identity of the scrape now in prev.prom | check 12 |
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
 | `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
-| `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
+| `metrics/anomaly_cooldown.json` | alert dedup state (written by the evaluator via `--cooldown-file`; #3762) | check 12 |
 | `obsrvr-not-indexed.state` | OBSRVR Radar `not-indexed` streak counter + one-shot escalation marker (`eval_obsrvr_not_indexed_streak`) | check 9 |
 | `metrics/archive/` | Per-tick snapshot dirs (current.prom + prev.prom + metadata.env), rolling 500, atomic write | check 12 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
@@ -1485,8 +1485,18 @@ eval_result=$(python3 scripts/lib/eval-alarms.py \
     --catalog .claude/skills/shared/metric-alarms.toml \
     --current "$HOME/data/$MONITOR_SESSION_ID/metrics/current.prom" \
     --prev "$HOME/data/$MONITOR_SESSION_ID/metrics/prev.prom" \
-    --state-dir "$HOME/data/$MONITOR_SESSION_ID/metrics")
+    --state-dir "$HOME/data/$MONITOR_SESSION_ID/metrics" \
+    --cooldown-file "$HOME/data/$MONITOR_SESSION_ID/metrics/anomaly_cooldown.json")
 ```
+
+> **Cooldown is now mechanized (#3762).** Passing `--cooldown-file` makes the
+> evaluator own the whole alarm-dedup lifecycle: it reads
+> `anomaly_cooldown.json`, flips any metrics-family alarm still inside its
+> `cooldown_seconds` window to `state == "cooldown"` (excluded from the firing
+> count, so it is neither banner-flipping nor filed), and writes `last_fired`
+> for the ones it reports `firing`. There is **no manual JSON edit** — do not
+> hand-write `last_fired`, and do not apply your own window check. The window
+> uses the catalog `cooldown_seconds` (authoritative), not a hard-coded value.
 
 > **Caution (#3209):** This canonical per-tick run is invoked **exactly once** and
 > advances the streak/ratio snapshots. Any ad-hoc or repeat/diagnostic eval
@@ -1686,32 +1696,49 @@ Examples:
 - Skipped: `recovery_stalled: skipped (metric missing)`
 - Baseline: `recovery_stalled: collecting baseline`
 
-### Firing alerts — cooldown + filing
+### Firing alerts — filing
 
-For each firing alert:
+**Cooldown is handled by the evaluator, not by hand (#3762).** Because the
+canonical run passes `--cooldown-file`, the tool has already suppressed every
+metrics-family alarm still inside its window (reporting it as
+`state == "cooldown"`, excluded from the firing count) and already written
+`last_fired` for the ones it reports `firing`. There is **no `anomaly_cooldown.json`
+read, no window check, and no post-fire JSON write to do here** — only file the
+alarms the tool still reports as `firing`.
 
-1. Read `/home/tomer/data/$MONITOR_SESSION_ID/metrics/anomaly_cooldown.json`
-   (create empty `{}` if missing).
-2. If `now - last_filed[<metric>] < 7200s` (2h), include the alert in the
-   status report but SKIP file/comment.
-3. Otherwise follow the BUG FILING WORKFLOW:
-   - Search `gh issue list --search "metrics: <metric-name>" --state open`.
-   - If one matches, `gh issue comment <N>` with the new evidence (current/prev
-     values, delta, threshold, ledger, binary sha, sibling metrics). Apply the
-     `urgent` label only if the metric breach blocks validator operation (per
-     the Label policy in the Bug filing workflow); otherwise leave unlabeled.
-     **Board-route:** if NOT on project board, add to Backlog.
-   - If no match, `gh issue create` (append `--label urgent` only when the
-     metric breach is operation-blocking; most metric alerts are non-urgent
-     and should be filed without a label) with:
-     - Title: `Non-critical: metrics: <metric>` (NONC tier) or `metrics: <metric> — <symptom>` (WARN/SYNC tier).
-     - Body: current/prev values, delta, threshold, ledger, binary sha, related
-       sibling metrics, file:line citation from `grep -n "<metric_name_without_prefix>" crates/ -r`,
-       and a suggested fix.
-     **Board-route:** `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
-4. Update `anomaly_cooldown.json` with `{"<metric>": <now>}`.
-5. For SYNC-tier alerts, ALSO update the `sync:` line in the status report
+For each alarm with `state == "firing"`, follow the BUG FILING WORKFLOW:
+
+1. Search `gh issue list --search "metrics: <metric-name>" --state open`.
+2. If one matches, `gh issue comment <N>` with the new evidence (current/prev
+   values, delta, threshold, ledger, binary sha, sibling metrics). Apply the
+   `urgent` label only if the metric breach blocks validator operation (per
+   the Label policy in the Bug filing workflow); otherwise leave unlabeled.
+   **Board-route:** if NOT on project board, add to Backlog.
+3. If no match, `gh issue create` (append `--label urgent` only when the
+   metric breach is operation-blocking; most metric alerts are non-urgent
+   and should be filed without a label) with:
+   - Title: `Non-critical: metrics: <metric>` (NONC tier) or `metrics: <metric> — <symptom>` (WARN/SYNC tier).
+   - Body: current/prev values, delta, threshold, ledger, binary sha, related
+     sibling metrics, file:line citation from `grep -n "<metric_name_without_prefix>" crates/ -r`,
+     and a suggested fix.
+   **Board-route:** `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
+4. For SYNC-tier alerts, ALSO update the `sync:` line in the status report
    (not just `metrics:`).
+
+Alarms reported as `state == "cooldown"` are already-filed duplicates inside
+their dedup window: report them on the `metrics:` line as suppressed, but do
+NOT file or comment.
+
+**Exception — recovery_stalled (Check 12b, counter-streak):** the evaluator's
+`--cooldown-file` mechanization is scoped to the metrics family only; it does
+**not** auto-suppress the `recovery_stalled` counter-streak alarm (its
+`recovery_stalled:` render line has no `cooldown` state). For that alarm the
+manual dedup still applies: before filing, read
+`anomaly_cooldown.json`; if `now - last_fired[<cooldown_key>] < cooldown_seconds`
+(7200s), report on the `recovery_stalled:` line but SKIP file/comment; after
+filing, write `{"<cooldown_key>": {"last_fired": <now>, "cooldown_seconds": 7200}}`
+back (dict form, matching the evaluator's normalized schema). This is the only
+alarm that still needs a hand-performed cooldown edit.
 
 ### Watcher mode
 
