@@ -2621,6 +2621,49 @@ mod tests {
         );
     }
 
+    /// Issue #3759: the three live process-RSS gauges are in the gauge catalog,
+    /// pre-registered at 0, and rendered by the recorder. These give the metrics
+    /// archive a retroactive view of the 60 s / 2.76 GB RSS sawtooth that the
+    /// allocator-view (`henyey_jemalloc_resident_bytes`) and one-shot startup
+    /// peak gauges cannot capture. Mirrors the #3226 startup-peak-gauge pattern.
+    #[test]
+    fn test_process_rss_gauges_in_catalog() {
+        let gauge_names: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
+        let prereg: HashSet<&str> = ALL_PREREGISTERED_GAUGE_NAMES.iter().copied().collect();
+        for name in [
+            "henyey_process_resident_memory_bytes",
+            "henyey_process_anon_resident_memory_bytes",
+            "henyey_process_file_resident_memory_bytes",
+        ] {
+            assert!(
+                gauge_names.contains(name),
+                "{name} missing from gauge catalog"
+            );
+            assert!(
+                prereg.contains(name),
+                "{name} must be pre-registered at 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_rss_gauges_rendered() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+        for name in [
+            "henyey_process_resident_memory_bytes",
+            "henyey_process_anon_resident_memory_bytes",
+            "henyey_process_file_resident_memory_bytes",
+        ] {
+            assert!(
+                output.contains(name),
+                "{name} not found in rendered metrics"
+            );
+        }
+    }
+
     /// Stage E: 16 history counters and 1 histogram are present in the
     /// catalog with the exact wire names referenced from the `henyey-history`
     /// and `henyey-historywork` crates (which use string literals, not

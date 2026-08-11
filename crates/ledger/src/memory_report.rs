@@ -687,6 +687,92 @@ mod memory_report_field_tests {
         );
     }
 
+    /// Issue #3759: `log_periodic_sample` emits exactly one event carrying the
+    /// distinct `memory_sample = true` field, and must NOT emit the reserved
+    /// `memory_report = true` field (whose exclusivity contract is guarded by
+    /// `test_memory_report_emits_field_structured`). This is the cheap per-close
+    /// line that resolves the 60 s RSS sawtooth in the log stream.
+    #[test]
+    fn test_periodic_sample_emits_distinct_field() {
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct FieldFlags {
+            has_sample: bool,
+            has_report: bool,
+        }
+        impl Visit for FieldFlags {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if value && field.name() == "memory_sample" {
+                    self.has_sample = true;
+                }
+                if value && field.name() == MEMORY_REPORT_FIELD {
+                    self.has_report = true;
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct SampleFieldSubscriber {
+            sample_count: Arc<AtomicUsize>,
+            report_count: Arc<AtomicUsize>,
+            total_events: Arc<AtomicUsize>,
+        }
+        impl Subscriber for SampleFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                self.total_events.fetch_add(1, Ordering::SeqCst);
+                let mut flags = FieldFlags::default();
+                event.record(&mut flags);
+                if flags.has_sample {
+                    self.sample_count.fetch_add(1, Ordering::SeqCst);
+                }
+                if flags.has_report {
+                    self.report_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let sub = SampleFieldSubscriber::default();
+        let sample_count = sub.sample_count.clone();
+        let report_count = sub.report_count.clone();
+        let total_events = sub.total_events.clone();
+
+        with_default(sub, || {
+            log_periodic_sample(4242);
+        });
+
+        assert_eq!(
+            sample_count.load(Ordering::SeqCst),
+            1,
+            "log_periodic_sample() must emit exactly one event with memory_sample=true"
+        );
+        assert_eq!(
+            report_count.load(Ordering::SeqCst),
+            0,
+            "log_periodic_sample() must NOT emit the reserved {MEMORY_REPORT_FIELD} field"
+        );
+        assert_eq!(
+            total_events.load(Ordering::SeqCst),
+            1,
+            "log_periodic_sample() must emit exactly one (single-line) event"
+        );
+    }
+
     /// A `Write` adapter that appends to a shared `Vec<u8>`.
     #[derive(Clone)]
     struct BufWriter(Arc<Mutex<Vec<u8>>>);
