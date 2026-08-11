@@ -8,6 +8,8 @@
 //! tracing fields for machine parsing.
 
 use henyey_common::memory::ComponentMemory;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 /// Name of the structured tracing field emitted by [`MemoryReport::log`].
@@ -392,7 +394,46 @@ pub fn log_startup_memory(phase: &str) {
 /// [`MEMORY_REPORT_FIELD`] and the `test_memory_report_emits_field_*` contract):
 /// monitoring consumers grep the two independently. There is no per-component
 /// walk — that is what keeps it cheap enough to run on every close.
+///
+/// **Wall-clock throttle.** Steady-state closes are ~5 s apart, so every close
+/// emits a sample. But `LedgerCloseContext::commit` also runs on the catchup
+/// replay path (`replay_via_close_ledger`), where many ledgers close per second
+/// — a per-close `info!` line there is pure log-volume noise. To avoid that
+/// (flagged in PR #3843 review), samples are throttled to at most one per
+/// [`MIN_SAMPLE_INTERVAL_MS`]. That interval (1 s) is far under the Nyquist
+/// bound for the 60 s RSS sawtooth, so the steady-state sampling this exists for
+/// is unaffected, while catchup collapses to ≤1 line/s.
 pub fn log_periodic_sample(ledger_seq: u32) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last_ms = LAST_SAMPLE_UNIX_MS.load(Ordering::Relaxed);
+    if !should_emit_sample(now_ms, last_ms) {
+        return;
+    }
+    LAST_SAMPLE_UNIX_MS.store(now_ms, Ordering::Relaxed);
+    emit_memory_sample(ledger_seq);
+}
+
+/// Minimum wall-clock spacing between emitted memory samples (see
+/// [`log_periodic_sample`]).
+const MIN_SAMPLE_INTERVAL_MS: u64 = 1_000;
+
+/// Wall-clock time (ms since UNIX epoch) the last sample was emitted; `0` = never.
+static LAST_SAMPLE_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Pure throttle decision, factored out for deterministic testing. Emits when at
+/// least [`MIN_SAMPLE_INTERVAL_MS`] has elapsed since the last sample. A `now_ms`
+/// of `0` (clock read failed) fails open so a broken clock degrades to per-close
+/// emission rather than silence.
+fn should_emit_sample(now_ms: u64, last_ms: u64) -> bool {
+    now_ms == 0 || now_ms.saturating_sub(last_ms) >= MIN_SAMPLE_INTERVAL_MS
+}
+
+/// Emit the actual single-line memory sample (unthrottled). Split out from
+/// [`log_periodic_sample`] so the throttle wrapper stays testable in isolation.
+fn emit_memory_sample(ledger_seq: u32) {
     let pm = ProcessMemory::capture();
     let alloc = AllocatorStats::capture();
     let (small, large, huge) = alloc.arena_split();
@@ -796,6 +837,9 @@ mod memory_report_field_tests {
         let report_count = sub.report_count.clone();
         let total_events = sub.total_events.clone();
 
+        // Reset the wall-clock throttle so this call is guaranteed to emit,
+        // independent of any other sample this test binary may have taken.
+        LAST_SAMPLE_UNIX_MS.store(0, Ordering::Relaxed);
         with_default(sub, || {
             log_periodic_sample(4242);
         });
@@ -815,6 +859,28 @@ mod memory_report_field_tests {
             1,
             "log_periodic_sample() must emit exactly one (single-line) event"
         );
+    }
+
+    /// Issue #3759 / PR #3843: the wall-clock throttle in `log_periodic_sample`
+    /// suppresses back-to-back samples closer than `MIN_SAMPLE_INTERVAL_MS`.
+    /// This is what keeps catchup replay (many closes/sec) from emitting one
+    /// info line per replayed ledger, while leaving steady-state per-close
+    /// sampling (closes ~5 s apart) untouched.
+    #[test]
+    fn test_periodic_sample_throttle_decision() {
+        // Never sampled before ⇒ emit.
+        assert!(should_emit_sample(1_000_000, 0));
+        // Exactly at the interval boundary ⇒ emit.
+        assert!(should_emit_sample(10_000 + MIN_SAMPLE_INTERVAL_MS, 10_000));
+        // Just under the interval (catchup: many closes/sec) ⇒ suppress.
+        assert!(!should_emit_sample(
+            10_000 + MIN_SAMPLE_INTERVAL_MS - 1,
+            10_000
+        ));
+        // Same-millisecond close ⇒ suppress.
+        assert!(!should_emit_sample(10_000, 10_000));
+        // Clock read failed (now_ms == 0) ⇒ fail open (emit).
+        assert!(should_emit_sample(0, 10_000));
     }
 
     /// A `Write` adapter that appends to a shared `Vec<u8>`.
