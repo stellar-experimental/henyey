@@ -1979,6 +1979,35 @@ impl App {
         let archive_latest = match archive_latest {
             Some(latest) => latest,
             None => {
+                // ── #3848 wall-clock wedge escape (BEFORE the near-tip /
+                // far-behind split) ─────────────────────────────────────
+                // The archive is not ahead (this whole block), so the
+                // near-tip branch below would route every tick into peer-SCP
+                // back-fill + retry_exhausted_tx_sets and return None. That is
+                // correct while peers CAN eventually serve the slot, but when
+                // all peers have been exhausted for the tx_set past the
+                // wall-clock deadline, no retry produces the missing hash and
+                // no gap signal (latest_ext, peer_gap) ever moves — the node
+                // wedges at tip (the 5m39s incident). Force the state-clearing
+                // hard reset here, ahead of the split, so the escape is
+                // reachable even when the archive-confirmed-behind sub-state is
+                // not (yet) set (placement moved earlier per Critic A). The
+                // hard reset's internal cooldown / livelock breaker still
+                // apply; on suppression it returns None and we fall through to
+                // the existing near-tip / far-behind handling below.
+                if self.tx_set_wall_clock_wedged() {
+                    use super::types::HardResetReason;
+                    if let Some(pc) = self
+                        .force_post_catchup_hard_reset(
+                            current_ledger,
+                            HardResetReason::ArchiveBehindTxSetExhausted,
+                        )
+                        .await
+                    {
+                        return Some(pc);
+                    }
+                }
+
                 // ── Peer-ahead hard-reset escalation (issue #2349) ──────
                 // When the archive is confirmed behind AND verified peers
                 // are ahead by a meaningful gap AND we've been stuck for
