@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=446
+TAP_PLAN=456
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2228,6 +2228,186 @@ PYEOF
     fi
   else
     tap_skip "stuck-alive: heartbeat-fallback under zsh (#3579)" "zsh not found"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # classify_event_loop_stall (T63els1–T63els10) — issue #3815
+  # Source: scripts/lib/monitor-decisions.sh — monitor-tick sub-check (3f)
+  # "Recovered event-loop stall policy".
+  #
+  # Contract: classify_event_loop_stall LOG_FILE STATE_FILE [NOW_EPOCH]
+  #   Counts recovered ERROR-tier loop-side stall lines (#3795's
+  #   `Event loop stall (loop-side exact accounting)` + `stall_recovered=true`)
+  #   whose timestamps fall inside a rolling STALL_WINDOW_SEC (7200s), then
+  #   applies an explicit policy:
+  #     none    — no recovered ERROR stall in window
+  #     alert   — 1..(MAX_RECOVERED_STALLS-1) in window, OR restart suppressed
+  #               by the STALL_COOLDOWN_SEC guard (alert-only, no restart)
+  #     restart — >= MAX_RECOVERED_STALLS (default 3) in window, cooldown clear
+  #   Sets EVENT_LOOP_STALL_VERDICT and EVENT_LOOP_STALL_COUNT. Sole reader/
+  #   writer of STATE_FILE (only last_restart_epoch persisted). NOW_EPOCH is
+  #   injectable for deterministic tests. The (3b)-wedge `watchdog_freeze=true`
+  #   ERROR line is NOT counted here — it carries neither the loop-side message
+  #   nor `stall_recovered`, so it stays with (3b). Missing/corrupt state or
+  #   unparseable timestamps fail inert toward none/alert, never restart.
+  #
+  # RED on origin/main: the function does not exist there, so any call aborts
+  # the harness with "command not found" (set -euo pipefail). GREEN after #3815.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  local NOW_ELS=1700000000            # fixed reference for event-loop-stall tests
+  local els_dir="$TEST_ROOT/event-loop-stall"
+  mkdir -p "$els_dir"
+
+  # Helper: append one loop-side stall log line at a given epoch/level/field-form.
+  # $1=file $2=epoch $3=level(ERROR|WARN) $4=field-form(text|json)
+  _els_line() {
+    local f="$1" ep="$2" lvl="$3" form="$4"
+    local ts field
+    ts=$(date -u -d "@$ep" "+%Y-%m-%dT%H:%M:%S.000000Z" 2>/dev/null)
+    if [[ "$form" == "json" ]]; then field='"stall_recovered":true'; else field='stall_recovered=true'; fi
+    printf '%s %s henyey_app::app::watchdog: Event loop stall (loop-side exact accounting) %s stall_ms=35000 stall_secs=35 phase=3\n' \
+      "$ts" "$lvl" "$field" >> "$f"
+  }
+
+  # ── Test 63els1: single recovered ERROR stall in window → alert (no restart) ─
+  local els1_log="$els_dir/1.log" els1_st="$els_dir/1.state"
+  : > "$els1_log"
+  _els_line "$els1_log" "$((NOW_ELS - 100))" ERROR text
+  classify_event_loop_stall "$els1_log" "$els1_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "alert" && "$EVENT_LOOP_STALL_COUNT" == "1" ]]; then
+    tap_ok "event-loop-stall: single recovered ERROR stall in window → alert (count=1)"
+  else
+    tap_not_ok "event-loop-stall: single recovered ERROR stall in window → alert" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els2: MAX_RECOVERED_STALLS (3) in window, fresh state → restart ──
+  local els2_log="$els_dir/2.log" els2_st="$els_dir/2.state"
+  : > "$els2_log"
+  _els_line "$els2_log" "$((NOW_ELS - 300))" ERROR text
+  _els_line "$els2_log" "$((NOW_ELS - 200))" ERROR text
+  _els_line "$els2_log" "$((NOW_ELS - 100))" ERROR text
+  classify_event_loop_stall "$els2_log" "$els2_st" "$NOW_ELS"
+  local els2_last
+  els2_last=$(grep '^last_restart_epoch=' "$els2_st" 2>/dev/null | cut -d= -f2)
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "restart" && "$EVENT_LOOP_STALL_COUNT" == "3" \
+        && "$els2_last" == "$NOW_ELS" ]]; then
+    tap_ok "event-loop-stall: 3 recovered ERROR stalls in window → restart (last_restart recorded)"
+  else
+    tap_not_ok "event-loop-stall: 3 recovered ERROR stalls in window → restart" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT last_restart=$els2_last"
+  fi
+
+  # ── Test 63els3: prune boundary — line just OUTSIDE window is excluded ──────
+  # 2 in-window + 1 at exactly NOW-7201 (age >= STALL_WINDOW_SEC → pruned). If
+  # the boundary line were wrongly counted, count=3 → restart; correct prune
+  # yields count=2 → alert.
+  local els3_log="$els_dir/3.log" els3_st="$els_dir/3.state"
+  : > "$els3_log"
+  _els_line "$els3_log" "$((NOW_ELS - 100))" ERROR text
+  _els_line "$els3_log" "$((NOW_ELS - 200))" ERROR text
+  _els_line "$els3_log" "$((NOW_ELS - 7201))" ERROR text
+  classify_event_loop_stall "$els3_log" "$els3_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "alert" && "$EVENT_LOOP_STALL_COUNT" == "2" ]]; then
+    tap_ok "event-loop-stall: just-outside-window stall pruned → alert (count=2, boundary excluded)"
+  else
+    tap_not_ok "event-loop-stall: just-outside-window stall pruned → alert (count=2)" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els4: WARN-tier recovered stall only → none ─────────────────────
+  # A sub-30s stall renders at WARN; only the ERROR tier (>=30s) drives policy.
+  local els4_log="$els_dir/4.log" els4_st="$els_dir/4.state"
+  : > "$els4_log"
+  _els_line "$els4_log" "$((NOW_ELS - 100))" WARN text
+  classify_event_loop_stall "$els4_log" "$els4_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "none" && "$EVENT_LOOP_STALL_COUNT" == "0" ]]; then
+    tap_ok "event-loop-stall: WARN-tier recovered stall only → none (ERROR tier drives policy)"
+  else
+    tap_not_ok "event-loop-stall: WARN-tier recovered stall only → none" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els5: watchdog_freeze ERROR line is NOT counted (belongs to 3b) ──
+  # The unrecovered-wedge line carries neither the loop-side message nor
+  # stall_recovered, so (3f) must ignore it entirely.
+  local els5_log="$els_dir/5.log" els5_st="$els_dir/5.state"
+  printf '%s ERROR henyey_app::app::watchdog: WATCHDOG: Event loop appears frozen! watchdog_freeze=true\n' \
+    "$(date -u -d "@$((NOW_ELS - 100))" "+%Y-%m-%dT%H:%M:%S.000000Z")" > "$els5_log"
+  classify_event_loop_stall "$els5_log" "$els5_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "none" && "$EVENT_LOOP_STALL_COUNT" == "0" ]]; then
+    tap_ok "event-loop-stall: watchdog_freeze ERROR line not counted → none (3b owns it)"
+  else
+    tap_not_ok "event-loop-stall: watchdog_freeze ERROR line not counted → none" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els6: corrupt state file → non-restart (fails inert) ────────────
+  # A single in-window stall with a garbage state file: last_restart_epoch must
+  # fall back to 0 without crashing, and the verdict must be alert (never a
+  # spurious restart).
+  local els6_log="$els_dir/6.log" els6_st="$els_dir/6.state"
+  : > "$els6_log"
+  _els_line "$els6_log" "$((NOW_ELS - 100))" ERROR text
+  printf 'garbage\nlast_restart_epoch=not-a-number\n===\n' > "$els6_st"
+  classify_event_loop_stall "$els6_log" "$els6_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "alert" ]]; then
+    tap_ok "event-loop-stall: corrupt state file → alert (fails inert, non-restart)"
+  else
+    tap_not_ok "event-loop-stall: corrupt state file → alert (fails inert)" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els7: restart cooldown suppresses a second restart → alert ──────
+  # 3 in-window stalls (would restart) but last_restart_epoch is 300s ago
+  # (< STALL_COOLDOWN_SEC=900) → restart suppressed, verdict alert-only.
+  local els7_log="$els_dir/7.log" els7_st="$els_dir/7.state"
+  : > "$els7_log"
+  _els_line "$els7_log" "$((NOW_ELS - 300))" ERROR text
+  _els_line "$els7_log" "$((NOW_ELS - 200))" ERROR text
+  _els_line "$els7_log" "$((NOW_ELS - 100))" ERROR text
+  printf 'last_restart_epoch=%s\n' "$((NOW_ELS - 300))" > "$els7_st"
+  classify_event_loop_stall "$els7_log" "$els7_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_VERDICT" == "alert" && "$EVENT_LOOP_STALL_COUNT" == "3" ]]; then
+    tap_ok "event-loop-stall: cooldown active (last_restart 300s ago) → alert (restart suppressed)"
+  else
+    tap_not_ok "event-loop-stall: cooldown active → alert (restart suppressed)" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els8: both Text and JSON stall_recovered field forms counted ────
+  # The node runs Text format, but a formatter change to JSON must still be
+  # detected. Feed one of each rendered field form; both must count.
+  local els8_log="$els_dir/8.log" els8_st="$els_dir/8.state"
+  : > "$els8_log"
+  _els_line "$els8_log" "$((NOW_ELS - 200))" ERROR text
+  _els_line "$els8_log" "$((NOW_ELS - 100))" ERROR json
+  classify_event_loop_stall "$els8_log" "$els8_st" "$NOW_ELS"
+  if [[ "$EVENT_LOOP_STALL_COUNT" == "2" && "$EVENT_LOOP_STALL_VERDICT" == "alert" ]]; then
+    tap_ok "event-loop-stall: both Text and JSON stall_recovered field forms counted (count=2)"
+  else
+    tap_not_ok "event-loop-stall: both Text and JSON field forms counted (count=2)" \
+      "verdict=$EVENT_LOOP_STALL_VERDICT count=$EVENT_LOOP_STALL_COUNT"
+  fi
+
+  # ── Test 63els9: consistency — SKILL.md references classify_event_loop_stall ─
+  local tick_file_els="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'classify_event_loop_stall' "$tick_file_els"; then
+    tap_ok "consistency: monitor-tick/SKILL.md references classify_event_loop_stall"
+  else
+    tap_not_ok "consistency: monitor-tick/SKILL.md references classify_event_loop_stall" \
+      "(3f) rung not wired in monitor-tick/SKILL.md"
+  fi
+
+  # ── Test 63els10: log-scan carve-out for the recovered-stall ERROR line ────
+  # The (1) log-scan section must mark the loop-side recovered-stall ERROR line
+  # a known class routed to (3f) and exclude it from the unexpected-ERROR count.
+  if grep -q 'recovered-stall ERROR carve-out' "$tick_file_els"; then
+    tap_ok "log-scan: stall_recovered ERROR line excluded from unexpected-ERROR count"
+  else
+    tap_not_ok "log-scan: stall_recovered ERROR line excluded from unexpected-ERROR count" \
+      "carve-out marker missing from (1) Log scan in monitor-tick/SKILL.md"
   fi
 
   # ════════════════════════════════════════════════════════════════════════════
