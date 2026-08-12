@@ -1997,13 +1997,26 @@ mod tests {
             Arc::new(OverlayMetrics::new()),
         );
 
-        // Send strictly more than the capacity so eviction is exercised.
+        // Send strictly more than the capacity so eviction is exercised. Each
+        // send is wrapped with a strictly-incrementing authenticated sequence
+        // number (`wrap_message`), so every recorded `prefix` is distinct even
+        // though all messages share `msg_type == "GET_SCP_STATE"`. Capture each
+        // just-recorded prefix so we can assert exactly which entries survive.
         let total = RECENT_SENDS_CAPACITY + 10;
+        let mut sent_prefixes: Vec<[u8; crate::connection::SEND_PREFIX_LEN]> =
+            Vec::with_capacity(total);
         for i in 0..total {
             peer_a
                 .send(StellarMessage::GetScpState(i as u32))
                 .await
                 .expect("send");
+            sent_prefixes.push(
+                peer_a
+                    .recent_sends
+                    .back()
+                    .expect("send just recorded an entry")
+                    .prefix,
+            );
         }
 
         assert_eq!(
@@ -2011,19 +2024,32 @@ mod tests {
             RECENT_SENDS_CAPACITY,
             "ring must be capped at RECENT_SENDS_CAPACITY entries"
         );
-        // The oldest surviving entry must be the (total - CAPACITY)-th send,
-        // proving FIFO eviction (front dropped, back appended).
-        let first_surviving = peer_a
-            .recent_sends
-            .front()
-            .expect("ring is non-empty")
-            .prefix;
-        // The prefix encodes the send ordinal indirectly; simply assert the
-        // buffer is exactly full and never exceeded.
-        let _ = first_surviving;
-        assert!(
-            peer_a.recent_sends.len() <= RECENT_SENDS_CAPACITY,
-            "ring must never exceed capacity"
+
+        // Prove FIFO front-eviction positionally: the surviving ring must be
+        // exactly the tail slice of everything sent — the first
+        // `total - RECENT_SENDS_CAPACITY` sends dropped from the front, with the
+        // survivors retaining send order. This single equality proves (a) the
+        // correct count was evicted, (b) from the front (not the back), and
+        // (c) order preservation — none of which the length check alone can.
+        let surviving: Vec<[u8; crate::connection::SEND_PREFIX_LEN]> =
+            peer_a.recent_sends.iter().map(|s| s.prefix).collect();
+        assert_eq!(
+            surviving,
+            sent_prefixes[total - RECENT_SENDS_CAPACITY..].to_vec(),
+            "surviving ring must be the FIFO tail of all sends (front evicted)"
+        );
+
+        // Explicit front-eviction statement: the oldest survivor must NOT be the
+        // last-evicted send. Distinct prefixes are guaranteed by the incrementing
+        // auth sequence, so this is a strict inequality.
+        assert_ne!(
+            peer_a
+                .recent_sends
+                .front()
+                .expect("ring is non-empty")
+                .prefix,
+            sent_prefixes[total - RECENT_SENDS_CAPACITY - 1],
+            "front survivor must be the (total - CAPACITY)-th send, not the last evicted one"
         );
     }
 
