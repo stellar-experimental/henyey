@@ -1329,6 +1329,143 @@ classify_stuck_alive_sync() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# classify_event_loop_stall LOG_FILE STATE_FILE [NOW_EPOCH]
+#
+# Pure decision function for the monitor-tick alive-path sub-check (3f)
+# "Recovered event-loop stall policy" (issue #3815).
+#
+# #3795 made the node emit exact loop-side accounting of event-loop inter-tick
+# stalls. That signal comes in TWO shapes from crates/app/src/app/mod.rs:
+#   - the SAMPLER's emit_error() carries `watchdog_freeze=true` — the loop is
+#     wedged *right now*; monitor-tick's (3b) wedge owns it (restart is correct).
+#   - the LOOP-SIDE emit_event_loop_stall() (mod.rs:4711) fires only *after* the
+#     loop has demonstrably resumed. It deliberately carries NEITHER auto-restart
+#     pattern (no `watchdog_freeze`, no "WATCHDOG: Event loop appears frozen"),
+#     instead emitting message "Event loop stall (loop-side exact accounting)"
+#     with `stall_recovered=true`, at WARN ([15,30)s) or ERROR (>=30s) tier.
+#
+# Restarting a node that has ALREADY recovered is the wrong action, so a lone
+# recovered stall must NOT restart. But a *chronic* run of recovered >=30 s parks
+# is real degradation. This function makes that policy explicit — replacing the
+# pre-#3815 non-monotonicity where a 35 s recovered park (sampler ERROR-window
+# blind) escaped restart while a 45 s one tripped it, purely by sampler geometry.
+#
+# It counts recovered ERROR-tier stall lines whose timestamps fall inside a
+# rolling STALL_WINDOW_SEC and maps the count to an explicit verdict. The (3b)
+# wedge `watchdog_freeze=true` line is never counted here: it carries neither the
+# loop-side message nor `stall_recovered`, so the three-way AND-grep excludes it.
+# The WARN-tier recovered stall is likewise excluded (only ERROR drives policy).
+#
+# SOLE READER/WRITER of STATE_FILE — the caller supplies only the log path and
+# the state-file path. Only `last_restart_epoch` is persisted (for the restart
+# cooldown guard); the in-window count is derived from the LOG each call, so the
+# function is idempotent w.r.t. repeated ticks over the same log tail.
+#
+# Mirrors classify_stuck_alive_sync's injectable-time design: NOW_EPOCH is the
+# optional last positional arg (defaults to wall clock) so all window/cooldown
+# arithmetic is deterministically testable.
+#
+# Thresholds (named constants — operators may retune):
+#   STALL_WINDOW_SEC=7200     rolling window (2h) for the in-window count.
+#   MAX_RECOVERED_STALLS=3    recovered ERROR stalls in window before escalating
+#                             from alert-only to restart.
+#   STALL_COOLDOWN_SEC=900    min seconds between recovered-stall restarts; a
+#                             restart within this window degrades to `alert`.
+#
+# Sets globals:
+#   EVENT_LOOP_STALL_VERDICT ∈ "none" | "alert" | "restart":
+#     none    — no recovered ERROR stall in window.
+#     alert   — 1..(MAX_RECOVERED_STALLS-1) in window, OR a would-be restart
+#               suppressed by the cooldown guard (alert-only, no restart).
+#     restart — >= MAX_RECOVERED_STALLS in window and the cooldown is clear;
+#               records last_restart_epoch=NOW.
+#   EVENT_LOOP_STALL_COUNT — the in-window recovered ERROR stall count.
+#
+# Defensive anchoring: a missing/unreadable log, a missing/corrupt state file, or
+# an unparseable timestamp all fail INERT toward none/alert — never `restart`.
+# Returns: 0 always. Does NO process I/O (no kill/relaunch) — the (3f) rung does that.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_event_loop_stall() {
+  local log_file="$1"
+  local state_file="$2"
+  local now_epoch="${3:-$(date +%s)}"
+
+  # Named thresholds (operator-retunable).
+  local STALL_WINDOW_SEC=7200
+  local MAX_RECOVERED_STALLS=3
+  local STALL_COOLDOWN_SEC=900
+
+  EVENT_LOOP_STALL_VERDICT="none"
+  EVENT_LOOP_STALL_COUNT=0
+
+  # ── Read prior state (sole reader/writer). Only last_restart_epoch persists. ─
+  local last_restart_epoch="0"
+  if [[ -f "$state_file" ]]; then
+    local key val
+    while IFS='=' read -r key val; do
+      case "$key" in
+        last_restart_epoch) last_restart_epoch="$val" ;;
+      esac
+    done < "$state_file"
+  fi
+  # Corrupt/non-numeric last_restart_epoch → treat as "never" (fail inert).
+  [[ "$last_restart_epoch" =~ ^[0-9]+$ ]] || last_restart_epoch="0"
+
+  _write_stall_state() {
+    printf 'last_restart_epoch=%s\n' "$last_restart_epoch" > "$state_file" 2>/dev/null || true
+  }
+
+  # ── Count recovered ERROR-tier stall lines in the rolling window. ───────────
+  # Three-way AND: ERROR level prefix, the loop-side message, and stall_recovered
+  # true (matches BOTH Text `stall_recovered=true` and JSON `"stall_recovered":true`
+  # — the optional `"?` absorbs the JSON closing quote, `[=:]` the `=`/`:`). The
+  # (3b) wedge `watchdog_freeze=true` line matches none of the message/field
+  # anchors, so it can never be counted here. WARN-tier lines fail the ERROR
+  # anchor. A missing/unreadable log yields an empty stream → count 0 → none.
+  local count=0 line ts epoch age
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Leading ISO8601 timestamp up to the trailing Z (same shape the wedge and
+    # heartbeat-freshness checks parse). Unparseable → skip the line (inert).
+    ts=$(printf '%s' "$line" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -1)
+    [[ -z "$ts" ]] && continue
+    epoch=$(date -d "$ts" +%s 2>/dev/null)
+    [[ "$epoch" =~ ^[0-9]+$ ]] || continue
+    age=$(( now_epoch - epoch ))
+    # In-window only: prune entries at/older than the window; ignore future ts.
+    [[ "$age" -ge 0 && "$age" -lt "$STALL_WINDOW_SEC" ]] || continue
+    count=$(( count + 1 ))
+  done < <(grep -E '^[^ ]+Z[[:space:]]+ERROR[[:space:]]' "$log_file" 2>/dev/null \
+             | grep -F 'Event loop stall (loop-side exact accounting)' \
+             | grep -E 'stall_recovered"?[[:space:]]*[=:][[:space:]]*true')
+
+  EVENT_LOOP_STALL_COUNT="$count"
+
+  # ── Apply explicit policy. ──────────────────────────────────────────────────
+  if [[ "$count" -le 0 ]]; then
+    _write_stall_state
+    EVENT_LOOP_STALL_VERDICT="none"
+    return 0
+  fi
+  if [[ "$count" -lt "$MAX_RECOVERED_STALLS" ]]; then
+    _write_stall_state
+    EVENT_LOOP_STALL_VERDICT="alert"
+    return 0
+  fi
+  # count >= MAX_RECOVERED_STALLS → restart, unless the cooldown guard trips.
+  if [[ "$last_restart_epoch" -gt 0 ]] \
+     && [[ $(( now_epoch - last_restart_epoch )) -lt "$STALL_COOLDOWN_SEC" ]]; then
+    _write_stall_state
+    EVENT_LOOP_STALL_VERDICT="alert"   # suppressed restart degrades to alert-only
+    return 0
+  fi
+  last_restart_epoch="$now_epoch"
+  _write_stall_state
+  EVENT_LOOP_STALL_VERDICT="restart"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # classify_obsrvr_radar INDEX_HTTP_CODE NODE_HTTP_CODE HAS_REQUIRED_FIELDS
 #
 # Decision logic for monitor-tick check (9) "OBSRVR Radar" (issue #3753). Maps
