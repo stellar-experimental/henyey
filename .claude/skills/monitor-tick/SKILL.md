@@ -307,8 +307,8 @@ Detect crash-recovery once at the top of the tick. The rule fires on
 recovery is considered complete regardless):
 
 1. **Rotation signal**: the most recent log rotation in the session's
-   `logs/` dir is a `.crashed-*`, `.stuck-*`, or `.frozen-*` (not a
-   planned `.preredeploy-*`). Use `find` (not shell globs) to avoid
+   `logs/` dir is a `.crashed-*`, `.stuck-*`, `.stall-*`, or `.frozen-*`
+   (not a planned `.preredeploy-*`). Use `find` (not shell globs) to avoid
    zsh `NO_NOMATCH` failing the pipeline.
 
 2. **Active-catchup signal** (fires even when the rotation was
@@ -329,11 +329,12 @@ if [ -n "$PID" ]; then
     newest_rotation=$(find "$logs_dir" -maxdepth 1 -type f \
         \( -name 'monitor.log.crashed-*' \
         -o -name 'monitor.log.stuck-*' \
+        -o -name 'monitor.log.stall-*' \
         -o -name 'monitor.log.frozen-*' \
         -o -name 'monitor.log.preredeploy-*' \) \
       -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     case "$newest_rotation" in
-      *.crashed-*|*.stuck-*|*.frozen-*) CRASH_RECOVERY=yes ;;
+      *.crashed-*|*.stuck-*|*.stall-*|*.frozen-*) CRASH_RECOVERY=yes ;;
     esac
 
     # Signal 2: active catchup past the clean-restart window
@@ -377,7 +378,8 @@ mv /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log \
    /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.<suffix>-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true
 ```
 Suffix per origin: `crashed` (process found dead), `frozen` (wedge per 3b),
-`preredeploy` (planned restart for deploy).
+`stuck` (stuck-but-alive per 3e), `stall` (chronic recovered event-loop stalls
+per 3f), `preredeploy` (planned restart for deploy).
 
 **(1) Log scan** — `tail -n 500 /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log`.
 Scan for hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual
@@ -390,6 +392,25 @@ A naive case-insensitive `error` match falsely fires on INFO-level lines that
 contain the word "error" as part of a message body — e.g. peer disconnect
 lines like `INFO ... recv error: IO error: Connection reset by peer`. Treat
 those as the normal overlay-churn INFO they are; do not flag.
+
+**recovered-stall ERROR carve-out** (issue #3815, composes with the #3795
+node-side signal): the loop-side line `Event loop stall (loop-side exact
+accounting)` carrying `stall_recovered=true` fires only *after* the event loop
+has resumed and, at the ERROR tier (recovered ≥30 s parks), renders as an
+**ERROR-level line**. It is a KNOWN, expected class — not a new fault — routed to
+sub-check **(3f)** below, which owns the recovered-stall policy. Exclude it from
+the unexpected-ERROR fault count, exactly parallel to the `recv error` INFO
+carve-out above, e.g.:
+
+```bash
+grep -E '^[^ ]+Z\s+ERROR\s' "$LOG" \
+  | grep -vF 'Event loop stall (loop-side exact accounting)'
+```
+
+Do NOT read a `stall_recovered=true` ERROR line as a regression on a node that
+previously read `0 ERROR` in-window — (3f) accounts for it explicitly. The
+unrecovered-wedge line (`watchdog_freeze=true` / `WATCHDOG: Event loop appears
+frozen`) is a DIFFERENT class and stays owned by (3b).
 
 **(2) Ledger progression & sync deadline** — persist ledger progression across
 ticks so STUCK can be detected by a single invocation:
@@ -812,6 +833,17 @@ Board-route to Backlog: `bash .github/skills/shared/scripts/move-issue-status.sh
 Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
 incidents: #1904, #1873, #1921, #1949.
 
+(3b) owns ONLY the **unrecovered** class — the loop is wedged *now*, proven by
+condition 2 (dead/timed-out `/info`). **This dead-`/info` AND-gate is
+load-bearing and must be preserved verbatim** (issue #3815): a `watchdog_freeze`
+line left behind by an *already-recovered* park does NOT restart, because once
+the loop resumes `/info` answers again and condition 2 fails. The recovered
+class — the #3795 loop-side `Event loop stall (loop-side exact accounting)` /
+`stall_recovered=true` line — is deliberately sentinel-free (no `watchdog_freeze`)
+and is handled by (3f) below, NOT here. Removing condition 2 would let recovered
+parks trip a spurious restart and reintroduce the 35 s-vs-45 s non-monotonicity
+that (3f) exists to close.
+
 **(3e) Stuck-but-alive SYNC FAILURE auto-restart** — a node can be alive AND
 responsive (admin `/info` answers) yet make no ledger progress: a frozen local
 `lcl`, climbing RPC `age`, RPC `unhealthy`, and RSS under the OOM floor. This is
@@ -908,6 +940,65 @@ during legitimate transient sync/catch-up — a false restart on a consensus
 validator is harmful. The 600s frozen-lcl dwell + six-way AND-gate + 900s
 cooldown + max-3/2h guard enforce that conservatism.
 
+**(3f) Recovered event-loop stall policy** — the #3795 loop-side signal emits
+`Event loop stall (loop-side exact accounting)` with `stall_recovered=true` only
+*after* the event loop has resumed. Restarting an already-recovered node is
+wrong, so a lone recovered stall must NOT restart — but a **chronic** run of
+recovered ≥30 s (ERROR-tier) parks is real degradation that should escalate.
+This sub-check makes that decision an **explicit policy** instead of inheriting
+it from sampler phase (issue #3815). It removes the pre-#3815 non-monotonicity
+where a 35 s recovered park escaped restart (sampler ERROR-window blind for the
+recovering class) while a 45 s one tripped it, purely by sampler geometry —
+**both recovered stalls now flow through this single rule.**
+
+(3f) is distinct from (3b) wedge, which owns the **unrecovered** class
+(`watchdog_freeze=true` + dead `/info`). The two never overlap: the loop-side
+line is deliberately sentinel-free (no `watchdog_freeze`), and (3b)'s dead-`/info`
+AND-gate fails once the loop has resumed. Evaluate (3f) in the alive path,
+**strictly after** (3c) soft-fail-wipe → (3b) wedge → (3e) stuck-alive-sync, so
+it only sees a live, recovered node. The decision is made by the pure function
+`classify_event_loop_stall` (`scripts/lib/monitor-decisions.sh`, already sourced),
+the **sole reader/writer** of its per-session state file (only
+`last_restart_epoch` persists — the in-window count is derived from the log each
+tick).
+
+```bash
+STALL_STATE_FILE="/home/tomer/data/$MONITOR_SESSION_ID/metrics/event_loop_stall_state"
+mkdir -p "$(dirname "$STALL_STATE_FILE")"
+classify_event_loop_stall "$LOG" "$STALL_STATE_FILE" "$(date +%s)"
+```
+
+`classify_event_loop_stall` sets `EVENT_LOOP_STALL_VERDICT` ∈ `none|alert|restart`
+and `EVENT_LOOP_STALL_COUNT` (in-window recovered ERROR stalls). It counts only
+ERROR-tier lines carrying BOTH the loop-side message and `stall_recovered=true`
+(Text `=true` or JSON `":true`) whose timestamps fall inside a rolling
+`STALL_WINDOW_SEC` (default 7200s); WARN-tier (<30 s) parks and the (3b)
+`watchdog_freeze` line are never counted. Policy: `alert` for 1..2 in-window,
+escalating to `restart` at `MAX_RECOVERED_STALLS` (default 3), gated by a
+`STALL_COOLDOWN_SEC` (default 900s) restart guard. A missing/corrupt state file
+or unparseable timestamp fails **inert toward `none`/`alert`, never `restart`**.
+
+- On `EVENT_LOOP_STALL_VERDICT=restart` (chronic degradation: ≥3 recovered ≥30 s
+  stalls in the window, cooldown clear): **Stop-PID**, **Rotate-log** with suffix
+  `stall`, then **Relaunch** (verbatim reuse of the Common-procedures machinery;
+  the `stall` suffix is a recognized crash-recovery rotation type — see the
+  crash-recovery detector — so the next tick sees `CRASH_RECOVERY=yes` and does
+  not false-fire SYNC FAILURE during the legitimate replay that follows). File an
+  `urgent`-labeled issue via the Filing flow noting the recovered-stall streak
+  and pointing at the parks' root cause (#3756); include `EVENT_LOOP_STALL_COUNT`.
+- On `EVENT_LOOP_STALL_VERDICT=alert` (a recovered stall present, or a restart
+  suppressed by the cooldown guard): **do NOT restart.** Append
+  `WATCH_ITEMS+=("recovered_stall=$EVENT_LOOP_STALL_COUNT")` so `daily-summary`
+  can aggregate a stable key, and file/dedup a **non-urgent** issue via the
+  Filing flow (omit `--label urgent`). This is the alert-only tier for a node
+  that recovered on its own.
+- On `EVENT_LOOP_STALL_VERDICT=none`: report-only, no action this tick.
+
+Note: recovered ≥30 s stalls now surface as **ERROR**-severity lines on a node
+that previously read `0 ERROR` in-window. That is expected — the (1) log-scan
+**recovered-stall ERROR carve-out** excludes this class from the unexpected-ERROR
+fault count and routes it here. Do not double-count it as a new fault.
+
 **(4) Memory** — `ps -o rss= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`, convert to MB.
 
 The guardrail is **host-RAM-relative** (not absolute GB) so the same skill gives
@@ -951,7 +1042,7 @@ shared `prune_rotated_logs` helper (`scripts/lib/monitor-decisions.sh`, sourced
 at skill init). The helper discovers every `monitor.log.<category>-*` category
 present on disk — including legacy/other suffixes (`predeploy`, `coldcatchup`,
 `stopped`, `prerestart`, `freshstart`, …), not just a hardcoded
-`preredeploy/crashed/stuck/frozen` list — and orders retention by **mtime**, not
+`preredeploy/crashed/stuck/stall/frozen` list — and orders retention by **mtime**, not
 by lexical filename. mtime ordering is correct even when an infixed variant such
 as `monitor.log.crashed-knit2lcl-20260615T192932Z` would otherwise sort its `k`
 ahead of a bare `crashed-20260623T…` under `sort -r` and wrongly retain the OLD
