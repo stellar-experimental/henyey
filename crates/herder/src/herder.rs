@@ -538,6 +538,17 @@ pub struct Herder {
     /// don't install a manager simply leave it empty (purge becomes a no-op),
     /// while production install exactly once in `init_herder`.
     scp_persistence: std::sync::OnceLock<Arc<crate::persistence::ScpPersistenceManager>>,
+    /// The single SCP persist worker installed alongside `scp_persistence`.
+    ///
+    /// Replaces the previous unbounded thread-per-emit fan-out (#3813): the
+    /// emit callback now enqueues the slot onto this worker's coalescing queue
+    /// instead of spawning a thread. Held here so it is dropped — and its
+    /// thread joined, draining any queued work — when the `Herder` drops,
+    /// closing the "detached, never joined" shutdown race.
+    ///
+    /// `OnceLock` because the worker is installed exactly once, together with
+    /// `scp_persistence`, in [`Self::set_scp_persistence`].
+    scp_persist_worker: std::sync::OnceLock<crate::persistence::ScpPersistWorker>,
     /// Shared flag indicating whether ledger application is in progress.
     ///
     /// Parity: stellar-core's `triggerNextLedger` checks
@@ -751,6 +762,7 @@ impl Herder {
             scp_metrics,
             lcl_ahead_of_tracking_corrective_total: AtomicU64::new(0),
             scp_persistence: std::sync::OnceLock::new(),
+            scp_persist_worker: std::sync::OnceLock::new(),
             is_applying_flag: std::sync::OnceLock::new(),
         }
     }
@@ -777,13 +789,15 @@ impl Herder {
     /// `OnceLock` enforces single-installer at the type-system level: a second
     /// call returns `Err` with the supplied manager so the caller can fail loud.
     ///
-    /// On first install, also wires the persist callback into
+    /// On first install, also spawns the single SCP persist worker (#3813) and
+    /// wires the persist callback into
     /// [`crate::scp_driver::ScpDriver::set_persist_callback`] so each emitted
-    /// envelope triggers a `persist_scp_state` call on the manager. The
-    /// callback captures `Arc<SCP>`, `Arc<ScpDriver>`, and
-    /// `Arc<ScpPersistenceManager>` (an intentional Arc cycle mirroring
-    /// the existing `envelope_sender` cycle — benign because all three
-    /// are dropped together with the owning `Herder`).
+    /// envelope enqueues its slot onto that worker's coalescing queue. The
+    /// worker captures `Arc<SCP>`, `Arc<ScpDriver>`, and
+    /// `Arc<ScpPersistenceManager>` (an intentional Arc cycle mirroring the
+    /// existing `envelope_sender` cycle — benign because all are dropped
+    /// together with the owning `Herder`, whose `scp_persist_worker` `Drop`
+    /// joins the worker thread).
     pub fn set_scp_persistence(
         &self,
         manager: Arc<crate::persistence::ScpPersistenceManager>,
@@ -792,16 +806,20 @@ impl Herder {
         // double-install and the existing manager is already wired).
         self.scp_persistence.set(Arc::clone(&manager))?;
 
-        // Capture handles for the persist closure. Each call to the closure
-        // re-clones these Arcs onto a worker thread; the thread does the
-        // gather + persist work AFTER returning from `emit()` so SCP's
-        // internal slots write-lock has been released (otherwise the
-        // closure's `scp.get_latest_messages_send` would deadlock against
-        // the writer chain that invoked `emit`).
+        // Capture handles for the persist worker's per-slot gather+persist body.
+        // The worker runs this AFTER `emit()` returns, so SCP's internal `slots`
+        // write-lock has been released (otherwise `scp.get_latest_messages_send`
+        // would deadlock against the writer chain that invoked `emit`).
         let scp = Arc::clone(&self.scp);
         let driver = Arc::clone(&self.scp_driver);
-        let manager_for_cb = Arc::clone(&manager);
+        let manager_for_worker = Arc::clone(&manager);
 
+        // The single coalescing queue: the emit callback enqueues a slot; the
+        // one worker drains it. Bounds live persist threads to exactly 1 (#3813).
+        let queue = crate::persistence::SharedPersistQueue::new(Arc::clone(&manager));
+
+        // Per-slot work — moved verbatim off the old detached-thread body.
+        //
         // Parity: stellar-core HerderImpl::persistSCPState (HerderImpl.cpp:2152-2186):
         //   1. getSCP().getLatestMessagesSend(slotIndex) → envelopes
         //   2. for each envelope: mPendingEnvelopes.getTxSet(h) → encode StoredTransactionSet
@@ -810,90 +828,81 @@ impl Herder {
         //
         // Deviation: stellar-core runs this synchronously inside `emitEnvelope`.
         // henyey's `SCP::nominate`/`process_envelope`/etc hold a
-        // `parking_lot::RwLock` write guard on `slots` while the driver
-        // emits, so a synchronous `get_latest_messages_send` (which takes
-        // the same RwLock for reading) would deadlock. We spawn a worker
-        // thread instead; the thread acquires the read lock after the
-        // writer chain unwinds. `pending_persist_begin`/`_end` provide
-        // synchronization for tests (`wait_for_pending_persists`).
-        self.scp_driver.set_persist_callback(move |slot| {
-            let scp = Arc::clone(&scp);
-            let driver = Arc::clone(&driver);
-            let manager_for_thread = Arc::clone(&manager_for_cb);
+        // `parking_lot::RwLock` write guard on `slots` while the driver emits,
+        // so a synchronous `get_latest_messages_send` (which takes the same
+        // RwLock for reading) would deadlock. We hop to the persist worker
+        // instead; it reads after the writer chain unwinds. This refactor bounds
+        // that hop's concurrency from unbounded (thread-per-emit) to one worker.
+        let process = move |slot: u64| {
+            use stellar_xdr::{Limits, WriteXdr};
 
-            // Increment BEFORE spawn so a tightly-following
-            // `wait_for_pending_persists` cannot race past us.
-            manager_for_thread.pending_persist_begin();
+            let envelopes = scp.get_latest_messages_send(slot);
 
-            // Worker thread: gather state + persist outside the SCP slot
-            // write-lock. Errors are best-effort logged.
-            std::thread::Builder::new()
-                .name(format!("scp-persist-{}", slot))
-                .spawn(move || {
-                    // Decrement on any exit path.
-                    struct Guard<'a>(&'a crate::persistence::ScpPersistenceManager);
-                    impl<'a> Drop for Guard<'a> {
-                        fn drop(&mut self) {
-                            self.0.pending_persist_end();
-                        }
-                    }
-                    let _guard = Guard(&manager_for_thread);
+            let mut tx_sets: Vec<(stellar_xdr::Hash, Vec<u8>)> = Vec::new();
+            let mut quorum_sets: Vec<(stellar_xdr::Hash, stellar_xdr::ScpQuorumSet)> = Vec::new();
 
-                    use stellar_xdr::{Limits, WriteXdr};
-
-                    let envelopes = scp.get_latest_messages_send(slot);
-
-                    let mut tx_sets: Vec<(stellar_xdr::Hash, Vec<u8>)> = Vec::new();
-                    let mut quorum_sets: Vec<(stellar_xdr::Hash, stellar_xdr::ScpQuorumSet)> =
-                        Vec::new();
-
-                    for envelope in &envelopes {
-                        for hash in crate::persistence::get_tx_set_hashes(envelope) {
-                            let hash256 = henyey_common::Hash256(hash.0);
-                            if let Some(tx_set) = driver.get_tx_set(&hash256) {
-                                let stored = tx_set.to_xdr_stored_set();
-                                match stored.to_xdr(Limits::none()) {
-                                    Ok(bytes) => tx_sets.push((hash, bytes)),
-                                    Err(e) => {
-                                        warn!(
-                                            error = %e,
-                                            slot,
-                                            "persist_scp_state: failed to encode \
-                                             StoredTransactionSet"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(qhash) = crate::persistence::get_quorum_set_hash(envelope) {
-                            let qhash256 = henyey_common::Hash256(qhash.0);
-                            if let Some(qs) = driver.get_quorum_set_by_hash(&qhash256) {
-                                quorum_sets.push((qhash, qs));
+            for envelope in &envelopes {
+                for hash in crate::persistence::get_tx_set_hashes(envelope) {
+                    let hash256 = henyey_common::Hash256(hash.0);
+                    if let Some(tx_set) = driver.get_tx_set(&hash256) {
+                        let stored = tx_set.to_xdr_stored_set();
+                        match stored.to_xdr(Limits::none()) {
+                            Ok(bytes) => tx_sets.push((hash, bytes)),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    slot,
+                                    "persist_scp_state: failed to encode \
+                                     StoredTransactionSet"
+                                );
                             }
                         }
                     }
-
-                    if let Err(e) = manager_for_thread.persist_scp_state(
-                        slot,
-                        &envelopes,
-                        &tx_sets,
-                        &quorum_sets,
-                    ) {
-                        warn!(error = %e, slot, "persist_scp_state failed");
+                }
+                if let Some(qhash) = crate::persistence::get_quorum_set_hash(envelope) {
+                    let qhash256 = henyey_common::Hash256(qhash.0);
+                    if let Some(qs) = driver.get_quorum_set_by_hash(&qhash256) {
+                        quorum_sets.push((qhash, qs));
                     }
-                })
-                .map_err(|e| {
-                    // If spawn fails we still need to drop the pending count.
-                    // `record_spawn_failure` is ADDITIVE — it does not replace
-                    // the `pending_persist_end` decrement (#3796): dropping the
-                    // decrement would leak `pending_persists` upward forever and
-                    // hang `wait_for_pending_persists`.
-                    manager_for_cb.record_spawn_failure();
-                    manager_for_cb.pending_persist_end();
-                    warn!(error = %e, slot, "failed to spawn scp-persist worker");
-                })
-                .ok();
-        });
+                }
+            }
+
+            if let Err(e) =
+                manager_for_worker.persist_scp_state(slot, &envelopes, &tx_sets, &quorum_sets)
+            {
+                warn!(error = %e, slot, "persist_scp_state failed");
+            }
+        };
+
+        // Spawn the single worker up front. On spawn failure, record it and
+        // leave the callback uninstalled: persistence is disabled rather than
+        // falling back to an inline (deadlocking) persist.
+        match crate::persistence::ScpPersistWorker::spawn(Arc::clone(&queue), process) {
+            Ok(worker) => {
+                // Store so `Herder::drop` joins the worker thread. `set` can
+                // only fail if the cell was already populated; the earlier
+                // `self.scp_persistence.set(..)?` guarantees this method runs
+                // exactly once, so this is the first (and only) `set`. Assert
+                // it in debug builds to catch any future reordering that would
+                // leave the worker un-stored (dropped/joined) while the enqueue
+                // callback below stays installed — which would leak the pending
+                // count and hang `wait_for_pending_persists`.
+                let stored = self.scp_persist_worker.set(worker).is_ok();
+                debug_assert!(stored, "scp_persist_worker set exactly once");
+                // The emit callback: enqueue only. This is the short,
+                // SQLite-free work that runs under SCP's `slots` write guard.
+                self.scp_driver.set_persist_callback(move |slot| {
+                    queue.enqueue(slot);
+                });
+            }
+            Err(e) => {
+                manager.record_spawn_failure();
+                warn!(
+                    error = %e,
+                    "failed to spawn scp-persist worker; SCP persistence disabled"
+                );
+            }
+        }
 
         Ok(())
     }
