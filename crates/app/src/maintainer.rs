@@ -400,6 +400,14 @@ fn delete_in_chunks(
                     drop(_write_ctx);
                     // Back off before retrying, unless the budget is exhausted.
                     if attempts < MAINTENANCE_DELETE_MAX_ATTEMPTS {
+                        // #3802: one increment per attempt that will actually be
+                        // followed by another. This is the series that answers
+                        // "did #3772's bounded retry convert lock-loss into
+                        // successful trims?" — previously a successful retry
+                        // emitted no signal whatsoever.
+                        crate::metrics::record_db_busy_retry_attempt(
+                            crate::metrics::SITE_RETENTION_TRIM,
+                        );
                         std::thread::sleep(MAINTENANCE_CHUNK_PAUSE);
                     }
                 }
@@ -417,6 +425,18 @@ fn delete_in_chunks(
                 total_rows += rows as u64;
             }
             Err(e) => {
+                // #3802: this table's trim is abandoned. Count it as a
+                // busy-caused loss ONLY when the give-up error is itself a
+                // transient busy — the fail-closed non-transient path (e.g.
+                // `Integrity`) is a different failure class and must not
+                // inflate the busy-loss series. Note this arm is shared by
+                // both: a chunk can retry a busy and then hit a non-transient
+                // error, in which case `attempts` incremented but `dropped`
+                // correctly does not.
+                crate::metrics::record_db_busy_drop_if_transient(
+                    crate::metrics::SITE_RETENTION_TRIM,
+                    &e,
+                );
                 warn!(error = %e, attempts, "Failed to delete old {} entries", label);
                 break;
             }
@@ -467,6 +487,13 @@ pub fn run_maintenance(
                 }
                 Ok(_) => min_queued,
                 Err(e) => {
+                    // #3802: log-and-continue, no retry — the eviction is
+                    // simply lost until the next maintenance cycle. Count the
+                    // transient-busy subset. Behaviour unchanged.
+                    crate::metrics::record_db_busy_drop_if_transient(
+                        crate::metrics::SITE_PUBLISH_QUEUE_EVICT,
+                        &e,
+                    );
                     warn!(error = %e, "Failed to evict stale publish queue entries");
                     min_queued
                 }
@@ -1598,5 +1625,145 @@ mod tests {
             total, 0,
             "no rows counted on immediate non-transient failure"
         );
+    }
+
+    // ── #3802 busy telemetry ───────────────────────────────────────────
+    //
+    // Counters are process-global: each of these runs on a pristine local
+    // recorder inside a synchronous `#[test]` (`with_local_recorder` is
+    // thread-local), and pre-registers the label series before asserting any
+    // `== 0`, since an unincremented labelled series is absent from the render.
+
+    /// #3802: **this is the "is #3781/#3772's bounded retry working?"
+    /// assertion.** A chunk that loses the write-lock race once and then
+    /// succeeds must increment `attempts{retention_trim}` and leave
+    /// `dropped{retention_trim}` at zero. Before this change a successful retry
+    /// produced no signal at all, so the deploy could not answer the question.
+    #[test]
+    fn test_delete_in_chunks_counts_retry_attempts_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let mut calls = 0u32;
+            let total = delete_in_chunks(100, "test", |chunk| {
+                calls += 1;
+                match calls {
+                    1 => Err(busy_error()),
+                    2 => Ok(chunk * 3),
+                    _ => Ok(0),
+                }
+            });
+            assert_eq!(total, (MAINTENANCE_CHUNK_LEDGERS as u64) * 3);
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_retry_attempts_total{site=\"retention_trim\"} 1"),
+                "the retried chunk must be counted; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"retention_trim\"} 0"),
+                "a retry that then succeeds must NOT count as a dropped write; got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802: a persistently-busy chunk exhausts the attempt budget and the
+    /// table's trim is abandoned → exactly one `dropped{retention_trim}`, and
+    /// `MAINTENANCE_DELETE_MAX_ATTEMPTS - 1` retried attempts (the final,
+    /// giving-up attempt is the drop, not a retry).
+    #[test]
+    fn test_delete_in_chunks_counts_drop_on_exhaustion_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let total =
+                delete_in_chunks(100, "test", |_chunk| -> Result<u32, henyey_db::DbError> {
+                    Err(busy_error())
+                });
+            assert_eq!(total, 0);
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"retention_trim\"} 1"),
+                "an abandoned trim must count exactly one dropped write; got:\n{out}"
+            );
+            assert!(
+                out.contains(&format!(
+                    "henyey_db_busy_retry_attempts_total{{site=\"retention_trim\"}} {}",
+                    MAINTENANCE_DELETE_MAX_ATTEMPTS - 1
+                )),
+                "only the non-final attempts are retries; got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802: the give-up arm is shared by the busy and non-transient paths, so
+    /// the drop increment MUST be gated on classification. A non-transient
+    /// `Integrity` failure is fail-closed behaviour, not a busy-caused loss —
+    /// counting it would poison the alertable series.
+    #[test]
+    fn test_delete_in_chunks_non_transient_error_counts_no_drop_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let total =
+                delete_in_chunks(100, "test", |_chunk| -> Result<u32, henyey_db::DbError> {
+                    Err(henyey_db::DbError::Integrity("boom".into()))
+                });
+            assert_eq!(total, 0);
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_retry_attempts_total{site=\"retention_trim\"} 0"),
+                "a non-transient error is never retried; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"retention_trim\"} 0"),
+                "a non-transient error must NOT count as a busy-caused drop; got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802 (documented subtlety): a chunk can retry a transient busy and then
+    /// hit a NON-transient error on a later attempt. `attempts` increments
+    /// while `dropped` correctly does not — the two series have no simple
+    /// per-episode ordering relationship, and a missing `dropped` must not be
+    /// read as a missing increment.
+    #[test]
+    fn test_delete_in_chunks_busy_then_non_transient_counts_attempt_not_drop_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let mut calls = 0u32;
+            let total =
+                delete_in_chunks(100, "test", |_chunk| -> Result<u32, henyey_db::DbError> {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(busy_error())
+                    } else {
+                        Err(henyey_db::DbError::Integrity("boom".into()))
+                    }
+                });
+            assert_eq!(calls, 2, "busy is retried once, then fails non-transiently");
+            assert_eq!(total, 0);
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_retry_attempts_total{site=\"retention_trim\"} 1"),
+                "the busy attempt was genuinely retried and must be counted; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"retention_trim\"} 0"),
+                "the loss was non-transient, so no busy-caused drop; got:\n{out}"
+            );
+        });
     }
 }

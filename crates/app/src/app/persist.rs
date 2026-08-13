@@ -344,6 +344,7 @@ impl PersistJob {
                 // error aborts immediately (no retry consumed).
                 if let PersistOutcome::Fatal(e) = commit_with_busy_retry(
                     "catchup DB write",
+                    crate::metrics::SITE_CATCHUP_PERSIST,
                     || data.write_to_db(&db),
                     is_transient_db_busy,
                     &shutdown,
@@ -385,6 +386,7 @@ impl PersistJob {
                 // no retry consumed).
                 if let PersistOutcome::Fatal(e) = commit_with_busy_retry(
                     "ledger close DB write",
+                    crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
                     || write_fn(&db),
                     is_transient_db_busy_anyhow,
                     &shutdown,
@@ -395,6 +397,15 @@ impl PersistJob {
                 // LedgerCloseMeta for RPC (non-fatal).
                 if let Some(meta) = meta_xdr {
                     if let Err(e) = db.store_ledger_close_meta(ledger_seq, &meta) {
+                        // #3802: this arm is log-and-continue — the row is
+                        // permanently lost and RPC sees a hole. Count the
+                        // transient-busy subset so the loss is Prometheus-
+                        // visible instead of log-archaeology only. Behaviour
+                        // (including the warn! below) is unchanged.
+                        crate::metrics::record_db_busy_drop_if_transient(
+                            crate::metrics::SITE_LEDGER_CLOSE_META,
+                            &e,
+                        );
                         tracing::warn!(
                             error = %e,
                             ledger_seq,
@@ -563,7 +574,12 @@ pub(crate) fn is_transient_db_busy(error: &henyey_db::DbError) -> bool {
 /// and can be recovered via `downcast_ref::<DbError>()` — NO string-matching
 /// on the rendered "database is locked" message. A non-`DbError` anyhow error
 /// (downcast fails) is NOT transient → stays fatal.
-fn is_transient_db_busy_anyhow(error: &anyhow::Error) -> bool {
+///
+/// `pub(crate)` (re-exported from `crate::app`) because `crate::metrics`
+/// consumes it for the busy-drop telemetry helpers (#3802). `pub(super)` would
+/// NOT reach there: `mod persist` is a private module of `mod app`, so
+/// `pub(super)` == `pub(in crate::app)`, which excludes `crate::metrics`.
+pub(crate) fn is_transient_db_busy_anyhow(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<henyey_db::DbError>()
         .is_some_and(is_transient_db_busy)
@@ -653,8 +669,17 @@ fn sqlite_extended_code_anyhow(error: &anyhow::Error) -> Option<i32> {
 /// (ledger-close + catchup) are retried. The publish-queue dequeue
 /// (`remove_publish`, warn-only) and the SCP tx-set purge (best-effort) are
 /// intentionally NOT retried — they do not halt consensus.
+///
+/// ## Telemetry (#3802)
+///
+/// `site` is a **stable Prometheus label value** from the closed
+/// `crate::metrics::DB_BUSY_SITES` vocabulary — deliberately a separate
+/// parameter from `context`, which is a human-readable log string that someone
+/// will eventually rephrase. Deriving the label from `context` would silently
+/// rename a production series on a log-wording edit.
 fn commit_with_busy_retry<E: std::fmt::Display>(
     context: &str,
+    site: &'static str,
     mut attempt: impl FnMut() -> Result<(), E>,
     is_transient: impl Fn(&E) -> bool,
     shutdown: &RecoverableShutdownHandle,
@@ -681,7 +706,13 @@ where
                     return PersistOutcome::Fatal(e);
                 }
                 if n < MAX_PERSIST_ATTEMPTS {
+                    // #3640 watch signal — kept, unchanged, still emitted. It
+                    // is the one series with continuous scraped history for the
+                    // 2026-06-26 mainnet outage, so it is NOT superseded away.
+                    // The deliberate double-count against the #3802 sibling
+                    // below is documented in both HELP strings.
                     crate::metrics::DB_BUSY_RETRY_TOTAL.increment(1);
+                    crate::metrics::record_db_busy_retry_attempt(site);
                     let backoff = PERSIST_RETRY_BACKOFF[(n - 1) as usize];
                     tracing::warn!(
                         context,
@@ -706,6 +737,10 @@ where
                         "Persistent SQLite busy on persist DB commit after exhausting \
                          the bounded retry budget; escalating to recoverable shutdown"
                     );
+                    // #3802: the commit is abandoned here — count it as a
+                    // busy-caused write loss. `is_transient(&e)` already
+                    // returned true above, so no re-classification is needed.
+                    crate::metrics::record_db_busy_drop(site);
                     shutdown.trigger(context, &e);
                     return PersistOutcome::RecoverableShutdown;
                 }
@@ -862,6 +897,7 @@ mod tests {
         // would die.)
         let outcome = commit_with_busy_retry(
             "ledger close DB write",
+            crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
             || {
                 Err(db_sqlite_error(
                     rusqlite::ffi::ErrorCode::DatabaseBusy,
@@ -921,6 +957,7 @@ mod tests {
 
         let outcome = commit_with_busy_retry(
             "ledger close DB write",
+            crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
             || -> Result<(), anyhow::Error> {
                 Err(anyhow::Error::new(db_sqlite_error(
                     rusqlite::ffi::ErrorCode::DatabaseBusy,
@@ -1013,6 +1050,7 @@ mod tests {
 
         let outcome = commit_with_busy_retry(
             "test ledger close DB write",
+            crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
             attempt,
             is_transient_db_busy,
             &shutdown,
@@ -1053,6 +1091,7 @@ mod tests {
 
         let outcome = commit_with_busy_retry(
             "test ledger close DB write (anyhow)",
+            crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
             attempt,
             is_transient_db_busy_anyhow,
             &shutdown,
@@ -1084,6 +1123,7 @@ mod tests {
 
         let outcome = commit_with_busy_retry(
             "test ledger close DB write",
+            crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
             attempt,
             is_transient_db_busy,
             &shutdown,
@@ -1127,6 +1167,7 @@ mod tests {
 
         let outcome = commit_with_busy_retry(
             "test ledger close DB write",
+            crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
             attempt,
             is_transient_db_busy,
             &shutdown,
@@ -1145,6 +1186,151 @@ mod tests {
             rx.try_recv().is_err(),
             "no recoverable-shutdown signal must be sent for a non-transient (fatal) error"
         );
+    }
+
+    // ── #3802 busy telemetry ───────────────────────────────────────────
+    //
+    // Counters are process-global, so every one of these runs inside
+    // `metrics::with_local_recorder` on a pristine recorder, in a synchronous
+    // `#[test]` (the helper is thread-local — never `#[tokio::test]`), and
+    // calls `register_label_series()` before any `== 0` assertion, because an
+    // unincremented labelled series is simply absent from the render output.
+
+    /// #3802: a transient busy that clears in-window increments the per-site
+    /// `attempts` series once per retried attempt and the `dropped` series NOT
+    /// AT ALL. This pair — `attempts > 0`, `dropped == 0` — is the signal that
+    /// the bounded retry absorbed the contention. Also asserts the legacy
+    /// `henyey_db_busy_retry_total` is still emitted (decision 3: the #3640
+    /// watch signal is kept, and the double-count is deliberate).
+    #[test]
+    fn busy_retry_counts_attempts_and_no_drop_on_success_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let (tx, _rx) = tokio::sync::broadcast::channel(1);
+            let shutdown = RecoverableShutdownHandle::new(tx);
+
+            // Busy on attempts 1 and 2, Ok on attempt 3 → 2 retried attempts.
+            let calls = Cell::new(0u32);
+            let outcome = commit_with_busy_retry(
+                "test ledger close DB write",
+                crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    if n < 3 {
+                        Err(db_sqlite_error(
+                            rusqlite::ffi::ErrorCode::DatabaseBusy,
+                            5,
+                            "database is locked",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                is_transient_db_busy,
+                &shutdown,
+            );
+            assert!(matches!(outcome, PersistOutcome::Survived));
+
+            let out = handle.render();
+            assert!(
+                out.contains(
+                    "henyey_db_busy_retry_attempts_total{site=\"ledger_close_persist\"} 2"
+                ),
+                "two retried attempts must be counted for the site; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"ledger_close_persist\"} 0"),
+                "a surviving retry must not count as a dropped write; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_retry_total 2"),
+                "the legacy #3640 counter must still be emitted (kept, unchanged); got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802: a persistent busy that exhausts the retry budget increments
+    /// `dropped{site}` exactly once (the commit really was abandoned) and
+    /// `attempts{site}` `MAX_PERSIST_ATTEMPTS - 1` times — the final, giving-up
+    /// attempt is a drop, not a retry.
+    #[test]
+    fn busy_retry_counts_drop_on_budget_exhaustion_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let (tx, _rx) = tokio::sync::broadcast::channel(1);
+            let shutdown = RecoverableShutdownHandle::new(tx);
+
+            let outcome = commit_with_busy_retry(
+                "test catchup DB write",
+                crate::metrics::SITE_CATCHUP_PERSIST,
+                || {
+                    Err(db_sqlite_error(
+                        rusqlite::ffi::ErrorCode::DatabaseBusy,
+                        5,
+                        "database is locked",
+                    ))
+                },
+                is_transient_db_busy,
+                &shutdown,
+            );
+            assert!(matches!(outcome, PersistOutcome::RecoverableShutdown));
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"catchup_persist\"} 1"),
+                "budget exhaustion must count exactly one dropped write; got:\n{out}"
+            );
+            assert!(
+                out.contains(&format!(
+                    "henyey_db_busy_retry_attempts_total{{site=\"catchup_persist\"}} {}",
+                    MAX_PERSIST_ATTEMPTS - 1
+                )),
+                "only the non-final attempts are retries; got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802: a non-transient error short-circuits without consuming a retry,
+    /// so neither busy series moves. Genuine corruption must never appear as
+    /// SQLite contention.
+    #[test]
+    fn non_transient_persist_error_counts_nothing_3802() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            let (tx, _rx) = tokio::sync::broadcast::channel(1);
+            let shutdown = RecoverableShutdownHandle::new(tx);
+
+            let outcome = commit_with_busy_retry(
+                "test ledger close DB write",
+                crate::metrics::SITE_LEDGER_CLOSE_PERSIST,
+                || Err(henyey_db::DbError::Integrity("boom".into())),
+                is_transient_db_busy,
+                &shutdown,
+            );
+            assert!(matches!(outcome, PersistOutcome::Fatal(_)));
+
+            let out = handle.render();
+            assert!(
+                out.contains(
+                    "henyey_db_busy_retry_attempts_total{site=\"ledger_close_persist\"} 0"
+                ),
+                "a non-transient error must not count a retry attempt; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"ledger_close_persist\"} 0"),
+                "a non-transient error must not count a busy-caused drop; got:\n{out}"
+            );
+        });
     }
 
     fn make_header(seq: u32) -> (LedgerHeader, Vec<u8>) {

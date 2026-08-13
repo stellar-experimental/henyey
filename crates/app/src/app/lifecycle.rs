@@ -1796,6 +1796,15 @@ impl App {
                     // `db_write_ctx` so it correlates in log aggregation with
                     // the holder-side `WriteCtxGuard` events that name the
                     // long-holding writer.
+                    //
+                    // #3802: log-and-continue, no retry — the peer record is
+                    // silently lost. Count the transient-busy subset; this is
+                    // the highest-volume of the log-only sites, and the one the
+                    // #3772 "113 of 139" measurement was dominated by.
+                    crate::metrics::record_db_busy_drop_if_transient(
+                        crate::metrics::SITE_PEER_RECORD_UPDATE,
+                        &err,
+                    );
                     tracing::warn!(
                         db_write_ctx = "peer-record-update",
                         ?err,

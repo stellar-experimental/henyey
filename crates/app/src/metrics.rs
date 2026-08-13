@@ -274,6 +274,56 @@ macro_rules! metric_catalog {
     };
 }
 
+// ── DB busy-telemetry site vocabulary (#3802) ──────────────────────────
+//
+// The closed set of `site` label values for the two `henyey_db_busy_*`
+// labelled counters below. Every value is pre-registered at zero by
+// `register_label_series`, so an un-hit site renders as an explicit `0`
+// rather than being absent from the scrape (absence is indistinguishable
+// from "not instrumented").
+//
+// These are declared as named constants — not bare literals — so the catalog
+// entry and every emitting call site share one symbol and cannot drift by
+// typo. `record_db_busy_*` additionally `debug_assert!`s membership, turning
+// a wrong-constant copy-paste into a test-build panic.
+//
+// Adding a value is a deliberate, reviewed change: it must be added HERE, in
+// both catalog entries below, and in `DB_BUSY_SITES` — and
+// `test_db_busy_site_label_vocabulary_pinned` fails until all three agree.
+//
+// Reserved (NOT yet in the vocabulary — added by the PR that wires the
+// emitter, so no misleading always-zero series exists in between):
+//   - `catchup_meta` — `crates/history/src/catchup/persist.rs` `emit_meta` (#3801)
+//   - `tx_set_gc`    — `crates/herder/src/herder.rs` tx-set GC purge (#3806)
+
+/// Ledger-close persist DB commit (`commit_with_busy_retry`, bounded retry).
+pub const SITE_LEDGER_CLOSE_PERSIST: &str = "ledger_close_persist";
+/// Catchup persist DB commit (`commit_with_busy_retry`, bounded retry).
+pub const SITE_CATCHUP_PERSIST: &str = "catchup_persist";
+/// Live ledger-close `LedgerCloseMeta` row write (log-and-continue, RPC-visible).
+pub const SITE_LEDGER_CLOSE_META: &str = "ledger_close_meta";
+/// Maintenance retention trim (`delete_in_chunks`, bounded retry; shared by
+/// all five retention tables).
+pub const SITE_RETENTION_TRIM: &str = "retention_trim";
+/// Stale publish-queue eviction (log-and-continue).
+pub const SITE_PUBLISH_QUEUE_EVICT: &str = "publish_queue_evict";
+/// Failed-peer prune (log-and-continue).
+pub const SITE_PEER_FAILURE_PRUNE: &str = "peer_failure_prune";
+/// Peer-record update from the overlay peer-event loop (log-and-continue).
+pub const SITE_PEER_RECORD_UPDATE: &str = "peer_record_update";
+
+/// The complete, closed `site` label vocabulary for the `henyey_db_busy_*`
+/// labelled counters. Pinned by `test_db_busy_site_label_vocabulary_pinned`.
+pub const DB_BUSY_SITES: &[&str] = &[
+    SITE_LEDGER_CLOSE_PERSIST,
+    SITE_CATCHUP_PERSIST,
+    SITE_LEDGER_CLOSE_META,
+    SITE_RETENTION_TRIM,
+    SITE_PUBLISH_QUEUE_EVICT,
+    SITE_PEER_FAILURE_PRUNE,
+    SITE_PEER_RECORD_UPDATE,
+];
+
 // ── Metric catalog ─────────────────────────────────────────────────────
 
 metric_catalog! {
@@ -618,7 +668,12 @@ metric_catalog! {
         DB_BUSY_RETRY_TOTAL = "henyey_db_busy_retry_total"
             => "Total bounded retries of a consensus-critical persist DB commit \
                 after a transient SQLITE_BUSY/LOCKED, before escalating to a \
-                clean recoverable shutdown; see issue #3640";
+                clean recoverable shutdown; see issue #3640. Superseded for new \
+                sites by henyey_db_busy_retry_attempts_total{site}, which \
+                double-counts this counter's events \
+                (site=\"ledger_close_persist\"|\"catchup_persist\"); retained \
+                unchanged for continuity with the #3640 incident timeline — do \
+                NOT sum the two";
         EVENT_LOOP_STALL_ERROR_TOTAL = "henyey_event_loop_stall_error_total"
             => "Event-loop stalls of >=30s, counted loop-side exactly once per \
                 stall when the loop resumes (issue #3795). Complete by \
@@ -938,6 +993,37 @@ metric_catalog! {
                        "at_tip_no_scp_hard_reset", "archive_behind_peer_ahead_hard_reset",
                        "hard_reset_suppressed_archive_behind", "near_tip_peer_scp_recovery",
                        "near_tip_peer_scp_widen", "near_tip_gap1_suppressed"];
+
+        // DB busy telemetry (#3802). Two single-label counters rather than one
+        // two-label counter: `LabeledCounterMetric` carries exactly one label
+        // key by construction.
+        DB_BUSY_RETRY_ATTEMPTS_TOTAL = "henyey_db_busy_retry_attempts_total"
+            => "Transient SQLITE_BUSY/LOCKED failures that were followed by \
+                another attempt, by call site (one per retried attempt, NOT one \
+                per episode). Leading indicator of write-lock contention: \
+                attempts>0 with henyey_db_busy_write_dropped_total==0 for the \
+                same site is the 'bounded retry absorbed the contention' \
+                signal. Overlaps henyey_db_busy_retry_total for \
+                site=\"ledger_close_persist\"|\"catchup_persist\", which is \
+                retained unchanged for #3640 continuity — do NOT sum the two",
+            "site", [SITE_LEDGER_CLOSE_PERSIST, SITE_CATCHUP_PERSIST, SITE_LEDGER_CLOSE_META,
+                     SITE_RETENTION_TRIM, SITE_PUBLISH_QUEUE_EVICT, SITE_PEER_FAILURE_PRUNE,
+                     SITE_PEER_RECORD_UPDATE];
+        DB_BUSY_WRITE_DROPPED_TOTAL = "henyey_db_busy_write_dropped_total"
+            => "DB writes ultimately NOT applied because of a transient \
+                SQLITE_BUSY/LOCKED — retry-budget exhaustion, or a \
+                log-and-continue site dropping on the first busy. This is the \
+                alertable series; the `site` label identifies the consequence \
+                (e.g. site=\"ledger_close_meta\" is an RPC-visible hole, \
+                site=\"retention_trim\" self-heals next maintenance cycle). \
+                Non-transient errors are never counted here. NOTE: a retried \
+                site can fail non-transiently on a later attempt, so `attempts` \
+                may increment while `dropped` correctly does not — the two have \
+                no per-episode ordering relationship, and a missing `dropped` \
+                is not a missing increment",
+            "site", [SITE_LEDGER_CLOSE_PERSIST, SITE_CATCHUP_PERSIST, SITE_LEDGER_CLOSE_META,
+                     SITE_RETENTION_TRIM, SITE_PUBLISH_QUEUE_EVICT, SITE_PEER_FAILURE_PRUNE,
+                     SITE_PEER_RECORD_UPDATE];
     }
 
     histograms {
@@ -1788,11 +1874,99 @@ pub fn reset_loadgen_meters() {
     }
 }
 
+// ── DB busy-telemetry recording helpers (#3802) ────────────────────────
+//
+// The classify-and-count decision lives in one unit-testable place instead of
+// being smeared across the log-and-continue call sites, each of which would
+// otherwise need a live `App` (or a real lock-contending SQLite connection) to
+// exercise. Call sites keep their existing `warn!` verbatim and gain exactly
+// one statement — no control flow, no error path, and no log line changes.
+
+/// Record one retried attempt against `site`'s contention series.
+///
+/// Call once per transient-busy failure that will be followed by another
+/// attempt — never on the final, give-up attempt (that is a *drop*).
+pub(crate) fn record_db_busy_retry_attempt(site: &'static str) {
+    debug_assert!(
+        DB_BUSY_SITES.contains(&site),
+        "unknown db-busy site label: {site}"
+    );
+    DB_BUSY_RETRY_ATTEMPTS_TOTAL.increment(site, 1);
+}
+
+/// Record one abandoned write against `site`'s loss series.
+///
+/// The caller must ALREADY have established that the loss was caused by a
+/// transient `SQLITE_BUSY`/`SQLITE_LOCKED` (as the bounded-retry helpers have,
+/// by construction, on their exhaustion path). Log-and-continue sites, which
+/// have not classified anything yet, should call
+/// [`record_db_busy_drop_if_transient`] / [`record_db_busy_drop_if_transient_anyhow`].
+pub(crate) fn record_db_busy_drop(site: &'static str) {
+    debug_assert!(
+        DB_BUSY_SITES.contains(&site),
+        "unknown db-busy site label: {site}"
+    );
+    DB_BUSY_WRITE_DROPPED_TOTAL.increment(site, 1);
+}
+
+/// Count `err` as a busy-caused write loss at `site` **iff** it classifies as a
+/// transient `SQLITE_BUSY`/`SQLITE_LOCKED`. Returns whether it did.
+///
+/// Non-transient errors (corruption, integrity, IO) are a different failure
+/// class and must NOT inflate the busy-loss series.
+pub(crate) fn record_db_busy_drop_if_transient(
+    site: &'static str,
+    err: &henyey_db::DbError,
+) -> bool {
+    let transient = crate::app::is_transient_db_busy(err);
+    if transient {
+        record_db_busy_drop(site);
+    }
+    transient
+}
+
+/// `&anyhow::Error` sibling of [`record_db_busy_drop_if_transient`], for the
+/// call sites whose DB helper returns `anyhow::Result`. Classification is by
+/// `downcast_ref::<DbError>()` — never by string-matching the rendered message
+/// — so a non-`DbError` anyhow error counts as non-transient.
+pub(crate) fn record_db_busy_drop_if_transient_anyhow(
+    site: &'static str,
+    err: &anyhow::Error,
+) -> bool {
+    let transient = crate::app::is_transient_db_busy_anyhow(err);
+    if transient {
+        record_db_busy_drop(site);
+    }
+    transient
+}
+
+/// Build a pristine local recorder for tests that assert absolute values.
+///
+/// `with_local_recorder` is thread-local — this helper is only correct for
+/// synchronous `#[test]` functions. Do NOT use in `#[tokio::test]` or any
+/// async context where work may span threads.
+///
+/// Uses a bare `PrometheusBuilder` (no custom histogram buckets) because these
+/// tests only inspect counter/gauge values, never histogram boundaries.
+///
+/// `pub(crate)` so the busy-telemetry tests in `app::persist` and `maintainer`
+/// can assert against an isolated recorder too — counters are process-global,
+/// so every counter-asserting test MUST run inside
+/// `metrics::with_local_recorder(&recorder, || …)`.
+#[cfg(test)]
+pub(crate) fn fresh_local_recorder() -> (
+    metrics_exporter_prometheus::PrometheusRecorder,
+    PrometheusHandle,
+) {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    (recorder, handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use catalog_arrays::*;
-    use metrics_exporter_prometheus::PrometheusRecorder;
     use std::collections::HashSet;
 
     /// Build the union of all known metric names from the catalog.
@@ -1807,20 +1981,6 @@ mod tests {
     /// Regex matching PromQL identifier tokens.
     fn metric_token_regex() -> regex::Regex {
         regex::Regex::new(r"[a-zA-Z_:][a-zA-Z0-9_:]*").unwrap()
-    }
-
-    /// Build a pristine local recorder for tests that assert absolute zero values.
-    ///
-    /// `with_local_recorder` is thread-local — this helper is only correct for
-    /// synchronous `#[test]` functions. Do NOT use in `#[tokio::test]` or any
-    /// async context where work may span threads.
-    ///
-    /// Uses a bare `PrometheusBuilder` (no custom histogram buckets) because
-    /// these tests only inspect counter/gauge values, never histogram boundaries.
-    fn fresh_local_recorder() -> (PrometheusRecorder, PrometheusHandle) {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        (recorder, handle)
     }
 
     #[test]
@@ -2322,6 +2482,238 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ── DB busy telemetry (#3802) ──────────────────────────────────────
+
+    /// Build a transient `DatabaseBusy` (`SQLITE_BUSY`) error — the exact shape
+    /// `is_transient_db_busy` classifies as recoverable. `extended_code` is
+    /// traceability only; the gate is the primary `DatabaseBusy` code.
+    fn busy_db_error() -> henyey_db::DbError {
+        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    /// #3802: both busy-telemetry counters are in the catalog and their typed
+    /// constants match the wire names, so a rename of one without the other
+    /// fails here rather than silently breaking a dashboard/alert later.
+    ///
+    /// Deliberately does NOT assert `ALL_PREREGISTERED_COUNTER_NAMES`: the
+    /// catalog macro builds that array from the unlabelled `counters` bucket
+    /// only, so labelled counters are excluded by construction. Their
+    /// zero-registration is asserted by
+    /// `test_db_busy_site_series_preregistered_at_zero` instead.
+    #[test]
+    fn test_db_busy_counters_in_catalog() {
+        assert_eq!(
+            super::DB_BUSY_RETRY_ATTEMPTS_TOTAL,
+            "henyey_db_busy_retry_attempts_total"
+        );
+        assert_eq!(
+            super::DB_BUSY_WRITE_DROPPED_TOTAL,
+            "henyey_db_busy_write_dropped_total"
+        );
+        assert_eq!(super::DB_BUSY_RETRY_ATTEMPTS_TOTAL.key, "site");
+        assert_eq!(super::DB_BUSY_WRITE_DROPPED_TOTAL.key, "site");
+
+        let counters: HashSet<&str> = ALL_COUNTER_NAMES.iter().copied().collect();
+        assert!(
+            counters.contains("henyey_db_busy_retry_attempts_total"),
+            "attempts counter missing from the catalog"
+        );
+        assert!(
+            counters.contains("henyey_db_busy_write_dropped_total"),
+            "dropped counter missing from the catalog"
+        );
+    }
+
+    /// #3802: every `site` value in the closed vocabulary is pre-registered at
+    /// zero for BOTH counters. An un-hit site must render an explicit `0` —
+    /// absence is indistinguishable from "not instrumented", which is precisely
+    /// the failure mode this issue exists to remove.
+    ///
+    /// This also catches drift between `DB_BUSY_SITES` and the two literal
+    /// lists inside `metric_catalog!`: a site present in the former but missing
+    /// from the latter is not pre-registered and fails here.
+    #[test]
+    fn test_db_busy_site_series_preregistered_at_zero() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+
+        for name in [
+            "henyey_db_busy_retry_attempts_total",
+            "henyey_db_busy_write_dropped_total",
+        ] {
+            assert!(
+                output.contains(&format!("# TYPE {name} counter")),
+                "missing TYPE counter for {name}"
+            );
+            for site in DB_BUSY_SITES {
+                let series = format!("{name}{{site=\"{site}\"}} 0");
+                assert!(
+                    output.contains(&series),
+                    "missing pre-registered zero series: {series}"
+                );
+            }
+        }
+    }
+
+    /// #3802: pin the exact `site` vocabulary. #3801 (`catchup_meta`) and
+    /// #3806 (`tx_set_gc`) each add their value in the SAME PR that wires the
+    /// emitter, so this test failing is the intended, reviewed signal — not
+    /// drift. It also pins the label contract #3801's plan was written against.
+    #[test]
+    fn test_db_busy_site_label_vocabulary_pinned() {
+        assert_eq!(
+            DB_BUSY_SITES,
+            &[
+                "ledger_close_persist",
+                "catchup_persist",
+                "ledger_close_meta",
+                "retention_trim",
+                "publish_queue_evict",
+                "peer_failure_prune",
+                "peer_record_update",
+            ],
+            "the db-busy site vocabulary changed; update the catalog entries \
+             and confirm the change is deliberate"
+        );
+
+        // Reserved values must NOT be present until their emitter lands.
+        assert!(
+            !DB_BUSY_SITES.contains(&"catchup_meta"),
+            "catchup_meta is reserved for #3801 and must land with its emitter"
+        );
+        assert!(
+            !DB_BUSY_SITES.contains(&"tx_set_gc"),
+            "tx_set_gc is reserved for #3806 and must land with its emitter"
+        );
+    }
+
+    /// #3802 decision 3: the legacy `henyey_db_busy_retry_total` is KEPT and
+    /// still pre-registered. It is the #3640 mainnet-outage watch signal — the
+    /// one series with continuous scraped history for that incident — so the
+    /// deliberate double-count with the new labelled family must not be
+    /// "cleaned up" by retiring it.
+    #[test]
+    fn test_db_busy_retry_total_retained() {
+        assert_eq!(super::DB_BUSY_RETRY_TOTAL, "henyey_db_busy_retry_total");
+        assert!(
+            ALL_COUNTER_NAMES.contains(&"henyey_db_busy_retry_total"),
+            "the #3640 watch counter must stay in the catalog"
+        );
+        assert!(
+            ALL_PREREGISTERED_COUNTER_NAMES.contains(&"henyey_db_busy_retry_total"),
+            "the #3640 watch counter must stay pre-registered (unlabelled counters bucket)"
+        );
+    }
+
+    /// #3802: the classify-and-count helper counts a transient busy and returns
+    /// `true`; a non-transient `DbError` counts nothing and returns `false`.
+    /// Non-transient failures are a different class and must not inflate the
+    /// alertable busy-loss series.
+    #[test]
+    fn test_record_db_busy_drop_if_transient_counts_only_busy() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            // Mandatory before any `== 0` assertion: an unincremented labelled
+            // series does not exist in the render output at all.
+            register_label_series();
+
+            assert!(record_db_busy_drop_if_transient(
+                SITE_LEDGER_CLOSE_META,
+                &busy_db_error()
+            ));
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"ledger_close_meta\"} 1"),
+                "a transient busy must be counted; got:\n{out}"
+            );
+
+            assert!(!record_db_busy_drop_if_transient(
+                SITE_LEDGER_CLOSE_META,
+                &henyey_db::DbError::Integrity("boom".into())
+            ));
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"ledger_close_meta\"} 1"),
+                "a non-transient error must NOT be counted; got:\n{out}"
+            );
+            // Sibling sites stay at their pre-registered zero.
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"retention_trim\"} 0"),
+                "unrelated sites must remain at 0; got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802: the `anyhow` sibling classifies by `downcast_ref::<DbError>()`,
+    /// never by string-matching the rendered message — so an `anyhow`-wrapped
+    /// `DatabaseBusy` counts and a plain `anyhow!` does not, even though the
+    /// latter can be made to render the same text.
+    #[test]
+    fn test_record_db_busy_drop_if_transient_anyhow_downcasts() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+
+            assert!(record_db_busy_drop_if_transient_anyhow(
+                SITE_PEER_FAILURE_PRUNE,
+                &anyhow::Error::new(busy_db_error())
+            ));
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"peer_failure_prune\"} 1"),
+                "a downcastable busy must be counted; got:\n{out}"
+            );
+
+            // Same rendered text, no typed DbError underneath → not transient.
+            assert!(!record_db_busy_drop_if_transient_anyhow(
+                SITE_PEER_FAILURE_PRUNE,
+                &anyhow::anyhow!("database is locked")
+            ));
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"peer_failure_prune\"} 1"),
+                "a non-DbError anyhow must NOT be counted (no string matching); got:\n{out}"
+            );
+        });
+    }
+
+    /// #3802: the retry-attempt helper increments its own series and leaves the
+    /// drop series untouched — `attempts > 0` with `dropped == 0` is the
+    /// "bounded retry absorbed the contention" signal the deploy needs.
+    #[test]
+    fn test_record_db_busy_retry_attempt_counts_attempts_only() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+
+            record_db_busy_retry_attempt(SITE_RETENTION_TRIM);
+            record_db_busy_retry_attempt(SITE_RETENTION_TRIM);
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_retry_attempts_total{site=\"retention_trim\"} 2"),
+                "two retried attempts must be counted; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"retention_trim\"} 0"),
+                "a retried attempt is not a drop; got:\n{out}"
+            );
+        });
     }
 
     #[test]
