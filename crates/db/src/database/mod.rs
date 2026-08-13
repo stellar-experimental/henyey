@@ -294,6 +294,71 @@ mod tests {
         .unwrap();
     }
 
+    /// #3812: `cleanup_ahead_of_lcl` must anchor on the durable LCL
+    /// (`lastclosedledger`) and truncate every history row strictly above it,
+    /// returning the number of rows removed. FAILS on origin/main: no cleanup
+    /// exists, so `MAX(ledgerseq)` would stay at 110 (the issue's divergence).
+    #[test]
+    fn test_cleanup_ahead_of_lcl_anchors_on_durable_lcl() {
+        use crate::queries::StateQueries;
+
+        let db = Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            conn.set_last_closed_ledger(100)?;
+            for seq in 1..=110u32 {
+                conn.execute(
+                    "INSERT INTO ledgerheaders \
+                     (ledgerhash, prevhash, bucketlisthash, ledgerseq, closetime, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        format!("h{seq}"),
+                        format!("p{seq}"),
+                        format!("b{seq}"),
+                        seq,
+                        0i64,
+                        vec![0u8]
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Only seq 101..=110 are ahead of the durable LCL → 10 rows removed.
+        assert_eq!(db.cleanup_ahead_of_lcl().unwrap(), Some(10));
+        assert_eq!(db.get_latest_ledger_seq().unwrap(), Some(100));
+    }
+
+    /// #3812: with no durable LCL yet (fresh/legacy DB), `cleanup_ahead_of_lcl`
+    /// must be a no-op returning `None` — there is no authoritative anchor to
+    /// truncate against. FAILS on origin/main: method does not exist.
+    #[test]
+    fn test_cleanup_ahead_of_lcl_noop_without_durable_lcl() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            for seq in 1..=5u32 {
+                conn.execute(
+                    "INSERT INTO ledgerheaders \
+                     (ledgerhash, prevhash, bucketlisthash, ledgerseq, closetime, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        format!("h{seq}"),
+                        format!("p{seq}"),
+                        format!("b{seq}"),
+                        seq,
+                        0i64,
+                        vec![0u8]
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(db.cleanup_ahead_of_lcl().unwrap(), None);
+        assert_eq!(db.get_latest_ledger_seq().unwrap(), Some(5));
+    }
+
     #[test]
     fn test_open_in_memory_initializes_schema() {
         let db = Database::open_in_memory().unwrap();

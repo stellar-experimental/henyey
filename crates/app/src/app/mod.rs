@@ -4879,6 +4879,45 @@ mod tests {
     use stellar_xdr::StellarValueExt;
     use tempfile;
 
+    /// #3812: the startup cleanup seam must truncate ahead-of-LCL history rows
+    /// left by an interrupted catchup (Window 1), so the whole startup path and
+    /// every live reader observe `MAX(ledgerseq) == durable LCL`. This invokes
+    /// exactly the `db.cleanup_ahead_of_lcl()` call `App::new()` runs immediately
+    /// before `verify_on_disk_integrity`. FAILS on origin/main: the method does
+    /// not exist and `MAX(ledgerseq)` would stay at 110.
+    #[test]
+    fn test_startup_cleanup_truncates_ahead_of_lcl_history() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO storestate (statename, state) \
+                 VALUES ('lastclosedledger', '100')",
+                [],
+            )?;
+            for seq in 1..=110u32 {
+                conn.execute(
+                    "INSERT INTO ledgerheaders \
+                     (ledgerhash, prevhash, bucketlisthash, ledgerseq, closetime, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        format!("h{seq}"),
+                        format!("p{seq}"),
+                        format!("b{seq}"),
+                        seq,
+                        0i64,
+                        vec![0u8]
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let deleted = db.cleanup_ahead_of_lcl().unwrap();
+        assert_eq!(deleted, Some(10));
+        assert_eq!(db.get_latest_ledger_seq().unwrap(), Some(100));
+    }
+
     /// #3478: the best-effort GC path must SKIP (not crash) on a transient-IO
     /// (ENOSPC/EDQUOT) merge-resolution failure, and stay FATAL on corruption
     /// or non-free-space IO. This guards the transient-vs-fatal decision the
