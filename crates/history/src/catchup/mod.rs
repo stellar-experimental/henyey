@@ -547,13 +547,15 @@ impl CatchupManager {
         // - `emit_meta` (replay.rs — LedgerCloseMeta rows)
         // All share the same non-authoritative property.
         //
-        // CAVEAT: `verify_on_disk_integrity()` and CLI readers
-        // (`publish_history`, `self_check`) still anchor on
-        // `get_latest_ledger_seq()` → `MAX(ledgerseq)` and may observe
-        // ahead-of-LCL state after a Window-1 crash. `verify_on_disk_integrity`
-        // is harmless (hash chain remains valid because headers are written
-        // sequentially), but CLI readers are a known gap requiring future
-        // hardening to use durable LCL/HAS as their authority anchor
+        // AHEAD-OF-LCL SWEEP: after a Window-1 crash these rows can lead the
+        // durable LCL by up to one checkpoint. `Database::cleanup_ahead_of_lcl()`
+        // (#3812, ports stellar-core `CheckpointBuilder::cleanup(lcl)`) truncates
+        // every `MAX(ledgerseq)`-anchored table strictly above the durable LCL at
+        // node startup (before `verify_on_disk_integrity()`) and in the offline
+        // CLI readers (`publish_history`, `self_check`) right after they open the
+        // DB, so no reader observes ahead-of-LCL state. `verify_on_disk_integrity`
+        // was harmless even before the sweep (hash chain stays valid because
+        // headers are written sequentially).
         // (see crates/history/SPEC_ADHERENCE.md §14.5).
         //
         // This is the first of two crash windows; the second (deferred-persist)

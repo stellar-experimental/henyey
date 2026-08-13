@@ -83,6 +83,18 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
     // Open database to get current state
     let db = henyey_db::Database::open(&config.database.path)?;
 
+    // #3812: remove any ahead-of-LCL history rows left by an interrupted catchup
+    // before anchoring on MAX(ledgerseq), so we publish only complete checkpoints
+    // at or below the durable LCL (mirrors stellar-core CheckpointBuilder::cleanup).
+    if let Some(deleted) = db.cleanup_ahead_of_lcl()? {
+        if deleted > 0 {
+            println!(
+                "Removed {} ahead-of-LCL history row(s) left by an interrupted catchup",
+                deleted
+            );
+        }
+    }
+
     // Get current ledger from database
     let current_ledger = db
         .get_latest_ledger_seq()?

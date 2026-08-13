@@ -3896,6 +3896,18 @@ fn self_check_crypto_benchmark() {
 async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     let db = henyey_db::Database::open(&config.database.path)?;
 
+    // #3812: remove any ahead-of-LCL history rows left by an interrupted catchup
+    // before anchoring on MAX(ledgerseq), so the self-check verifies only the
+    // authoritative header chain at or below the durable LCL.
+    if let Some(deleted) = db.cleanup_ahead_of_lcl()? {
+        if deleted > 0 {
+            println!(
+                "  Removed {} ahead-of-LCL history row(s) left by an interrupted catchup",
+                deleted
+            );
+        }
+    }
+
     let Some(latest_seq) = db.get_latest_ledger_seq()? else {
         println!("  No ledger data in database. Skipping header verification.");
         println!();
