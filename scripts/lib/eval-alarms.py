@@ -49,6 +49,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -360,6 +361,116 @@ def write_snapshot(path: Path, data: dict[str, str]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(path)
+
+
+# ── Alarm cooldown (dedup) file ──────────────────────────────────────────────
+#
+# `anomaly_cooldown.json` is the monitor's alarm-dedup state. Historically it
+# was written by a hand-performed JSON edit in the tick procedure (#3762) — a
+# step that failed silently whenever an agent skipped it, most often on an
+# alarm's *first* fire (no prior entry to pattern-match against). These helpers
+# move the whole read/suppress/write lifecycle into the one tool that already
+# knows `cooldown_key`, `cooldown_seconds`, and which alarms are firing.
+#
+# The file has a historically MIXED schema: some values are dicts
+# ({"last_fired": <int>, "cooldown_seconds": <int>}), others are bare ints.
+# read_cooldown_file normalizes bare ints to dict form on read; write_cooldown_file
+# always emits normalized dict form, one-time-migrating the bare ints.
+
+def _normalize_cooldown_entry(value: object) -> dict:
+    """Normalize one cooldown value to dict form.
+
+    Bare int/float `X` → {"last_fired": int(X)}; a dict is passed through
+    (unknown sub-keys preserved). Anything else yields {} (dropped last_fired),
+    which the callers treat as "no prior fire".
+    """
+    if isinstance(value, dict):
+        entry = dict(value)
+        if "last_fired" in entry:
+            try:
+                entry["last_fired"] = int(entry["last_fired"])
+            except (TypeError, ValueError):
+                pass
+        return entry
+    if isinstance(value, bool):
+        # bool is an int subclass — treat as no usable timestamp.
+        return {}
+    if isinstance(value, (int, float)):
+        return {"last_fired": int(value)}
+    return {}
+
+
+def read_cooldown_file(path: Path) -> dict[str, dict]:
+    """Read the alarm-cooldown dedup file, normalizing the mixed schema.
+
+    Missing/empty/malformed file → {} (fail toward "no prior fires", i.e. the
+    next fire is reported so nothing is silently suppressed). Every returned
+    value is a dict; unknown keys are preserved verbatim.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: _normalize_cooldown_entry(v) for k, v in raw.items()}
+
+
+def write_cooldown_file(path: Path, data: dict[str, dict]) -> None:
+    """Write the alarm-cooldown dedup file atomically via rename.
+
+    Always emits normalized dict form (bare ints one-time-migrated). No-op when
+    _NO_SNAPSHOT_WRITE is set (--no-snapshot-write), mirroring write_snapshot so
+    a read-only diagnostic re-run never mutates the dedup window. The temp file
+    is created in the target's OWN directory so the rename stays atomic and no
+    unrelated directory (e.g. cwd) is dirtied.
+    """
+    if _NO_SNAPSHOT_WRITE:
+        return
+    normalized = {k: _normalize_cooldown_entry(v) for k, v in data.items()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(normalized, indent=2, sort_keys=True) + "\n")
+    tmp.rename(path)
+
+
+def apply_cooldowns(results: list[dict], cooldown_data: dict[str, dict],
+                    now: int) -> None:
+    """Suppress in-window firing metrics-family alarms; persist fresh fires.
+
+    Scoped to `contributes_to == "metrics"` (Critic A): the ratio/streak
+    families are rendered by their own lines in render_aggregate and have no
+    `cooldown` branch, so flipping them would mislabel a suppressed alarm as
+    `ok`. Mutates `results` and `cooldown_data` in place.
+
+    For each firing metrics-family alarm, keyed by its `cooldown_key`:
+      - if a prior `last_fired` is within `cooldown_seconds` (strict `<`), it is
+        a duplicate the agent already filed this window: suppress it — set
+        state="cooldown", record `cooldown_remaining_seconds`, and do NOT bump
+        `last_fired`. The `now - last_fired == cooldown_seconds` boundary is
+        OUTSIDE the window and re-fires.
+      - otherwise it is a genuine fire the agent will file this tick: record
+        `last_fired = now` (and the catalog `cooldown_seconds`). Recording at
+        detection — not after filing — means a crash between eval and filing
+        marks it fired-but-unfiled for one window (self-heals next window);
+        strictly better than today's fail-open duplicate storm (#3762).
+    """
+    for r in results:
+        if r.get("contributes_to") != "metrics":
+            continue
+        if r.get("state") != "firing":
+            continue
+        key = r["cooldown_key"]
+        cooldown_seconds = r["cooldown_seconds"]
+        entry = cooldown_data.get(key)
+        last_fired = entry.get("last_fired") if entry else None
+        if last_fired is not None and (now - last_fired) < cooldown_seconds:
+            r["state"] = "cooldown"
+            r["cooldown_remaining_seconds"] = cooldown_seconds - (now - last_fired)
+        else:
+            cooldown_data[key] = {"last_fired": now, "cooldown_seconds": cooldown_seconds}
 
 
 # ── Alarm evaluation ────────────────────────────────────────────────────────
@@ -1569,9 +1680,16 @@ def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
     # metrics line
     metrics_alarms = [r for r in results if r["contributes_to"] == "metrics"]
     firing = [r for r in metrics_alarms if r["state"] == "firing"]
+    # Cooldown-suppressed alarms (#3762): a firing alarm still inside its dedup
+    # window, flipped by apply_cooldowns. They are excluded from the firing
+    # count so they neither flip the banner nor get filed (the agent only files
+    # state=="firing"), and surfaced separately for visibility.
+    cooldown = [r for r in metrics_alarms if r["state"] == "cooldown"]
     skipped = [r for r in metrics_alarms if r["state"] == "skipped"]
     total = len(metrics_alarms)
     metrics_line = f"metrics: {len(firing)}/{total} firing"
+    if cooldown:
+        metrics_line += f", {len(cooldown)} in cooldown"
     if skipped:
         skip_reasons = set(r.get("skip_reason", "") for r in skipped)
         metrics_line += f", {len(skipped)} skipped ({', '.join(r for r in skip_reasons if r)})"
@@ -1800,6 +1918,21 @@ def main() -> int:
         help="Evaluate without persisting any snapshot/state files (read-only "
              "dry-run for diagnostic/repeat invocations within a tick)",
     )
+    parser.add_argument(
+        "--cooldown-file",
+        default=None,
+        help="Path to the alarm-dedup JSON (anomaly_cooldown.json). When set, "
+             "the evaluator suppresses metrics-family alarms still inside their "
+             "cooldown window (state=cooldown) and persists last_fired for the "
+             "ones it reports firing — removing the manual JSON edit (#3762).",
+    )
+    parser.add_argument(
+        "--now",
+        type=int,
+        default=None,
+        help="Unix timestamp used as 'now' for cooldown-window math "
+             "(defaults to int(time.time())); primarily for deterministic tests.",
+    )
     args = parser.parse_args()
 
     # Gate the single write_snapshot() chokepoint for the whole process.
@@ -1981,6 +2114,16 @@ def main() -> int:
 
     # Save gauge persistence state
     write_snapshot(persist_path, persistence_state)
+
+    # Alarm-cooldown lifecycle (#3762): when a dedup file is supplied, the tool
+    # owns read/suppress/write so the manual JSON edit can be deleted. Absent
+    # --cooldown-file, this is a no-op and behavior is byte-for-byte legacy.
+    if args.cooldown_file:
+        now = args.now if args.now is not None else int(time.time())
+        cooldown_path = Path(args.cooldown_file)
+        cooldown_data = read_cooldown_file(cooldown_path)
+        apply_cooldowns(results, cooldown_data, now)
+        write_cooldown_file(cooldown_path, cooldown_data)
 
     watcher_mode = monitor_mode == "watcher"
     aggregate = render_aggregate(results, watcher_mode)
