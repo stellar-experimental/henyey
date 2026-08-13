@@ -675,3 +675,126 @@ impl App {
         deduped
     }
 }
+
+#[cfg(test)]
+mod dns_backoff_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn peer() -> PeerAddress {
+        PeerAddress::new("v3.stellar.lobstr.co", 11625)
+    }
+
+    fn state(consecutive_failures: u32, last_attempt_at: Instant) -> DnsResolveState {
+        DnsResolveState {
+            consecutive_failures,
+            last_attempt_at,
+            last_result: peer(),
+        }
+    }
+
+    #[test]
+    fn test_next_allowed_attempt_backs_off_and_caps() {
+        let base = Instant::now();
+        // No failures: eligible immediately (no added delay).
+        assert_eq!(next_allowed_attempt(&state(0, base)), base);
+        // Linear backoff: consecutive_failures * PEER_IP_RESOLVE_RETRY_DELAY.
+        assert_eq!(
+            next_allowed_attempt(&state(1, base)),
+            base + Duration::from_secs(10)
+        );
+        assert_eq!(
+            next_allowed_attempt(&state(5, base)),
+            base + Duration::from_secs(50)
+        );
+        // Caps at PEER_IP_RESOLVE_DELAY (600s), matching stellar-core.
+        assert_eq!(
+            next_allowed_attempt(&state(60, base)),
+            base + Duration::from_secs(600)
+        );
+        assert_eq!(
+            next_allowed_attempt(&state(10_000, base)),
+            base + Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn test_resolve_peers_for_storage_skips_lookup_within_backoff_window() {
+        let base = Instant::now();
+        let st = state(1, base); // one failure -> next allowed at base + 10s.
+
+        // Within the 10s window: host must NOT be re-attempted.
+        assert!(in_backoff_window(&st, base + Duration::from_secs(5)));
+        // At/after the window boundary: attempt again.
+        assert!(!in_backoff_window(&st, base + Duration::from_secs(10)));
+        assert!(!in_backoff_window(&st, base + Duration::from_secs(30)));
+        // A host with no recorded failures is never in a backoff window.
+        assert!(!in_backoff_window(&state(0, base), base));
+
+        // A skipped attempt reuses the last known result and leaves the
+        // failure count unchanged (no new DNS syscall was made).
+        let (new_state, addr, log) = apply_dns_result(
+            Some(&st),
+            &peer(),
+            DnsAttempt::Skipped,
+            base + Duration::from_secs(5),
+        );
+        assert_eq!(addr, st.last_result);
+        assert_eq!(new_state.consecutive_failures, 1);
+        assert!(matches!(log, DnsLog::None));
+    }
+
+    #[test]
+    fn test_resolve_peers_for_storage_logs_only_on_transition() {
+        let t0 = Instant::now();
+
+        // First failure: resolved -> failed transition, WARN once.
+        let (s1, a1, l1) = apply_dns_result(None, &peer(), DnsAttempt::Failed, t0);
+        assert_eq!(s1.consecutive_failures, 1);
+        // Stored as the hostname, matching prior behavior.
+        assert_eq!(a1, peer());
+        assert!(matches!(l1, DnsLog::WarnFailed));
+
+        // Second consecutive failure: steady state, DEBUG only.
+        let (s2, _a2, l2) = apply_dns_result(
+            Some(&s1),
+            &peer(),
+            DnsAttempt::Failed,
+            t0 + Duration::from_secs(20),
+        );
+        assert_eq!(s2.consecutive_failures, 2);
+        assert!(matches!(l2, DnsLog::DebugStillFailing));
+
+        // Third consecutive failure: still DEBUG (no repeated WARN).
+        let (s3, _a3, l3) = apply_dns_result(
+            Some(&s2),
+            &peer(),
+            DnsAttempt::Failed,
+            t0 + Duration::from_secs(60),
+        );
+        assert_eq!(s3.consecutive_failures, 3);
+        assert!(matches!(l3, DnsLog::DebugStillFailing));
+
+        // Recovery: failed -> resolved transition, WARN once.
+        let ip = PeerAddress::new("1.2.3.4", 11625);
+        let (s4, a4, l4) = apply_dns_result(
+            Some(&s3),
+            &peer(),
+            DnsAttempt::Succeeded(ip.clone()),
+            t0 + Duration::from_secs(120),
+        );
+        assert_eq!(s4.consecutive_failures, 0);
+        assert_eq!(a4, ip);
+        assert!(matches!(l4, DnsLog::WarnRecovered));
+
+        // Steady success after recovery: no log.
+        let (s5, _a5, l5) = apply_dns_result(
+            Some(&s4),
+            &peer(),
+            DnsAttempt::Succeeded(ip.clone()),
+            t0 + Duration::from_secs(180),
+        );
+        assert_eq!(s5.consecutive_failures, 0);
+        assert!(matches!(l5, DnsLog::None));
+    }
+}
