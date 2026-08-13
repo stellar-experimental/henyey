@@ -1669,3 +1669,70 @@ prune_rotated_logs() {
   PRUNED_LOG_COUNT="$removed"
   return 0
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# prune_metrics_archive ARCHIVE_DIR [KEEP]
+#
+# Per-tick metrics-snapshot retention for monitor-tick step 7. Keeps the newest
+# KEEP (default 500) COMPLETE snapshot directories under ARCHIVE_DIR and deletes
+# the rest, ordered by **mtime** — never by lexical directory name.
+#
+# Why mtime, not name (#3724): the archive has historically held snapshot dirs
+# in two timestamp-name formats — dash-format RFC-3339 (`2026-07-16T…Z`) and
+# compact (`20260716T…Z`). Because '-' (0x2D) sorts before every digit, a
+# lexical name sort places ALL dash-format dirs before ALL compact-format dirs
+# regardless of real age, so name-sort retention deletes the NEWEST (dash)
+# snapshots while pinning month-old (compact) ones. mtime ordering is immune to
+# the name format and always evicts the true-oldest.
+#
+# Array-free (a single `find`, piped straight into the delete loop) so behavior
+# is identical under bash and the zsh the monitor runs under. The previous
+# inline snippet filled a bash array and indexed it from 0, but zsh arrays are
+# 1-indexed, so `${SNAPSHOTS[0]}` was empty and one deletion no-op'd every tick
+# (the "501 fixed point"). Enumerating ONCE — computing `total` from the
+# captured rows rather than a second `find` — also closes the count-vs-deletion
+# TOCTOU.
+#
+# `.tmp` staging dirs (incomplete atomic writes) are excluded from enumeration.
+#
+# Arguments:
+#   ARCHIVE_DIR - directory containing per-tick snapshot dirs
+#   KEEP        - newest-N complete dirs to keep (default 500)
+#
+# Sets globals:
+#   PRUNED_ARCHIVE_COUNT - number of dirs removed (0 if none / dir missing)
+#
+# Returns: 0 always (no-op on a missing/empty dir or total <= keep).
+# Portability: GNU find -printf, GNU sort, Bash 4+ / zsh.
+# ─────────────────────────────────────────────────────────────────────────────
+prune_metrics_archive() {
+  local archive_dir="$1"
+  local keep="${2:-500}"
+
+  PRUNED_ARCHIVE_COUNT=0
+
+  [[ -d "$archive_dir" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=500
+
+  # Enumerate every COMPLETE snapshot dir ONCE as `<mtime-epoch> <path>`.
+  # find -printf survives zsh NO_NOMATCH (no shell glob) and yields mtime.
+  local rows total
+  rows=$(find "$archive_dir" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' \
+           -printf '%T@ %p\n' 2>/dev/null)
+  [[ -z "$rows" ]] && return 0
+
+  total=$(printf '%s\n' "$rows" | grep -c .)
+  [[ "$total" -gt "$keep" ]] || return 0
+
+  # Oldest-mtime first; delete everything past the newest `keep`. Strip only the
+  # leading mtime field so paths containing spaces survive intact.
+  local removed=0 line d
+  while IFS= read -r line; do
+    d="${line#* }"
+    [[ -n "$d" ]] || continue
+    rm -rf "$d" 2>/dev/null && removed=$(( removed + 1 ))
+  done < <(printf '%s\n' "$rows" | sort -n | head -n "$(( total - keep ))")
+
+  PRUNED_ARCHIVE_COUNT="$removed"
+  return 0
+}

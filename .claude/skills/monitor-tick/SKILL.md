@@ -1354,18 +1354,14 @@ tracks node health, and this signal is not one.
    # At ~20 min/tick ≈ 7 days of history. This bounds the replay window.
    # Pruned data is gone — not recoverable. For longer investigations,
    # bump retention or implement cold-archiving. See #2573 Gap 4.
-   SNAPSHOTS=()
-   while IFS= read -r -d '' d; do
-     SNAPSHOTS+=("$d")
-   done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d \
-     ! -name '*.tmp' -print0 | sort -z)
-   ARCHIVE_COUNT=${#SNAPSHOTS[@]}
-   if [ "$ARCHIVE_COUNT" -gt 500 ]; then
-     EXCESS=$((ARCHIVE_COUNT - 500))
-     for ((i=0; i<EXCESS; i++)); do
-       rm -rf "${SNAPSHOTS[$i]}"
-     done
-   fi
+   #
+   # prune_metrics_archive (scripts/lib/monitor-decisions.sh, sourced at skill
+   # init) orders by MTIME, not lexical name, so it evicts the true-oldest
+   # snapshots even when the archive holds mixed timestamp-name formats — a
+   # lexical name sort put every dash-format RFC-3339 dir ahead of every
+   # compact-format dir and deleted the newest data (#3724). It is array-free,
+   # so it behaves identically under bash and the zsh the monitor runs under.
+   prune_metrics_archive "$ARCHIVE_DIR" 500
 
    # Clean up orphaned .tmp dirs from crashed prior ticks
    find "$ARCHIVE_DIR" -maxdepth 1 -name '*.tmp' -type d -mmin +5 \

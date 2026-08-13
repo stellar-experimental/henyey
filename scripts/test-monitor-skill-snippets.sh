@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=461
+TAP_PLAN=465
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -5844,84 +5844,151 @@ METAEOF
       "Expected 1 snapshot, got $snap_count"
   fi
 
-  # ── Test: Archive pruning — keeps only 500 most recent ─────────────────
+  # ── Test: Archive pruning via prune_metrics_archive (mtime-sort) ──────────
+  # Regression for #3724: the archive holds snapshot dirs in two timestamp-name
+  # formats. A lexical name sort ('-' = 0x2D < '0'..'9') places ALL dash-format
+  # RFC-3339 dirs before ALL compact-format dirs regardless of real age, so a
+  # name-sort retention deletes the NEWEST (dash) snapshots while pinning
+  # month-old (compact) ones. prune_metrics_archive orders by mtime, so it
+  # evicts the TRUE-oldest. This FAILS on origin/main (embedded name-sort copy).
   local t_prune="$archive_root/t-prune"
   local prune_arc="$t_prune/data/prune-session/metrics/archive"
   mkdir -p "$prune_arc"
-  # Create 505 snapshot dirs with sequential timestamps
-  for i in $(seq -w 1 505); do
-    local ts_dir="$prune_arc/2025-01-01T00:${i:0:2}:${i:2:1}0.000000000Z"
-    mkdir -p "$ts_dir"
-    echo "ARCHIVE_VERSION=1" > "$ts_dir/metadata.env"
+  local now_epoch; now_epoch=$(date +%s)
+  # 3 recent dash-format dirs (newest mtime), lexically FIRST.
+  local pd
+  for pd in 2026-07-27 2026-07-26 2026-07-25; do
+    mkdir -p "$prune_arc/${pd}T00:00:00.000000000Z"
+    echo "ARCHIVE_VERSION=1" > "$prune_arc/${pd}T00:00:00.000000000Z/metadata.env"
+    touch -d "@$((now_epoch - 100))" "$prune_arc/${pd}T00:00:00.000000000Z"
   done
-
-  # Run pruning logic
-  local prune_snaps=()
-  while IFS= read -r -d '' d; do
-    prune_snaps+=("$d")
-  done < <(find "$prune_arc" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' -print0 | sort -z)
-  local prune_count=${#prune_snaps[@]}
-  if [[ "$prune_count" -gt 500 ]]; then
-    local prune_excess=$((prune_count - 500))
-    for ((i=0; i<prune_excess; i++)); do
-      rm -rf "${prune_snaps[$i]}"
-    done
-  fi
-
-  local remaining
-  remaining=$(find "$prune_arc" -maxdepth 1 -mindepth 1 -type d | wc -l)
-  if [[ "$remaining" -eq 500 ]]; then
-    tap_ok "archive: pruning keeps exactly 500 snapshots"
+  # 2 old compact-format dirs (oldest mtime), lexically LAST ('2' > '-').
+  local pc
+  for pc in 20260617T000000Z 20260618T000000Z; do
+    mkdir -p "$prune_arc/$pc"
+    echo "ARCHIVE_VERSION=1" > "$prune_arc/$pc/metadata.env"
+    touch -d "@$((now_epoch - 4000000))" "$prune_arc/$pc"
+  done
+  # keep=3: total 5, excess 2. mtime-sort removes the 2 OLDEST (both compact);
+  # a name sort would instead remove the lexical head = 2 recent dash dirs.
+  prune_metrics_archive "$prune_arc" 3
+  local prune_remaining
+  prune_remaining=$(find "$prune_arc" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
+  if [[ "$PRUNED_ARCHIVE_COUNT" -eq 2 && "$prune_remaining" -eq 3 \
+        && ! -d "$prune_arc/20260617T000000Z" \
+        && ! -d "$prune_arc/20260618T000000Z" \
+        && -d "$prune_arc/2026-07-27T00:00:00.000000000Z" \
+        && -d "$prune_arc/2026-07-26T00:00:00.000000000Z" \
+        && -d "$prune_arc/2026-07-25T00:00:00.000000000Z" ]]; then
+    tap_ok "archive: prune_metrics_archive evicts oldest-mtime (compact) dirs, keeps recent dash"
   else
-    tap_not_ok "archive: pruning keeps exactly 500 snapshots" \
-      "Expected 500, got $remaining"
+    tap_not_ok "archive: prune_metrics_archive evicts oldest-mtime (compact) dirs, keeps recent dash" \
+      "removed=$PRUNED_ARCHIVE_COUNT remaining=$prune_remaining files=$(ls "$prune_arc" | tr '\n' ',')"
   fi
 
-  # ── Test: Replay chronological ordering ─────────────────────────────────
+  # ── Test: prune_metrics_archive no-op cases (missing / empty / <= keep) ────
+  prune_metrics_archive "$archive_root/prune-missing/nope" 500
+  local noop_missing=$PRUNED_ARCHIVE_COUNT
+  local pe="$archive_root/prune-empty"; mkdir -p "$pe"
+  prune_metrics_archive "$pe" 500
+  local noop_empty=$PRUNED_ARCHIVE_COUNT
+  local pu="$archive_root/prune-underkeep"; mkdir -p "$pu/a" "$pu/b"
+  prune_metrics_archive "$pu" 500
+  local noop_under=$PRUNED_ARCHIVE_COUNT
+  local under_remaining
+  under_remaining=$(find "$pu" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
+  if [[ "$noop_missing" -eq 0 && "$noop_empty" -eq 0 && "$noop_under" -eq 0 && "$under_remaining" -eq 2 ]]; then
+    tap_ok "archive: prune_metrics_archive no-op on missing/empty/under-keep (count 0, nothing deleted)"
+  else
+    tap_not_ok "archive: prune_metrics_archive no-op on missing/empty/under-keep (count 0, nothing deleted)" \
+      "missing=$noop_missing empty=$noop_empty under=$noop_under under_remaining=$under_remaining"
+  fi
+
+  # ── Test: prune_metrics_archive excludes .tmp staging dirs ────────────────
+  local ptmp="$archive_root/prune-tmp"; mkdir -p "$ptmp"
+  mkdir -p "$ptmp/2026-07-27T00:00:00.000000000Z" "$ptmp/2026-07-01T00:00:00.000000000Z.tmp"
+  touch -d "@$((now_epoch - 100))"     "$ptmp/2026-07-27T00:00:00.000000000Z"
+  touch -d "@$((now_epoch - 9000000))" "$ptmp/2026-07-01T00:00:00.000000000Z.tmp"
+  prune_metrics_archive "$ptmp" 0
+  if [[ "$PRUNED_ARCHIVE_COUNT" -eq 1 \
+        && ! -d "$ptmp/2026-07-27T00:00:00.000000000Z" \
+        && -d "$ptmp/2026-07-01T00:00:00.000000000Z.tmp" ]]; then
+    tap_ok "archive: prune_metrics_archive excludes .tmp dirs from the eviction set"
+  else
+    tap_not_ok "archive: prune_metrics_archive excludes .tmp dirs from the eviction set" \
+      "removed=$PRUNED_ARCHIVE_COUNT files=$(ls "$ptmp" | tr '\n' ',')"
+  fi
+
+  # ── Test: Replay processes snapshots in mtime (chronological) order ───────
+  # Regression for #3724: replay claims chronological evaluation but name-sorted
+  # the archive. Build a fixture where the OLDEST-by-mtime dir is compact-named
+  # (lexically LAST) and the NEWEST-by-mtime is dash-named (lexically FIRST): a
+  # name sort reports first_ts=dash (WRONG), mtime sort reports first_ts=compact
+  # (correct). FAILS on origin/main (replay enumerator name-sorts).
   local t_replay="$archive_root/t-replay"
   local replay_session="$t_replay/data/replay-session"
   local replay_arc="$replay_session/metrics/archive"
   mkdir -p "$replay_arc"
-
-  # Create 3 snapshots with known timestamps and metrics
-  for ts_pair in "2025-05-10T10:00:00.000000000Z=100" "2025-05-10T11:00:00.000000000Z=200" "2025-05-10T12:00:00.000000000Z=300"; do
-    local ts="${ts_pair%%=*}"
-    local val="${ts_pair##*=}"
-    local sd="$replay_arc/$ts"
+  local rnow; rnow=$(date +%s)
+  local old_name="20260617T000000Z"                  # oldest mtime, compact (lexically last)
+  local mid_name="2026-07-01T00:00:00.000000000Z"    # middle mtime, dash
+  local new_name="2026-07-02T00:00:00.000000000Z"    # newest mtime, dash (lexically first)
+  local rp
+  for rp in "$old_name=9000000" "$mid_name=200000" "$new_name=100"; do
+    local rn="${rp%%=*}"; local ago="${rp##*=}"
+    local sd="$replay_arc/$rn"
     mkdir -p "$sd"
-    # Create minimal prom files
-    echo "# HELP test_gauge A test gauge" > "$sd/current.prom"
-    echo "# TYPE test_gauge gauge" >> "$sd/current.prom"
-    echo "test_gauge $val" >> "$sd/current.prom"
-    echo "# HELP test_gauge A test gauge" > "$sd/prev.prom"
-    echo "# TYPE test_gauge gauge" >> "$sd/prev.prom"
-    echo "test_gauge $((val - 10))" >> "$sd/prev.prom"
-    cat > "$sd/metadata.env" << METAEOF
+    echo "# empty" > "$sd/current.prom"
+    echo "# empty" > "$sd/prev.prom"
+    cat > "$sd/metadata.env" << 'METAEOF'
 ARCHIVE_VERSION=1
 TICK_SKIPPED=false
 PREV_PROM_INVALID=false
 WARMUP_TICKS_REMAINING=0
 FRESH_START=no
 CRASH_RECOVERY=no
-UPTIME_SECONDS=14400
+UPTIME_SECONDS=900
 MONITOR_MODE=validator
 PID=12345
-START_TICKS=987654
+START_TICKS=100
 METAEOF
+    touch -d "@$((rnow - ago))" "$sd/current.prom" "$sd/prev.prom" "$sd/metadata.env" "$sd"
   done
-
-  # Verify chronological sort by directory name
-  local sorted_dirs
-  sorted_dirs=$(find "$replay_arc" -maxdepth 1 -mindepth 1 -type d ! -name '*.tmp' -print0 | sort -z | tr '\0' '\n')
-  local first_dir last_dir
-  first_dir=$(echo "$sorted_dirs" | head -1)
-  last_dir=$(echo "$sorted_dirs" | tail -1)
-  if [[ "$(basename "$first_dir")" == "2025-05-10T10:00:00.000000000Z" ]] \
-     && [[ "$(basename "$last_dir")" == "2025-05-10T12:00:00.000000000Z" ]]; then
-    tap_ok "archive: chronological ordering by directory name"
+  local replay_json
+  replay_json=$("$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh" \
+    "$replay_session" --replay --json 2>/dev/null) || true
+  local replay_order_ok
+  replay_order_ok=$(echo "$replay_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print('ok' if (d.get('first_ts') == '$old_name' and d.get('last_ts') == '$new_name') else 'fail:%s..%s' % (d.get('first_ts'), d.get('last_ts')))
+except Exception:
+    print('fail:exc')
+" 2>/dev/null) || echo "fail:noout"
+  if [[ "$replay_order_ok" == "ok" ]]; then
+    tap_ok "archive: replay evaluates in mtime order (first_ts oldest, last_ts newest)"
   else
-    tap_not_ok "archive: chronological ordering by directory name" \
-      "first=$(basename "$first_dir") last=$(basename "$last_dir")"
+    tap_not_ok "archive: replay evaluates in mtime order (first_ts oldest, last_ts newest)" \
+      "got $replay_order_ok; json=${replay_json:0:200}"
+  fi
+
+  # ── Test: SKILL.md + replay script use mtime-sort, not name-sort (#3724) ──
+  local prune_tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  local replay_script="$REPO_ROOT/scripts/dev/replay-alarms-on-history.sh"
+  if grep -q 'prune_metrics_archive' "$prune_tick_file" \
+     && ! grep -qE 'SNAPSHOTS\[|sort -z' "$prune_tick_file"; then
+    tap_ok "archive: SKILL.md step-7 uses prune_metrics_archive (no name-sort / SNAPSHOTS array)"
+  else
+    tap_not_ok "archive: SKILL.md step-7 uses prune_metrics_archive (no name-sort / SNAPSHOTS array)" \
+      "SKILL.md must call prune_metrics_archive and drop 'sort -z'/'SNAPSHOTS['"
+  fi
+  if ! grep -q 'sort -z' "$replay_script" \
+     && grep -qF "printf '%T@" "$replay_script"; then
+    tap_ok "archive: replay script enumerates archive by mtime (no 'sort -z' name-sort)"
+  else
+    tap_not_ok "archive: replay script enumerates archive by mtime (no 'sort -z' name-sort)" \
+      "replay script must enumerate with -printf '%T@ %p' | sort -n, not 'sort -z'"
   fi
 
   # ── Test: Replay skipped-tick handling ──────────────────────────────────

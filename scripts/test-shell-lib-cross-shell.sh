@@ -72,7 +72,7 @@ expected_funcs_for() {
     deploy-quarantine.sh)
       echo "parse_quarantine_file check_quarantine_active check_quarantine_ancestry quarantine_append quarantine_remove quarantine_resolve quarantine_autostamp quarantine_resolved_is_ve_green" ;;
     monitor-decisions.sh)
-      echo "check_session_wiped check_long_stale_session detect_crash_state cleanup_guard" ;;
+      echo "check_session_wiped check_long_stale_session detect_crash_state cleanup_guard prune_rotated_logs prune_metrics_archive" ;;
     review-pr-merge.sh)
       echo "attempt_merge classify_linked_pr_state is_auto_merge_armed has_armed_waiting_comment check_armed_pr_health" ;;
     review-pr-verdicts.sh)
@@ -406,6 +406,64 @@ if [[ "$HAVE_ZSH" -eq 1 ]]; then
   assert_hold_until_roundtrip zsh zsh
 else
   skip "quarantine-hold-until[zsh]: OPEN blocks (fail-closed), CLOSED falls through" "zsh not installed"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Assertion group 5.7: prune-metrics-archive-roundtrip-both-shells (#3724).
+#   prune_metrics_archive orders the archive by MTIME (array-free single find),
+#   so it evicts the true-oldest snapshots even when the archive holds mixed
+#   timestamp-name formats — a lexical name sort put every dash-format dir ahead
+#   of every compact-format dir and deleted the newest data. The array-free form
+#   is the load-bearing zsh guard: the old inline snippet indexed a bash array
+#   from 0, but zsh arrays are 1-indexed, so `${SNAPSHOTS[0]}` was empty and one
+#   deletion no-op'd every tick. This roundtrip builds a mixed-format fixture
+#   (500 recent dash dirs + 2 old compact dirs, mtimes inverted vs names), runs
+#   prune under each shell, and asserts EXACTLY the 2 oldest-mtime (compact)
+#   dirs are evicted and all 500 recent dash dirs survive — identical count and
+#   eviction set under bash and zsh.
+# ─────────────────────────────────────────────────────────────────────────────
+assert_prune_metrics_archive_roundtrip() {
+  local shbin="$1" shname="$2"
+  local adir="$SCRATCH/prune-archive-$shname"
+  rm -rf "$adir"; mkdir -p "$adir"
+  local base=1700000000 i
+  # 500 recent dash-format dirs (newest mtime), lexically FIRST.
+  for i in $(seq 1 500); do
+    local d="$adir/2026-07-16T00:00:00.$(printf '%09d' "$i")Z"
+    mkdir -p "$d"
+    touch -d "@$(( base + 100000 + i ))" "$d"
+  done
+  # 2 compact-format dirs — lexically LAST ('2' > '-') but OLDEST by mtime.
+  local c1="$adir/20260617T000000Z" c2="$adir/20260618T000000Z"
+  mkdir -p "$c1" "$c2"
+  touch -d "@$(( base + 1 ))" "$c1"
+  touch -d "@$(( base + 2 ))" "$c2"
+
+  local code="
+    source '$LIB_DIR/monitor-decisions.sh' || exit 3;
+    prune_metrics_archive '$adir' 500;
+    printf '%s' \"\$PRUNED_ARCHIVE_COUNT\"
+  "
+  run_in_shell "$shbin" "$code"
+  local label="prune-metrics-archive-roundtrip[$shname]: mtime-sort evicts oldest compact, keeps 500 recent dash"
+  if [[ "$_RC" -ne 0 ]]; then
+    notok "$label" "rc=$_RC" "stderr: $_STDERR"; return
+  fi
+  local remaining
+  remaining=$(find "$adir" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
+  if [[ "$_STDOUT" == "2" && "$remaining" == "500" && ! -d "$c1" && ! -d "$c2" ]]; then
+    ok "$label"
+  else
+    notok "$label" "PRUNED_ARCHIVE_COUNT=$_STDOUT (want 2)" "remaining=$remaining (want 500)" \
+      "compact1 exists=$( [[ -d "$c1" ]] && echo yes || echo no )" \
+      "compact2 exists=$( [[ -d "$c2" ]] && echo yes || echo no )"
+  fi
+}
+assert_prune_metrics_archive_roundtrip bash bash
+if [[ "$HAVE_ZSH" -eq 1 ]]; then
+  assert_prune_metrics_archive_roundtrip zsh zsh
+else
+  skip "prune-metrics-archive-roundtrip[zsh]: mtime-sort evicts oldest compact, keeps 500 recent dash" "zsh not installed"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
