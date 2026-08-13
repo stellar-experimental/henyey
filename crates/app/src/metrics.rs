@@ -533,6 +533,10 @@ metric_catalog! {
             => "Anonymous (heap+stack) resident bytes (RssAnon); scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
         PROCESS_FILE_RESIDENT_MEMORY_BYTES = "henyey_process_file_resident_memory_bytes"
             => "File-backed (mmap) resident bytes (RssFile); scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
+        // Total OS thread count (#3814). Folded into the same per-scrape
+        // /proc/self/status read as the RSS gauges above — zero extra syscalls.
+        PROCESS_THREADS = "henyey_process_threads"
+            => "Total OS thread count (Threads: from /proc/self/status; 0 = unavailable/off-Linux)";
 
         // ── Loadgen meters (#3569, reset on clearmetrics #3630) ────────
         //
@@ -1386,6 +1390,8 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     PROCESS_RESIDENT_MEMORY_BYTES.set(proc_mem.rss_bytes as f64);
     PROCESS_ANON_RESIDENT_MEMORY_BYTES.set(proc_mem.anon_rss_bytes as f64);
     PROCESS_FILE_RESIDENT_MEMORY_BYTES.set(proc_mem.file_rss_bytes as f64);
+    // Total OS thread count (#3814), from the same /proc/self/status read.
+    PROCESS_THREADS.set(proc_mem.threads as f64);
 
     // Phase 3: Ledger apply cumulative counters.
     LEDGER_APPLY_SUCCESS_TOTAL.absolute(snap.cumulative_apply_success);
