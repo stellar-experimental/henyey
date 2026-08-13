@@ -76,7 +76,7 @@ _NO_SNAPSHOT_WRITE = False
 
 VALID_KINDS = {
     "gauge", "gauge-ratio", "counter", "counter-dynamic",
-    "counter-ratio", "histogram-p99", "counter-streak",
+    "counter-ratio", "histogram-p99", "histogram-bucket-rate", "counter-streak",
 }
 VALID_SEVERITIES = {"SYNC", "ACTION", "WARN", "NONC"}
 VALID_GATES = {"warmup-2-ticks", "synced-only", "uptime-min-15m", "validator-only"}
@@ -220,7 +220,7 @@ def telemetry_metric(alarm: dict, kind: str) -> str:
     This mirrors the evaluator's own lookup order so that the telemetry
     line reflects the metric that was actually evaluated.
     """
-    if kind == "histogram-p99":
+    if kind in ("histogram-p99", "histogram-bucket-rate"):
         m = alarm.get("metric", "")
         return f"{m}_bucket" if m else ""
     if kind == "gauge-ratio":
@@ -250,6 +250,8 @@ def default_extra_values(alarm: dict, kind: str) -> dict:
     """
     if kind == "histogram-p99":
         return {"p99_value": None, "mean_value": None}
+    if kind == "histogram-bucket-rate":
+        return {"rate_value": None}
     if kind == "counter-ratio":
         return {
             "streak": 0,
@@ -900,6 +902,128 @@ def eval_histogram_p99(
     )
 
 
+def eval_histogram_bucket_rate(
+    alarm: dict,
+    current: dict,
+    prev: dict,
+    prev_prom_invalid: bool,
+    gap_stale: bool = False,
+    gap_stale_age_hours: float = 0,
+) -> dict:
+    """Evaluate a histogram-bucket-rate alarm.
+
+    Fires when the fraction of new observations exceeding a configured `le`
+    boundary over the tick window is above `rate_threshold` (strict `>`). This
+    keys on sustained window behavior — unlike the single-sample last-slot gauge
+    alarm it complements (#3750). Reuses the same cumulative-bucket differencing
+    as eval_histogram_p99: because Prometheus buckets are cumulative,
+    `bucket_deltas[bucket_le]` is the count of new observations ≤ bucket_le in
+    the window, so `over = count_delta - bucket_deltas[bucket_le]` and
+    `rate = over / count_delta`.
+    """
+    ev_default = default_extra_values(alarm, "histogram-bucket-rate")
+
+    if prev_prom_invalid:
+        return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID",
+                           extra_values=ev_default)
+    # Gap-stale (#3246): the count/bucket deltas span the loop gap, so SKIP.
+    # prev.prom is recomputed each tick (no persisted baseline to reseed).
+    # Checked after prev_prom_invalid so a PID change is never double-handled.
+    if gap_stale:
+        return make_result(alarm, "skipped",
+                           skip_reason=gap_stale_reason(gap_stale_age_hours),
+                           extra_values=ev_default)
+
+    metric = alarm["metric"]
+    min_count = alarm.get("min_count_delta", 20)
+    bucket_le = float(alarm["bucket_le"])
+    rate_threshold = alarm["rate_threshold"]
+
+    # Only _bucket and _count are needed for the over-threshold rate (no _sum).
+    for suffix in ("_bucket", "_count"):
+        if not current.get(f"{metric}{suffix}"):
+            return make_result(alarm, "skipped", skip_reason=f"missing {metric}{suffix}",
+                               extra_values=ev_default)
+    for suffix in ("_bucket", "_count"):
+        if not prev.get(f"{metric}{suffix}"):
+            return make_result(alarm, "skipped", skip_reason=f"no previous {metric}{suffix}",
+                               extra_values=ev_default)
+
+    cur_count = extract_value(current, f"{metric}_count", "form1")
+    prev_count = extract_value(prev, f"{metric}_count", "form1")
+    if cur_count is None or prev_count is None:
+        return make_result(alarm, "skipped", skip_reason="missing count metric",
+                           extra_values=ev_default)
+
+    count_delta = cur_count - prev_count
+    if count_delta < 0:
+        return make_result(alarm, "skipped", skip_reason="counter reset (count)",
+                           extra_values=ev_default)
+    if count_delta < min_count:
+        return make_result(alarm, "skipped",
+                           skip_reason=f"low volume (count_delta={int(count_delta)} < {min_count})",
+                           extra_values=ev_default)
+
+    # Build {le: delta} map (same cumulative-bucket differencing as p99).
+    bucket_series_cur = current.get(f"{metric}_bucket", [])
+    bucket_series_prev = prev.get(f"{metric}_bucket", [])
+    cur_by_le: dict[float, float] = {}
+    prev_by_le: dict[float, float] = {}
+    for labels, val in bucket_series_cur:
+        le = labels.get("le")
+        if le is not None:
+            try:
+                cur_by_le[float(le)] = val
+            except ValueError:
+                if le == "+Inf":
+                    cur_by_le[float("inf")] = val
+    for labels, val in bucket_series_prev:
+        le = labels.get("le")
+        if le is not None:
+            try:
+                prev_by_le[float(le)] = val
+            except ValueError:
+                if le == "+Inf":
+                    prev_by_le[float("inf")] = val
+
+    bucket_deltas: dict[float, float] = {}
+    for le in cur_by_le:
+        d = cur_by_le[le] - prev_by_le.get(le, 0)
+        if d < 0:
+            d = cur_by_le[le]  # counter reset
+        bucket_deltas[le] = d
+
+    if bucket_le not in bucket_deltas:
+        return make_result(alarm, "skipped",
+                           skip_reason=f"bucket le={alarm['bucket_le']} not found",
+                           extra_values=ev_default)
+
+    # Cumulative bucket at bucket_le = observations ≤ bucket_le, so the
+    # complement is the over-threshold count. Clamp before dividing so a
+    # rebucket/reset differencing artifact can never yield a negative rate
+    # (Critic A).
+    over = count_delta - bucket_deltas[bucket_le]
+    over = max(over, 0.0)
+    # Defensive: `count_delta < min_count` already skips low-volume windows for
+    # every shipped alarm (default min_count 20, this alarm 100), but a future
+    # alarm configured with `min_count_delta = 0` and a zero-volume window would
+    # reach here with count_delta == 0. Guard the division for symmetry with
+    # `eval_histogram_p99`'s `count_delta > 0` checks (a zero-volume window has
+    # no over-threshold slots, so rate is 0.0 and cannot fire).
+    rate = over / count_delta if count_delta > 0 else 0.0
+
+    ev = {"rate_value": round(rate, 4)}
+    if rate > rate_threshold:
+        return make_result(
+            alarm, "firing", value=round(rate, 4), threshold=rate_threshold,
+            for_ticks_elapsed=1, extra_values=ev,
+        )
+    return make_result(
+        alarm, "ok", value=round(rate, 4), threshold=rate_threshold,
+        extra_values=ev,
+    )
+
+
 def eval_counter_ratio(
     alarm: dict,
     current: dict,
@@ -1540,6 +1664,13 @@ def validate_catalog(catalog: dict) -> list[str]:
                 errors.append(f"{name}: histogram-p99 requires 'metric'")
             if "p99_threshold" not in alarm:
                 errors.append(f"{name}: histogram-p99 requires 'p99_threshold'")
+        elif kind == "histogram-bucket-rate":
+            if "metric" not in alarm:
+                errors.append(f"{name}: histogram-bucket-rate requires 'metric'")
+            if "bucket_le" not in alarm:
+                errors.append(f"{name}: histogram-bucket-rate requires 'bucket_le'")
+            if "rate_threshold" not in alarm:
+                errors.append(f"{name}: histogram-bucket-rate requires 'rate_threshold'")
         elif kind == "counter-streak":
             if "metric" not in alarm:
                 errors.append(f"{name}: counter-streak requires 'metric'")
@@ -1703,6 +1834,9 @@ def main() -> int:
             elif kind == "histogram-p99":
                 result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid,
                                             gap_stale, gap_stale_age_hours)
+            elif kind == "histogram-bucket-rate":
+                result = eval_histogram_bucket_rate(alarm, current, prev, prev_prom_invalid,
+                                                    gap_stale, gap_stale_age_hours)
             elif kind == "counter-ratio":
                 result = eval_counter_ratio(
                     alarm, current, prev, state_dir, pid, start_ticks_val,

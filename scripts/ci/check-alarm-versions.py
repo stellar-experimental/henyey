@@ -35,6 +35,7 @@ SEMANTIC_FIELDS = frozenset({
     "numerator", "numerator_metric", "numerator_sum", "numerator_extraction",
     "ratio_op", "ratio_threshold", "absent_denominator",
     "p99_threshold", "mean_threshold",
+    "bucket_le", "rate_threshold",
     "min_volume", "min_count_delta",
     "snapshot_file", "optional_counters",
     "exempt", "exempt_reason", "allow_duplicate_cooldown",

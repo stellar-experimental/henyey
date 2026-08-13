@@ -467,6 +467,24 @@ details = "externalize_time={value}s threshold={threshold}s"
 notes = "SLOT-CYCLE metric: first-envelope-received to self-externalize, naturally ~4-6s on mainnet 5s slots. >10s = real degradation."
 
 [[alarm]]
+name = "scp-externalize-slow-rate"
+metric = "stellar_scp_timing_externalized_hist_seconds"
+kind = "histogram-bucket-rate"
+expected_suffixes = ["_bucket", "_count"]
+bucket_le = 10
+rate_threshold = 0.02
+min_count_delta = 100
+severity = "WARN"
+gates = ["warmup-2-ticks", "validator-only"]
+cooldown_key = "stellar_scp_timing_externalized_hist_seconds_rate"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_scp_timing_externalized_hist_seconds >10s rate — {rate_value} > {threshold}"
+filing_search = "metrics: stellar_scp_timing_externalized_hist_seconds >10s rate"
+summary = "SCP externalize >10s slot rate sustained"
+details = "over_10s_rate={rate_value} threshold={threshold} (windowed >10s fraction over the tick)"
+notes = "Defense-in-depth complement to scp-externalize-slow: keys on the SUSTAINED windowed fraction of externalize slots exceeding the 10s bucket, so an isolated last-slot jitter spike (which trips the single-sample gauge alarm) does not fire here. Healthy floor 0.02-0.5%; 2% threshold matches the differenced-histogram degradation evidence in #3750."
+
+[[alarm]]
 name = "scp-nominate-slow"
 metric = "stellar_scp_timing_nominated_seconds"
 kind = "gauge"
