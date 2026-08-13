@@ -884,6 +884,13 @@ pub struct App {
     /// Only meaningful when `MAX_DEX_TX_OPERATIONS_IN_TX_SET` is configured.
     broadcast_dex_op_carryover: AtomicUsize,
 
+    /// Per-host DNS resolution state for config peers (`known_peers` /
+    /// `preferred_peers`), keyed by hostname. Rate-limits re-resolution of a
+    /// hostname that has stopped resolving and throttles its log noise so a
+    /// permanently-dead config peer no longer re-resolves every refresh cycle
+    /// (#3760). See `peers::resolve_peers_for_storage`.
+    dns_resolve_state: std::sync::Mutex<HashMap<String, peers::DnsResolveState>>,
+
     /// Per-peer advert tracking and queues for demand scheduling.
     tx_adverts_by_peer: RwLock<HashMap<henyey_overlay::PeerId, PeerTxAdverts>>,
     /// Per-peer demand responses deferred because the peer's outbound channel
@@ -1689,6 +1696,7 @@ impl App {
             )),
             broadcast_op_carryover: AtomicUsize::new(0),
             broadcast_dex_op_carryover: AtomicUsize::new(0),
+            dns_resolve_state: std::sync::Mutex::new(HashMap::new()),
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
             tx_deferred_demand_responses: RwLock::new(HashMap::new()),
             tail_watch: RwLock::new(HashSet::new()),

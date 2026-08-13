@@ -1729,8 +1729,9 @@ impl App {
 
         // Resolve config hostnames to IPs so the merge with persisted (already
         // resolved) peers can dedup correctly via dial_key().
-        overlay_config.known_peers =
-            Self::resolve_peers_for_storage(&overlay_config.known_peers).await;
+        overlay_config.known_peers = self
+            .resolve_peers_for_storage(&overlay_config.known_peers)
+            .await;
 
         match self.load_persisted_peers().await {
             Ok(persisted) => {

@@ -11,6 +11,135 @@ pub enum DisconnectError {
     PeerNotFound,
 }
 
+/// Base retry interval for a config hostname whose DNS resolution has failed.
+/// The effective delay grows linearly (`consecutive_failures * this`) up to
+/// [`PEER_IP_RESOLVE_DELAY`]. Mirrors stellar-core's
+/// `PEER_IP_RESOLVE_RETRY_DELAY` (`OverlayManagerImpl.cpp:46`) as a sound,
+/// already-adopted cadence (see `henyey-overlay`'s `tick.rs`) — logging and
+/// peer-list internals are on the "MAY deviate freely" side of `docs/PARITY.md`,
+/// so this is an engineering choice, not a parity requirement.
+const PEER_IP_RESOLVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ceiling for the DNS re-resolution interval of a failing config hostname.
+/// Mirrors stellar-core's `PEER_IP_RESOLVE_DELAY` (`OverlayManagerImpl.cpp:45`).
+const PEER_IP_RESOLVE_DELAY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Per-host DNS resolution state, tracked so a config hostname that stops
+/// resolving is not re-queried every refresh cycle (and does not emit a WARN
+/// on every attempt). Keyed by hostname; shared across `known_peers` and
+/// `preferred_peers`.
+#[derive(Debug, Clone)]
+pub(super) struct DnsResolveState {
+    /// Number of consecutive failed resolution attempts. `0` once the host
+    /// resolves successfully.
+    consecutive_failures: u32,
+    /// When the last resolution attempt (or skip decision) was recorded.
+    last_attempt_at: std::time::Instant,
+    /// The address last stored for this host: the resolved IP on success, or
+    /// the hostname itself on failure. Reused verbatim while the host is inside
+    /// its backoff window so we neither drop the peer nor issue a DNS syscall.
+    last_result: PeerAddress,
+}
+
+/// Outcome of a single resolution cycle for one host, fed to
+/// [`apply_dns_result`]. Kept separate from the `async` I/O so the state
+/// machine is unit-testable without real DNS.
+pub(super) enum DnsAttempt {
+    /// The host is within its backoff window; no DNS call was made.
+    Skipped,
+    /// Resolution produced a usable IPv4 address.
+    Succeeded(PeerAddress),
+    /// Resolution failed (lookup error or no IPv4 address).
+    Failed,
+}
+
+/// Which (if any) log line a resolution cycle should emit. Only *transitions*
+/// are logged at `warn!`; steady-state failure/success is `debug!`/silent, so a
+/// permanently-dead config hostname no longer floods the log.
+#[derive(Debug)]
+pub(super) enum DnsLog {
+    /// No log line.
+    None,
+    /// resolved → failed transition (first failure): `warn!`.
+    WarnFailed,
+    /// failed → resolved transition (recovery): `warn!`.
+    WarnRecovered,
+    /// Still failing after a prior failure: `debug!`.
+    DebugStillFailing,
+}
+
+/// Earliest [`Instant`](std::time::Instant) at which `state`'s host may be
+/// re-queried: `last_attempt_at + min(consecutive_failures * RETRY_DELAY,
+/// RESOLVE_DELAY)`. A host with zero failures is eligible immediately.
+pub(super) fn next_allowed_attempt(state: &DnsResolveState) -> std::time::Instant {
+    let delay = PEER_IP_RESOLVE_RETRY_DELAY
+        .saturating_mul(state.consecutive_failures)
+        .min(PEER_IP_RESOLVE_DELAY);
+    state.last_attempt_at + delay
+}
+
+/// Whether `state`'s host is currently inside its backoff window at `now` and
+/// should therefore skip the DNS call. Only failing hosts (`consecutive_failures
+/// > 0`) are ever throttled; a healthy host is always eligible.
+pub(super) fn in_backoff_window(state: &DnsResolveState, now: std::time::Instant) -> bool {
+    state.consecutive_failures > 0 && now < next_allowed_attempt(state)
+}
+
+/// Pure state transition for one host's resolution cycle. Returns the new
+/// per-host state, the address to store this cycle, and which log line (if any)
+/// to emit. Split out from the `async` resolver so backoff/log behavior is
+/// testable without touching the network.
+pub(super) fn apply_dns_result(
+    prev: Option<&DnsResolveState>,
+    peer: &PeerAddress,
+    attempt: DnsAttempt,
+    now: std::time::Instant,
+) -> (DnsResolveState, PeerAddress, DnsLog) {
+    let prev_failures = prev.map_or(0, |s| s.consecutive_failures);
+    match attempt {
+        DnsAttempt::Skipped => {
+            // In backoff: reuse the last stored result, leave state as-is
+            // (aside from the fact that no attempt was made this cycle).
+            let state = prev.cloned().unwrap_or(DnsResolveState {
+                consecutive_failures: prev_failures,
+                last_attempt_at: now,
+                last_result: peer.clone(),
+            });
+            let result = state.last_result.clone();
+            (state, result, DnsLog::None)
+        }
+        DnsAttempt::Succeeded(addr) => {
+            let log = if prev_failures > 0 {
+                DnsLog::WarnRecovered
+            } else {
+                DnsLog::None
+            };
+            let state = DnsResolveState {
+                consecutive_failures: 0,
+                last_attempt_at: now,
+                last_result: addr.clone(),
+            };
+            (state, addr, log)
+        }
+        DnsAttempt::Failed => {
+            // Store the hostname on failure (unchanged from prior behavior):
+            // it is inert for `known_peers` (never persisted, filtered from the
+            // outbound wire message) and lets a later cycle resolve it.
+            let log = if prev_failures == 0 {
+                DnsLog::WarnFailed
+            } else {
+                DnsLog::DebugStillFailing
+            };
+            let state = DnsResolveState {
+                consecutive_failures: prev_failures + 1,
+                last_attempt_at: now,
+                last_result: peer.clone(),
+            };
+            (state, peer.clone(), log)
+        }
+    }
+}
+
 impl App {
     pub async fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
         match self.overlay().await {
@@ -388,8 +517,8 @@ impl App {
 
         // Resolve hostnames to IPs before storing, matching stellar-core's
         // behavior of resolving config peers at startup.
-        let resolved_known = Self::resolve_peers_for_storage(&known_peers).await;
-        let resolved_preferred = Self::resolve_peers_for_storage(&preferred_peers).await;
+        let resolved_known = self.resolve_peers_for_storage(&known_peers).await;
+        let resolved_preferred = self.resolve_peers_for_storage(&preferred_peers).await;
 
         if let Err(e) = self
             .db_blocking("store-config-peers", move |db| {
@@ -416,7 +545,18 @@ impl App {
     ///
     /// If DNS resolution fails for a hostname, the original hostname is kept
     /// so the peer is still stored (it will be resolved later in the DNS cycle).
-    pub(super) async fn resolve_peers_for_storage(peers: &[PeerAddress]) -> Vec<PeerAddress> {
+    ///
+    /// Resolution is rate-limited per host: a hostname whose last resolution
+    /// failed is not re-queried until its backoff window elapses (linear
+    /// `consecutive_failures * 10s`, capped at 600s — see [`next_allowed_attempt`]).
+    /// While in backoff the last stored result is reused with no DNS syscall, and
+    /// only resolution *transitions* (resolved↔failed) are logged at `warn!`;
+    /// steady-state failures are `debug!`. This keeps a permanently-dead config
+    /// hostname from re-resolving every 60s and flooding the log (#3760).
+    pub(super) async fn resolve_peers_for_storage(
+        &self,
+        peers: &[PeerAddress],
+    ) -> Vec<PeerAddress> {
         use std::net::IpAddr;
 
         let mut resolved = Vec::with_capacity(peers.len());
@@ -425,27 +565,55 @@ impl App {
                 resolved.push(peer.clone());
                 continue;
             }
-            match tokio::net::lookup_host((peer.host.as_str(), peer.port)).await {
-                Ok(addrs) => {
-                    if let Some(sa) = addrs.into_iter().find(|a| a.is_ipv4()) {
-                        resolved.push(PeerAddress::from(sa));
-                    } else {
-                        tracing::warn!(
-                            "No IPv4 address for config peer {}, storing as hostname",
-                            peer
-                        );
-                        resolved.push(peer.clone());
-                    }
+
+            let now = std::time::Instant::now();
+
+            // Snapshot the prior state, then release the lock before any await.
+            let prev = self
+                .dns_resolve_state
+                .lock()
+                .expect("dns_resolve_state poisoned")
+                .get(&peer.host)
+                .cloned();
+
+            let attempt = if prev.as_ref().is_some_and(|s| in_backoff_window(s, now)) {
+                DnsAttempt::Skipped
+            } else {
+                match tokio::net::lookup_host((peer.host.as_str(), peer.port)).await {
+                    Ok(addrs) => match addrs.into_iter().find(|a| a.is_ipv4()) {
+                        Some(sa) => DnsAttempt::Succeeded(PeerAddress::from(sa)),
+                        None => DnsAttempt::Failed,
+                    },
+                    Err(_) => DnsAttempt::Failed,
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "DNS failed for config peer {}: {}, storing as hostname",
-                        peer,
-                        e
-                    );
-                    resolved.push(peer.clone());
-                }
+            };
+
+            let (new_state, address, log) = apply_dns_result(prev.as_ref(), peer, attempt, now);
+
+            match log {
+                DnsLog::None => {}
+                DnsLog::WarnFailed => tracing::warn!(
+                    "DNS failed for config peer {}, storing as hostname (backing off, \
+                     further failures at debug)",
+                    peer
+                ),
+                DnsLog::WarnRecovered => tracing::warn!(
+                    "DNS resolved for config peer {} after {} failed attempt(s)",
+                    peer,
+                    prev.as_ref().map_or(0, |s| s.consecutive_failures)
+                ),
+                DnsLog::DebugStillFailing => tracing::debug!(
+                    "DNS still failing for config peer {} ({} consecutive), storing as hostname",
+                    peer,
+                    new_state.consecutive_failures
+                ),
             }
+
+            self.dns_resolve_state
+                .lock()
+                .expect("dns_resolve_state poisoned")
+                .insert(peer.host.clone(), new_state);
+            resolved.push(address);
         }
         resolved
     }
@@ -532,8 +700,10 @@ impl App {
 
         // Resolve config hostnames to IPs before DB operations,
         // preventing hostname/IP alias duplicates in the peer database.
-        let resolved_known = Self::resolve_peers_for_storage(&known_peers_config).await;
-        let resolved_preferred = Self::resolve_peers_for_storage(&preferred_peers_config).await;
+        let resolved_known = self.resolve_peers_for_storage(&known_peers_config).await;
+        let resolved_preferred = self
+            .resolve_peers_for_storage(&preferred_peers_config)
+            .await;
 
         // Phase 1: All DB work on the blocking pool
         struct DbResult {
