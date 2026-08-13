@@ -37,13 +37,15 @@ use crate::query_policy::QueryKind;
 /// Classification convention (matches the #3419 operator question "did peers
 /// churn out, or did henyey stop talking?"):
 /// - `Remote`: the peer closed/reset the socket — `recv` returned `Ok(None)`
-///   (peer FIN) or a recv error (RST / errno 104).
+///   (peer FIN) or a recv error (RST / errno 104) — or the peer sent us a
+///   terminal `ErrorMsg` (#3775), explicitly initiating the teardown at the
+///   protocol level. This is distinct from `send_error` below (henyey's own
+///   send path failing, still `Local`).
 /// - `Local`: henyey broke the loop — idle/straggler timeout, send / flood-send
-///   error, protocol-violation or received-ERROR_MSG teardown, shutdown, or
-///   channel close. `send_error` is attributed `Local` by the "who broke the
-///   loop" convention even though the underlying cause may be a remote RST
-///   surfaced on the next write: the operator signal is "henyey's send path
-///   gave up."
+///   error, protocol-violation teardown, shutdown, or channel close.
+///   `send_error` is attributed `Local` by the "who broke the loop" convention
+///   even though the underlying cause may be a remote RST surfaced on the next
+///   write: the operator signal is "henyey's send path gave up."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum DropInitiator {
     /// The remote peer closed or reset the connection.
@@ -55,12 +57,13 @@ pub(super) enum DropInitiator {
 
 impl DropInitiator {
     /// Map a `log_inbound_drop_diag` `reason` string to its initiator. Only the
-    /// two remote-origin reasons (`remote_closed`, `recv_error`) are `Remote`;
-    /// every other reason — and any unknown string — is `Local`. Kept as a pure
-    /// function so the attribution is unit-testable without a live socket.
+    /// three remote-origin reasons (`remote_closed`, `recv_error`, `peer_error`)
+    /// are `Remote`; every other reason — and any unknown string — is `Local`.
+    /// Kept as a pure function so the attribution is unit-testable without a
+    /// live socket.
     pub(super) fn from_reason(reason: &str) -> Self {
         match reason {
-            "remote_closed" | "recv_error" => DropInitiator::Remote,
+            "remote_closed" | "recv_error" | "peer_error" => DropInitiator::Remote,
             _ => DropInitiator::Local,
         }
     }
@@ -601,11 +604,13 @@ pub(super) struct InboundDropDiag {
 }
 
 /// Result from handling a received message — controls the peer loop's flow.
+#[derive(Debug)]
 enum RecvAction {
     /// Continue the loop normally.
     Continue,
-    /// Break out of the loop (disconnect).
-    Break,
+    /// Break out of the loop (disconnect), carrying who initiated the drop so
+    /// the peer loop can attribute the inbound-drop counter (#3422, #3775).
+    Break(DropInitiator),
 }
 
 /// Log received fetch messages and check for ping responses.
@@ -1202,9 +1207,11 @@ impl OverlayManager {
         let running = &state.running;
 
         // #3422: who initiated the drop. Default Local (henyey-side); set Remote
-        // only at the two remote-origin exits below. The caller in
-        // connection.rs uses this to increment the matching sibling counter
-        // alongside the unconditional inbound_drop total.
+        // at the remote-origin exits below — the two `peer.recv()` outcomes
+        // (`remote_closed`, `recv_error`) and the terminal peer-sent `ErrorMsg`
+        // path, which threads its initiator out via `RecvAction::Break` (#3775).
+        // The caller in connection.rs uses this to increment the matching
+        // sibling counter alongside the unconditional inbound_drop total.
         let mut drop_initiator = DropInitiator::Local;
         let is_validator = state.is_validator;
 
@@ -1396,7 +1403,8 @@ impl OverlayManager {
                                 "message_type" => msg_kind.label()
                             )
                             .record(recv_start.elapsed().as_secs_f64());
-                            if matches!(action, RecvAction::Break) {
+                            if let RecvAction::Break(initiator) = action {
+                                drop_initiator = initiator;
                                 break;
                             }
 
@@ -1483,7 +1491,8 @@ impl OverlayManager {
     /// Process a single received message from a peer.
     ///
     /// Handles error messages, flow control, message routing, and SendMore
-    /// grants. Returns `RecvAction::Break` if the peer loop should exit.
+    /// grants. Returns `RecvAction::Break(initiator)` if the peer loop should
+    /// exit, carrying who initiated the drop (#3775).
     async fn handle_received_message(
         message: StellarMessage,
         peer_id: &PeerId,
@@ -1522,9 +1531,26 @@ impl OverlayManager {
                     sanitize_error_msg(&err.msg[..])
                 );
             }
+            // #3775: a peer-sent ErrorMsg terminates the session at the peer's
+            // explicit request, so this drop is remote-initiated. Emit the
+            // `overlay_inbound_diag` line every other drop reason gets (fires
+            // for both Load and non-Load codes \u2014 both are remote-initiated by
+            // the same parity argument), so the inbound_drop_remote counter and
+            // the diag log agree by construction, then thread `Remote` out via
+            // the Break payload.
+            Self::log_inbound_drop_diag(
+                ctx.peer,
+                peer_id,
+                "peer_error",
+                &format!(
+                    "code={:?} msg={}",
+                    err.code,
+                    sanitize_error_msg(&err.msg[..])
+                ),
+            );
             // Parity: stellar-core's recvError() unconditionally
             // calls drop() \u2014 ErrorMsg is terminal.
-            return RecvAction::Break;
+            return RecvAction::Break(DropInitiator::from_reason("peer_error"));
         }
 
         // Flow control: RAII guard locks capacity on creation,
@@ -1547,7 +1573,7 @@ impl OverlayManager {
                     Ok(()) => state.metrics.messages_written.inc(),
                     Err(_) => state.metrics.errors_write.inc(),
                 }
-                return RecvAction::Break;
+                return RecvAction::Break(DropInitiator::Local);
             }
         };
 
@@ -1558,7 +1584,7 @@ impl OverlayManager {
                     "Peer sent_deprecated_send_more peer={}, dropping connection",
                     peer_id
                 );
-                return RecvAction::Break;
+                return RecvAction::Break(DropInitiator::Local);
             }
             StellarMessage::SendMoreExtended(_) => {
                 match Self::handle_send_more_extended(
@@ -1583,7 +1609,7 @@ impl OverlayManager {
                         // #3570 observability: accumulate SCP envelopes written.
                         *ctx.scp_written += outcome.scp_written;
                     }
-                    Err(()) => return RecvAction::Break,
+                    Err(()) => return RecvAction::Break(DropInitiator::Local),
                 }
             }
             _ => {}
@@ -1628,7 +1654,7 @@ impl OverlayManager {
         // release) or, on an early drop, lets it drop here (immediate release).
         match Self::route_received_message(&message, peer_id, ctx, state, is_validator, scp_release)
         {
-            None => return RecvAction::Break,
+            None => return RecvAction::Break(DropInitiator::Local),
             Some(is_scp) => {
                 if is_scp {
                     *ctx.scp_messages += 1;
@@ -1797,6 +1823,19 @@ mod tests {
             DropInitiator::Local
         );
         assert_eq!(DropInitiator::default(), DropInitiator::Local);
+    }
+
+    /// #3775: a peer-sent `ErrorMsg` terminates the session at the peer's
+    /// explicit request, so its drop reason (`peer_error`) must classify as
+    /// `Remote` — not fall through to the `Local` default the way it did before
+    /// this fix. Regression guard for `from_reason`'s taxonomy.
+    #[test]
+    fn test_from_reason_classifies_peer_error_as_remote() {
+        assert_eq!(
+            DropInitiator::from_reason("peer_error"),
+            DropInitiator::Remote,
+            "a peer-sent ErrorMsg (reason=\"peer_error\") is remote-initiated"
+        );
     }
 
     #[test]
@@ -3640,8 +3679,9 @@ mod tests {
                 &read_resume,
             ));
             assert!(
-                matches!(action, RecvAction::Break),
-                "a peer-sent ErrorMsg must terminate the loop"
+                matches!(action, RecvAction::Break(DropInitiator::Remote)),
+                "a peer-sent ErrorMsg must terminate the loop and attribute \
+                 the drop to the remote peer (#3775), got: {action:?}"
             );
         });
 
@@ -3657,6 +3697,78 @@ mod tests {
         assert!(
             value.contains("GET_SCP_STATE"),
             "recent_sends must surface the frame(s) sent before the drop, got: {value}"
+        );
+    }
+
+    /// #3775: a peer-sent `ErrorMsg` is a remote-initiated teardown, so
+    /// `handle_received_message` must break the loop attributing the drop to
+    /// `DropInitiator::Remote` — the value the peer loop then hands
+    /// `connection.rs` to increment `inbound_drop_remote` (not `_local`).
+    /// Before this fix the `ErrorMsg` arm returned a payload-less `Break` and
+    /// the drop fell through to the `Local` default. Asserts the attribution
+    /// directly, independent of the #3773 `recent_sends` logging concern above.
+    #[test]
+    fn test_error_msg_attributes_drop_to_remote() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+        let (mut peer, _peer_b) = crate::peer::Peer::new_test_authenticated_pair(
+            Arc::clone(&metrics),
+            Arc::new(crate::metrics::OverlayMetrics::new()),
+        );
+
+        let mut received_peers = false;
+        let mut ping = PingTracker::new();
+        let mut query_limiter = QueryRateLimiter::new();
+        let mut peer_rate_limiter = PeerRateLimiter::new();
+        let mut scp_messages = 0u64;
+        let mut last_write = Instant::now();
+        let mut enqueue_time_of_last_write = Instant::now();
+        let mut scp_written = 0u64;
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<OutboundMessage>(16);
+        let mut ctx = PeerLoopCtx {
+            peer: &mut peer,
+            received_peers: &mut received_peers,
+            ping: &mut ping,
+            query_limiter: &mut query_limiter,
+            peer_rate_limiter: &mut peer_rate_limiter,
+            scp_messages: &mut scp_messages,
+            last_write: &mut last_write,
+            enqueue_time_of_last_write: &mut enqueue_time_of_last_write,
+            scp_written: &mut scp_written,
+            outbound_tx: &outbound_tx,
+        };
+
+        let peer_id = crate::PeerId::from_bytes([9u8; 32]);
+        let (shared, _scp_rx) = crate::manager::tests::shared_state_with_scp_receiver();
+        let fc = Arc::new(crate::flow_control::FlowControl::new(
+            FlowControlConfig::default(),
+        ));
+        let read_resume = Arc::new(tokio::sync::Notify::new());
+
+        // ERR_LOAD too is remote-initiated by the same parity argument; use it
+        // to prove the attribution does NOT gate on `err.code`.
+        let err_msg = StellarMessage::ErrorMsg(stellar_xdr::SError {
+            code: ErrorCode::Load,
+            msg: stellar_xdr::StringM::try_from("peer at capacity".to_string()).unwrap(),
+        });
+
+        let action = rt.block_on(OverlayManager::handle_received_message(
+            err_msg,
+            &peer_id,
+            &mut ctx,
+            &fc,
+            &shared,
+            false,
+            &read_resume,
+        ));
+
+        assert!(
+            matches!(action, RecvAction::Break(DropInitiator::Remote)),
+            "a peer-sent ErrorMsg must attribute the drop to Remote, got: {action:?}"
         );
     }
 }
