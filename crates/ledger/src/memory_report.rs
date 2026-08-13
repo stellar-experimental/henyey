@@ -25,7 +25,7 @@ use tracing::info;
 #[cfg(test)]
 pub(crate) const MEMORY_REPORT_FIELD: &str = "memory_report";
 
-/// Process-level memory breakdown parsed from `/proc/self/status`.
+/// Process status (memory + thread count) parsed from `/proc/self/status`.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessMemory {
     /// Total resident set size in bytes (VmRSS).
@@ -34,6 +34,8 @@ pub struct ProcessMemory {
     pub anon_rss_bytes: u64,
     /// File-backed (mmap) RSS in bytes (RssFile).
     pub file_rss_bytes: u64,
+    /// Total OS thread count (the `Threads:` field — a bare count, not bytes).
+    pub threads: u64,
 }
 
 impl ProcessMemory {
@@ -51,30 +53,42 @@ impl ProcessMemory {
         }
     }
 
+    /// Read and parse `/proc/self/status` (Linux only).
     #[cfg(target_os = "linux")]
     fn parse_proc_status() -> Self {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
             return Self::default();
         };
+        Self::parse_proc_status_str(&status)
+    }
 
+    /// Parse the textual contents of a `/proc/self/status` file.
+    ///
+    /// Platform-independent (not `cfg`-gated) so the deterministic parse test
+    /// compiles and runs on every platform. Unknown/absent fields leave the
+    /// corresponding value at its `default()` of 0.
+    fn parse_proc_status_str(status: &str) -> Self {
         let mut result = Self::default();
         for line in status.lines() {
-            let (key, value_kb) = match line.split_once(':') {
+            let (key, value) = match line.split_once(':') {
                 Some((k, v)) => (k.trim(), v.trim()),
                 None => continue,
             };
-            // Values are in "NNNN kB" format
-            let kb: u64 = value_kb
+            // First whitespace-delimited token. For `Vm*`/`Rss*` this is a kB
+            // count ("NNNN kB"); for `Threads:` it is the bare thread count.
+            let first: u64 = value
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            let bytes = kb * 1024;
 
             match key {
-                "VmRSS" => result.rss_bytes = bytes,
-                "RssAnon" => result.anon_rss_bytes = bytes,
-                "RssFile" => result.file_rss_bytes = bytes,
+                // kB → bytes.
+                "VmRSS" => result.rss_bytes = first * 1024,
+                "RssAnon" => result.anon_rss_bytes = first * 1024,
+                "RssFile" => result.file_rss_bytes = first * 1024,
+                // Bare count — assign raw, NOT scaled by 1024.
+                "Threads" => result.threads = first,
                 _ => {}
             }
         }
@@ -471,6 +485,41 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(pm.rss_bytes > 0);
         let _ = pm;
+    }
+
+    /// #3814: `Threads:` is a bare count and must be assigned raw (NOT `* 1024`),
+    /// while the sibling `Vm*`/`Rss*` values in the same file stay kB→bytes. This
+    /// is the whole point of the special-case, so the test asserts both halves
+    /// off one synthetic blob. Platform-independent — exercises the pure helper.
+    #[test]
+    fn test_parse_proc_status_threads() {
+        let status = "\
+Name:\thenyey
+VmRSS:\t  204800 kB
+RssAnon:\t 102400 kB
+RssFile:\t 102400 kB
+Threads:\t47
+";
+        let pm = ProcessMemory::parse_proc_status_str(status);
+        assert_eq!(pm.threads, 47, "Threads: parsed as a raw count, not * 1024");
+        assert_eq!(
+            pm.rss_bytes,
+            204_800 * 1024,
+            "VmRSS still parses as kB→bytes"
+        );
+        assert_eq!(pm.anon_rss_bytes, 102_400 * 1024);
+        assert_eq!(pm.file_rss_bytes, 102_400 * 1024);
+    }
+
+    /// #3814: a live process always has at least its own thread, so `capture()`
+    /// reads a `Threads:` count ≥ 1 on Linux. Off-Linux this path is compiled
+    /// out (the field stays 0 via `Self::default()`), matching the sibling RSS
+    /// gauges' "0 = unavailable" convention.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_capture_reads_thread_count() {
+        let pm = ProcessMemory::capture();
+        assert!(pm.threads >= 1, "a running process has at least one thread");
     }
 
     #[test]

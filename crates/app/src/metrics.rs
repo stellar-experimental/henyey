@@ -533,6 +533,10 @@ metric_catalog! {
             => "Anonymous (heap+stack) resident bytes (RssAnon); scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
         PROCESS_FILE_RESIDENT_MEMORY_BYTES = "henyey_process_file_resident_memory_bytes"
             => "File-backed (mmap) resident bytes (RssFile); scrape < ~30 s to resolve the 60 s RSS sawtooth (#3759)";
+        // Total OS thread count (#3814). Folded into the same per-scrape
+        // /proc/self/status read as the RSS gauges above — zero extra syscalls.
+        PROCESS_THREADS = "henyey_process_threads"
+            => "Total OS thread count (Threads: from /proc/self/status; 0 = unavailable/off-Linux)";
 
         // ── Loadgen meters (#3569, reset on clearmetrics #3630) ────────
         //
@@ -1386,6 +1390,8 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     PROCESS_RESIDENT_MEMORY_BYTES.set(proc_mem.rss_bytes as f64);
     PROCESS_ANON_RESIDENT_MEMORY_BYTES.set(proc_mem.anon_rss_bytes as f64);
     PROCESS_FILE_RESIDENT_MEMORY_BYTES.set(proc_mem.file_rss_bytes as f64);
+    // Total OS thread count (#3814), from the same /proc/self/status read.
+    PROCESS_THREADS.set(proc_mem.threads as f64);
 
     // Phase 3: Ledger apply cumulative counters.
     LEDGER_APPLY_SUCCESS_TOTAL.absolute(snap.cumulative_apply_success);
@@ -1959,6 +1965,39 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// #3814: the process thread-count gauge is present in the catalog, is
+    /// pre-registered at 0, and renders its HELP/TYPE after `describe_metrics()`
+    /// + `register_label_series()`. Mirrors `test_scp_persist_metrics_in_catalog`.
+    #[test]
+    fn test_process_threads_gauge_in_catalog() {
+        let name = "henyey_process_threads";
+        assert!(
+            ALL_GAUGE_NAMES.contains(&name),
+            "gauge {} missing from ALL_GAUGE_NAMES",
+            name
+        );
+        assert!(
+            ALL_PREREGISTERED_GAUGE_NAMES.contains(&name),
+            "gauge {} should be pre-registered",
+            name
+        );
+
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+        assert!(
+            output.contains("# TYPE henyey_process_threads gauge"),
+            "threads gauge TYPE missing"
+        );
+        assert!(
+            output.contains("henyey_process_threads 0"),
+            "threads gauge should be pre-registered at 0"
+        );
     }
 
     /// The five state-archival eviction counters (#3168) are present in the
