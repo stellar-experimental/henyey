@@ -6,7 +6,7 @@
 **Overall adherence:** 83%
 
 Counts (excluding Drift and N/A from denominator):
-**Full 82 | Partial 17 | Absent 0 | Drift 2 | N/A 2**
+**Full 83 | Partial 17 | Absent 0 | Drift 1 | N/A 2**
 
 ## Summary table
 
@@ -14,7 +14,7 @@ Counts (excluding Drift and N/A from denominator):
 |---------|-------|--------|----------------|
 | §3.3 | MAX_MESSAGE_SIZE (16 MiB) / unauth limit (4096) | Full | `codec.rs:30-35,194-206` |
 | §3.3 | Zero-length frame rejection | Full | `codec.rs:183-187` |
-| §4.2 | RFC 5531 record marking (auth bit handling) | Drift | `codec.rs:128-145,175-177` — sender sets bit 31, receiver uses it as a tag; spec says it's just "last fragment"; effectively repurposed as auth-flag (henyey + stellar-core both do this) |
+| §4.2 | RFC 5531 record marking (last-fragment bit) | Full | `codec.rs:145,272` set `len \| 0x80000000` on send; `codec.rs:185-186` masks it on receive and surfaces it as `is_last_fragment` for diagnostics only (nothing branches on it). Matches stellar-core: xdrpp sets the bit on send (`marshal.cc:29,40`), and `TCPPeer::getIncomingMsgLength()` clears it and never inspects it (`TCPPeer.cpp:679`, `length &= 0x7f`). Neither implements continuation-fragment reassembly — spec-conformant, since the bit is set on every message. |
 | §4.3 | AuthenticatedMessage MAC framing, send/recv sequence | Full | `auth.rs:622-707` (INV-O1/O2) |
 | §4.3 | Constant-time MAC compare | Full | `auth.rs:90-103,694-697` |
 | §5.3 | TCP_NODELAY, SO_LINGER | Full | `connection.rs:94-99` |
@@ -191,8 +191,9 @@ Corrected invariant tally: **Full 18 | Partial 1 | Absent 0**.
 
 ## Drift items (require human review)
 
-1. **§4.2 / RFC 5531 bit 31 reinterpretation**: Both the henyey codec and stellar-core treat the high bit as a per-frame "authenticated" flag. The spec (§4.2 lines 230-244) says the high bit is RFC 5531's "last fragment" marker, set on every message. The Rust implementation matches stellar-core (`codec.rs:128-145`: `is_authenticated = !matches!(...Hello(_))`), so this is mutual deviation from the strict RFC and the spec text. **Probably the spec text should be updated** to acknowledge the auth-flag overload.
-2. **§5.4.4 / `GET_SCP_STATE(0)` vs `getMinLedgerSeqToAskPeers()`**: Rust always sends 0; spec expects a computed value. Likely a Rust gap (would benefit from app-callback for catchup state).
+1. **§5.4.4 / `GET_SCP_STATE(0)` vs `getMinLedgerSeqToAskPeers()`**: Rust always sends 0; spec expects a computed value. Likely a Rust gap (would benefit from app-callback for catchup state).
+
+*Resolved: §4.2 (RFC 5531 bit 31) was previously listed as Drift on the mistaken premise that stellar-core repurposed the record-marking bit as an authentication flag. That was factually wrong about upstream — there is no `is_authenticated` field in `codec.rs`, and `TCPPeer::getIncomingMsgLength()` (`TCPPeer.cpp:679`) masks the bit and never inspects it. Corrected to `Full`; see #3776 / PR #3800. (Note: xdrpp's generic message-socket reader `msgsock.cc:86` and `srpc.cc:42` do branch on the bit, but stellar-core's overlay does not use that read path — `TCPPeer` does its own asio read plus `getIncomingMsgLength()` — so this is not evidence that core inspects the bit.)*
 
 ## Dangling Spec anchors
 

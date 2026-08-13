@@ -24,7 +24,11 @@
 //! # Message Size Limits
 //!
 //! - Minimum: 12 bytes (at least the authenticated message header)
-//! - Maximum: 32 MB (prevents memory exhaustion attacks)
+//! - Maximum: 16 MB (prevents memory exhaustion attacks), matching
+//!   stellar-core's `Peer.h` `MAX_MESSAGE_SIZE = 1024 * 1024 * 16`.
+//! - Pre-authentication maximum: 4,096 bytes (applies to HELLO/AUTH before the
+//!   handshake completes), matching stellar-core's `TCPPeer.h`
+//!   `MAX_UNAUTH_MESSAGE_SIZE = 0x1000`.
 
 use crate::{OverlayError, Result};
 use bytes::{Buf, BufMut, BytesMut};
