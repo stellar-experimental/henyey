@@ -3054,11 +3054,23 @@ impl App {
     /// (`is_fatal_catchup_failure()`) **and** it is not the narrow
     /// stateless-fresh-genesis knit carve-out (`current_ledger_seq() ==
     /// GENESIS_LEDGER_SEQ && is_knit_to_lcl_failure()`). This mirrors, for the
-    /// startup path, the exact classification the online catchup handler
-    /// [`handle_catchup_result`](Self::handle_catchup_result) already applies —
+    /// startup path, the *fatal + genesis-knit* classification the online catchup
+    /// handler [`handle_catchup_result`](Self::handle_catchup_result) applies —
     /// the #3410 genesis-knit exception (a stateless fresh node has no committed
     /// state to protect) is preserved, and for `LCL > genesis` the #3282/#3288
     /// terminal semantics are unchanged.
+    ///
+    /// It is **not** a full mirror of the online handler: the #3282
+    /// seeded-from-local-clone divergence carve-out
+    /// (`is_local_vs_archive_divergence`) is intentionally omitted here. Online,
+    /// that class is treated as self-healing (no wipe) because
+    /// `handle_catchup_result` can re-drive catchup in-process with a force-full
+    /// flag. At boot that self-heal is unavailable — `run_cmd` exits on `Err`
+    /// and the force-full flag is in-memory only (not persisted for the
+    /// divergence case), so a no-wipe restart would re-seed from the same
+    /// divergent clone and crash-loop. Signalling a wipe is therefore the
+    /// correct startup recovery, and this classifier deliberately diverges from
+    /// the online handler for that class.
     ///
     /// The downcast searches the anyhow source chain, so a typed `HistoryError`
     /// wrapped by `?`'s `.context(...)` on the way out of the startup catchup
