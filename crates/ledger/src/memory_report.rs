@@ -473,6 +473,37 @@ mod tests {
         let _ = pm;
     }
 
+    /// #3814: `Threads:` is a bare count and must be assigned raw (NOT `* 1024`),
+    /// while the sibling `Vm*`/`Rss*` values in the same file stay kB→bytes. This
+    /// is the whole point of the special-case, so the test asserts both halves
+    /// off one synthetic blob. Platform-independent — exercises the pure helper.
+    #[test]
+    fn test_parse_proc_status_threads() {
+        let status = "\
+Name:\thenyey
+VmRSS:\t  204800 kB
+RssAnon:\t 102400 kB
+RssFile:\t 102400 kB
+Threads:\t47
+";
+        let pm = ProcessMemory::parse_proc_status_str(status);
+        assert_eq!(pm.threads, 47, "Threads: parsed as a raw count, not * 1024");
+        assert_eq!(pm.rss_bytes, 204_800 * 1024, "VmRSS still parses as kB→bytes");
+        assert_eq!(pm.anon_rss_bytes, 102_400 * 1024);
+        assert_eq!(pm.file_rss_bytes, 102_400 * 1024);
+    }
+
+    /// #3814: a live process always has at least its own thread, so `capture()`
+    /// reads a `Threads:` count ≥ 1 on Linux. Off-Linux this path is compiled
+    /// out (the field stays 0 via `Self::default()`), matching the sibling RSS
+    /// gauges' "0 = unavailable" convention.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_capture_reads_thread_count() {
+        let pm = ProcessMemory::capture();
+        assert!(pm.threads >= 1, "a running process has at least one thread");
+    }
+
     #[test]
     fn test_allocator_stats_capture() {
         // Without jemalloc feature, all zeros

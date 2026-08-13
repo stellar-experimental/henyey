@@ -1961,6 +1961,39 @@ mod tests {
         }
     }
 
+    /// #3814: the process thread-count gauge is present in the catalog, is
+    /// pre-registered at 0, and renders its HELP/TYPE after `describe_metrics()`
+    /// + `register_label_series()`. Mirrors `test_scp_persist_metrics_in_catalog`.
+    #[test]
+    fn test_process_threads_gauge_in_catalog() {
+        let name = "henyey_process_threads";
+        assert!(
+            ALL_GAUGE_NAMES.contains(&name),
+            "gauge {} missing from ALL_GAUGE_NAMES",
+            name
+        );
+        assert!(
+            ALL_PREREGISTERED_GAUGE_NAMES.contains(&name),
+            "gauge {} should be pre-registered",
+            name
+        );
+
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+        assert!(
+            output.contains("# TYPE henyey_process_threads gauge"),
+            "threads gauge TYPE missing"
+        );
+        assert!(
+            output.contains("henyey_process_threads 0"),
+            "threads gauge should be pre-registered at 0"
+        );
+    }
+
     /// The five state-archival eviction counters (#3168) are present in the
     /// catalog under the expected Prometheus names. The names mirror
     /// stellar-core's medida keys {"state-archival","eviction",*}.
