@@ -65,6 +65,7 @@ use henyey_common::protocol::LclContext;
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use henyey_ledger::{LedgerManager, TransactionSetVariant};
@@ -302,6 +303,17 @@ pub struct CatchupManager {
     /// `bucketListHash` is independent of this value (levels are assembled by
     /// index, not completion order), so capping is byte-for-byte state-preserving.
     pub(super) restore_apply_fan_out: Option<usize>,
+
+    /// Count of `ledger_close_meta` rows this manager failed to persist (#3801).
+    ///
+    /// Bumped by `emit_meta` on every abandoned meta write — transient-busy
+    /// exhaustion, non-transient DB error, or serialization failure alike. Each
+    /// increment is an RPC-visible hole catchup will never revisit, so the count
+    /// is surfaced on [`CatchupResult`] as a delta over the run. Atomic (rather
+    /// than `Cell`) because `emit_meta` takes `&self` and `CatchupManager` is
+    /// `Send + Sync`; `Relaxed` is sufficient — this is a pure counter with no
+    /// ordering relationship to any other state.
+    pub(super) meta_rows_dropped: AtomicU32,
 }
 
 impl CatchupManager {
@@ -324,6 +336,7 @@ impl CatchupManager {
             emit_meta_ext_v1: false,
             trusted_scp_anchor: None,
             restore_apply_fan_out: None,
+            meta_rows_dropped: AtomicU32::new(0),
         }
     }
 
@@ -344,12 +357,24 @@ impl CatchupManager {
             emit_meta_ext_v1: false,
             trusted_scp_anchor: None,
             restore_apply_fan_out: None,
+            meta_rows_dropped: AtomicU32::new(0),
         }
     }
 
     /// Get the current catchup progress.
     pub fn progress(&self) -> &CatchupProgress {
         &self.progress
+    }
+
+    /// Number of `ledger_close_meta` rows this manager has failed to persist
+    /// over its whole lifetime (#3801).
+    ///
+    /// Each one is a permanent, RPC-visible gap: catchup does not revisit a
+    /// ledger, so the row is never rewritten. [`CatchupResult::meta_rows_dropped`]
+    /// reports the per-run delta; this accessor exposes the running total for
+    /// callers that reuse one manager across runs.
+    pub fn meta_rows_dropped(&self) -> u32 {
+        self.meta_rows_dropped.load(Ordering::Relaxed)
     }
 
     /// Set the replay configuration.
@@ -597,6 +622,10 @@ impl CatchupManager {
         buckets_downloaded: u32,
         ledger_manager: &LedgerManager,
     ) -> Result<CatchupResult> {
+        // #3801: snapshot before, subtract after, so the reported count is this
+        // run's meta loss even when one manager is reused across runs.
+        let meta_dropped_before = self.meta_rows_dropped.load(Ordering::Relaxed);
+
         let (final_seq, final_hash, ledgers_applied) = if checkpoint_seq >= target {
             // No replay needed — target is exactly at checkpoint.
             // §14.5 parity: like `persist_bucket_list_snapshot` above,
@@ -631,11 +660,17 @@ impl CatchupManager {
             final_seq, final_hash, ledgers_applied
         );
 
+        let meta_rows_dropped = self
+            .meta_rows_dropped
+            .load(Ordering::Relaxed)
+            .saturating_sub(meta_dropped_before);
+
         Ok(CatchupResult {
             ledger_seq: final_seq,
             ledger_hash: final_hash,
             ledgers_applied,
             buckets_downloaded,
+            meta_rows_dropped,
         })
     }
 

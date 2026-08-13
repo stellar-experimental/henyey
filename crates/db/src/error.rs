@@ -80,6 +80,43 @@ pub enum DbError {
     QueryBudgetExceeded,
 }
 
+impl DbError {
+    /// Returns `true` iff this is a transient SQLite busy/locked
+    /// (`SQLITE_BUSY` / `SQLITE_LOCKED`, "database is locked"), #3497.
+    ///
+    /// SQLite write transactions are atomic: a `DatabaseBusy`/`DatabaseLocked`
+    /// means the transaction NEVER committed, so the on-disk state is
+    /// consistent and the write can be safely re-issued (or, at a
+    /// log-and-continue site, safely abandoned as a *known* loss rather than
+    /// treated as corruption). This is the recoverable, environmental class.
+    ///
+    /// The match is NARROW by design (the load-bearing consensus-safety
+    /// guard): only the two busy/locked primary `ErrorCode`s are recoverable.
+    /// Every other SQLite code (`DatabaseCorrupt`, `SystemIoFailure`, …) and
+    /// every other [`DbError`] variant (`Integrity`, `Xdr`, …) stay on the
+    /// fatal path — genuine corruption must NEVER be reclassified recoverable.
+    /// Mirrors the `is_query_interrupted` shape in `crate::queries` (matching
+    /// the structured `ErrorCode`, NOT the message string).
+    ///
+    /// Lives here, on the error type, rather than in a single consumer crate
+    /// so that every caller shares ONE definition of "transient": `crates/app`
+    /// (`is_transient_db_busy`, ledger-close/persist/maintenance) and
+    /// `crates/history` (catchup `emit_meta`, #3801) both delegate to it.
+    pub fn is_transient_busy(&self) -> bool {
+        matches!(
+            self,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked,
+                    ..
+                },
+                _,
+            ))
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

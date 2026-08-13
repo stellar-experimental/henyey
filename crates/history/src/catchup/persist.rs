@@ -5,10 +5,95 @@ use henyey_bucket::BucketList;
 use henyey_common::{Hash256, NetworkId};
 
 use henyey_tx::TransactionFrame;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use stellar_xdr::{LedgerHeader, ScpHistoryEntry, WriteXdr};
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::{CatchupManager, LedgerData};
+
+/// Bounded retry budget for the catchup `ledger_close_meta` write (#3801):
+/// 1 initial attempt + 2 retries.
+///
+/// Bounded rather than unbounded because each attempt already blocks inside
+/// SQLite for up to `busy_timeout` (30 s), so an unbounded loop would wedge
+/// catchup indefinitely on a persistently contended DB.
+const CATCHUP_META_MAX_ATTEMPTS: u32 = 3;
+
+/// Pause between attempts. Mirrors the maintenance chunk pause used by the
+/// sibling `delete_in_chunks` retry (#3772/#3781): long enough to let a
+/// competing writer's transaction commit, short enough to be noise against the
+/// 30 s `busy_timeout` each attempt may already have absorbed.
+const CATCHUP_META_RETRY_PAUSE: Duration = Duration::from_millis(25);
+
+/// Outcome of [`store_meta_with_busy_retry`].
+///
+/// `DroppedBusy` and `Failed` are both losses, but only the former is a
+/// *transient-busy* loss. Keeping them distinct is what lets the busy-loss
+/// counter stay honest (#3802 contract point 4: non-transient errors are never
+/// counted there) while every loss is still reported to the caller.
+pub(super) enum MetaStoreOutcome {
+    /// The row was written — possibly after one or more retries.
+    Stored,
+    /// A transient `SQLITE_BUSY`/`SQLITE_LOCKED` survived the whole retry
+    /// budget and the write was abandoned. The `henyey_db_busy_write_dropped_total`
+    /// increment has already been emitted by the helper.
+    DroppedBusy(henyey_db::DbError),
+    /// A non-transient error (corruption, integrity, schema, …). NOT retried
+    /// and NOT counted as a busy drop — re-issuing the identical INSERT cannot
+    /// help, and inflating the busy series would mislead the alert.
+    Failed(henyey_db::DbError),
+}
+
+/// Issue a `ledger_close_meta` write with a bounded transient-busy retry.
+///
+/// Takes the write as a closure — the same seam `delete_in_chunks` uses — so
+/// the classification, the budget and the telemetry are all exercisable
+/// without a real lock-contending SQLite connection (there is no deterministic
+/// way to surface a genuine `SQLITE_BUSY` through the pooled `Database`: with
+/// `busy_timeout = 30_000 ms` a lock held by a test thread is *waited out*,
+/// not returned as an error).
+///
+/// Telemetry (#3802 vocabulary, `site="catchup_meta"`), emitted here so the
+/// counters cannot drift apart from the policy that triggers them:
+/// - one `henyey_db_busy_retry_attempts_total` per *retried* attempt (so an
+///   exhausted budget yields `CATCHUP_META_MAX_ATTEMPTS - 1`, never one per
+///   episode);
+/// - exactly one `henyey_db_busy_write_dropped_total` on abandonment.
+///
+/// Emitted by literal name through the global `metrics` facade rather than via
+/// `henyey_app::metrics`, because the dependency runs app → history; the
+/// matching `SITE_CATCHUP_META` constant and pre-registration live in
+/// `crates/app/src/metrics.rs`. Same split as the `stellar_history_*` counters
+/// already emitted from this crate.
+pub(super) fn store_meta_with_busy_retry(
+    mut store: impl FnMut() -> std::result::Result<(), henyey_db::DbError>,
+) -> MetaStoreOutcome {
+    let mut attempt: u32 = 1;
+    loop {
+        match store() {
+            Ok(()) => return MetaStoreOutcome::Stored,
+            Err(err) if err.is_transient_busy() && attempt < CATCHUP_META_MAX_ATTEMPTS => {
+                metrics::counter!(
+                    "henyey_db_busy_retry_attempts_total",
+                    "site" => "catchup_meta",
+                )
+                .increment(1);
+                std::thread::sleep(CATCHUP_META_RETRY_PAUSE);
+                attempt += 1;
+            }
+            Err(err) if err.is_transient_busy() => {
+                metrics::counter!(
+                    "henyey_db_busy_write_dropped_total",
+                    "site" => "catchup_meta",
+                )
+                .increment(1);
+                return MetaStoreOutcome::DroppedBusy(err);
+            }
+            Err(err) => return MetaStoreOutcome::Failed(err),
+        }
+    }
+}
 
 impl CatchupManager {
     pub(super) fn persist_ledger_history(
@@ -175,19 +260,55 @@ impl CatchupManager {
     /// `getLedgers`) see entries for the replayed range. The streaming callback
     /// (if configured) writes the meta to the fd:3 pipe for captive core
     /// consumers like stellar-rpc and horizon.
+    ///
+    /// The SQLite write goes through [`store_meta_with_busy_retry`] (#3801): a
+    /// transient `SQLITE_BUSY`/`SQLITE_LOCKED` used to drop the row with a bare
+    /// `warn!`, and catchup never revisits a ledger, so the hole was permanent
+    /// AND silent. On exhaustion the write is still abandoned — propagating is
+    /// strictly worse here, because an error out of this function aborts the
+    /// whole batch's `persist_ledger_history` and the replay retry resumes from
+    /// the already-advanced in-memory LCL, turning a 1-row hole into a
+    /// ≤64-ledger, 3-table one without repairing the original (see #3811) —
+    /// but the drop is now *reportable*: an `error!` naming the RPC-visible
+    /// gap, the `henyey_db_busy_write_dropped_total{site="catchup_meta"}`
+    /// counter, and a `meta_rows_dropped` count surfaced on `CatchupResult`.
+    ///
+    /// The fd:3 callback fires unconditionally on every path, exactly as
+    /// before: it is deliberately decoupled from the DB outcome, since coupling
+    /// it would drop frames from the meta stream stellar-rpc/Horizon consume.
     pub(super) fn emit_meta(&self, ledger_seq: u32, meta: stellar_xdr::LedgerCloseMeta) {
         // Persist to SQLite first (to_xdr borrows &self on meta, no clone needed).
         match meta.to_xdr(stellar_xdr::Limits::none()) {
             Ok(meta_xdr) => {
-                if let Err(err) = self.db.store_ledger_close_meta(ledger_seq, &meta_xdr) {
-                    warn!(
-                        error = %err,
-                        ledger_seq,
-                        "Failed to persist LedgerCloseMeta during catchup"
-                    );
+                match store_meta_with_busy_retry(|| {
+                    self.db.store_ledger_close_meta(ledger_seq, &meta_xdr)
+                }) {
+                    MetaStoreOutcome::Stored => {}
+                    MetaStoreOutcome::DroppedBusy(err) => {
+                        self.meta_rows_dropped.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            error = %err,
+                            ledger_seq,
+                            attempts = CATCHUP_META_MAX_ATTEMPTS,
+                            "Dropped LedgerCloseMeta during catchup after exhausting \
+                             transient-busy retries — ledger_close_meta has an \
+                             RPC-visible gap at this ledger"
+                        );
+                    }
+                    MetaStoreOutcome::Failed(err) => {
+                        self.meta_rows_dropped.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            error = %err,
+                            ledger_seq,
+                            "Failed to persist LedgerCloseMeta during catchup — \
+                             ledger_close_meta has an RPC-visible gap at this ledger"
+                        );
+                    }
                 }
             }
             Err(err) => {
+                // Equally a permanent gap, so it counts toward the same total.
+                self.meta_rows_dropped.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     error = %err,
                     ledger_seq,
@@ -1137,10 +1258,6 @@ mod tests {
             1,
             "the fd:3 callback must fire exactly once"
         );
-        assert_eq!(
-            manager.meta_rows_dropped(),
-            0,
-            "no drop on the happy path"
-        );
+        assert_eq!(manager.meta_rows_dropped(), 0, "no drop on the happy path");
     }
 }
