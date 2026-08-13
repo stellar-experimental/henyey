@@ -128,11 +128,9 @@ known_peers = [
     "core-live-a.stellar.org:11625",
     "core-live-b.stellar.org:11625",
     "core-live-c.stellar.org:11625",
-    # LOBSTR
+    # LOBSTR (v3/v4 dropped: A/AAAA records removed upstream 2026-07-27)
     "v1.stellar.lobstr.co:11625",
     "v2.stellar.lobstr.co:11625",
-    "v3.stellar.lobstr.co:11625",
-    "v4.stellar.lobstr.co:11625",
     "v5.stellar.lobstr.co:11625",
     # Blockdaemon
     "stellar-full-validator1.bdnodes.net:11625",
