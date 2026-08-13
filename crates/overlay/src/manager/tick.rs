@@ -9,6 +9,7 @@ use crate::{connection::ConnectionPool, peer::PeerInfo, DialKey, PeerAddress, Pe
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -39,8 +40,25 @@ pub(super) const PEER_IP_RESOLVE_DELAY: Duration = Duration::from_secs(600);
 /// Matches stellar-core `PEER_IP_RESOLVE_RETRY_DELAY`.
 pub(super) const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Delay before retrying a failed outbound connection attempt.
-const OUTBOUND_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// Compute a jittered, escalating backoff delay for a failed outbound
+/// connect attempt, given the consecutive failure count for that peer.
+///
+/// Mirrors stellar-core's actual connect-retry backoff
+/// (`PeerManager::computeBackoff`, `PeerManager.cpp:365-410`): a random delay
+/// in `[1, 2^min(num_failures, MAX_BACKOFF_EXPONENT) * SECONDS_PER_BACKOFF]`
+/// seconds, doubling the ceiling per consecutive failure and capped at
+/// exponent 10 (~2.84h ceiling), with jitter to avoid synchronized retry
+/// bursts across many peers/nodes.
+///
+/// Replaces the old flat `OUTBOUND_CONNECT_RETRY_DELAY` (10s forever), which
+/// re-dialed dead preferred peers every ~20s indefinitely (#3770).
+fn compute_connect_backoff(num_failures: u32) -> Duration {
+    const SECONDS_PER_BACKOFF: u32 = 10;
+    const MAX_BACKOFF_EXPONENT: u32 = 10;
+    let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
+    let ceiling_secs = (1u32 << backoff_count) * SECONDS_PER_BACKOFF;
+    Duration::from_secs(rand::thread_rng().gen_range(1..=ceiling_secs) as u64)
+}
 
 /// Result of a background DNS resolution of configured peers.
 struct ResolvedPeers {
@@ -227,7 +245,10 @@ impl OverlayManager {
         };
 
         let handle = tokio::spawn(async move {
-            let mut retry_after: HashMap<DialKey, Instant> = HashMap::new();
+            // Value is (next-allowed-instant, consecutive-failure-count). The
+            // failure count persists across ticks so backoff escalates for a
+            // peer that keeps failing, and resets on the next success (#3770).
+            let mut retry_after: HashMap<DialKey, (Instant, u32)> = HashMap::new();
             // Delay the first tick by one full interval. This matches
             // stellar-core's timer semantics (timers fire AFTER the interval,
             // not at T=0) and prevents simultaneous outbound dials during
@@ -457,7 +478,7 @@ impl OverlayManager {
     #[allow(clippy::too_many_arguments)]
     async fn connect_preferred_peers(
         preferred_set: &PreferredPeerSet,
-        retry_after: &mut HashMap<DialKey, Instant>,
+        retry_after: &mut HashMap<DialKey, (Instant, u32)>,
         now: Instant,
         mut remaining: usize,
         _max_outbound: usize,
@@ -474,7 +495,7 @@ impl OverlayManager {
             }
 
             let key = addr.dial_key();
-            if let Some(next) = retry_after.get(&key) {
+            if let Some((next, _)) = retry_after.get(&key) {
                 if *next > now {
                     continue;
                 }
@@ -514,7 +535,11 @@ impl OverlayManager {
                 }
                 Err(e) => {
                     warn!("Failed to connect to preferred peer {}: {}", addr, e);
-                    retry_after.insert(key, now + OUTBOUND_CONNECT_RETRY_DELAY);
+                    let num_failures = retry_after.get(&key).map_or(0, |(_, count)| *count) + 1;
+                    retry_after.insert(
+                        key,
+                        (now + compute_connect_backoff(num_failures), num_failures),
+                    );
                 }
             }
         }
@@ -524,7 +549,7 @@ impl OverlayManager {
     /// Fill remaining outbound slots from the shuffled known-peer list.
     async fn fill_outbound_slots(
         known_peers: &RwLock<super::KnownPeerSet>,
-        retry_after: &mut HashMap<DialKey, Instant>,
+        retry_after: &mut HashMap<DialKey, (Instant, u32)>,
         now: Instant,
         mut remaining: usize,
         pool: &Arc<ConnectionPool>,
@@ -546,7 +571,7 @@ impl OverlayManager {
             }
 
             let key = addr.dial_key();
-            if let Some(next) = retry_after.get(&key) {
+            if let Some((next, _)) = retry_after.get(&key) {
                 if *next > now {
                     continue;
                 }
@@ -586,7 +611,11 @@ impl OverlayManager {
                 }
                 Err(e) => {
                     debug!("Failed to connect to peer {}: {}", addr, e);
-                    retry_after.insert(key, now + OUTBOUND_CONNECT_RETRY_DELAY);
+                    let num_failures = retry_after.get(&key).map_or(0, |(_, count)| *count) + 1;
+                    retry_after.insert(
+                        key,
+                        (now + compute_connect_backoff(num_failures), num_failures),
+                    );
                 }
             }
         }
@@ -1785,5 +1814,326 @@ mod tests {
         assert!(results[1].is_none());
         // Third entry still present at index 2
         assert_eq!(results[2].as_ref().unwrap().host, "10.0.0.2");
+    }
+
+    // ──────── #3770: escalating connect-retry backoff tests ────────
+
+    /// `compute_connect_backoff(1)` must return a jittered delay in `[1s, 20s]`
+    /// (ceiling = 2^1 * 10s = 20s).
+    #[test]
+    fn test_compute_connect_backoff_first_failure_bounded() {
+        for _ in 0..50 {
+            let backoff = compute_connect_backoff(1);
+            assert!(
+                backoff >= Duration::from_secs(1) && backoff <= Duration::from_secs(20),
+                "backoff for 1 failure should be in [1s, 20s], got {backoff:?}"
+            );
+        }
+    }
+
+    /// The backoff exponent must cap at `MAX_BACKOFF_EXPONENT` (10), so both
+    /// `compute_connect_backoff(10)` and `compute_connect_backoff(1000)` stay
+    /// within `[1s, 10240s]` (ceiling = 2^10 * 10s = 10240s).
+    #[test]
+    fn test_compute_connect_backoff_caps_at_max_exponent() {
+        for &num_failures in &[10u32, 1000u32] {
+            for _ in 0..50 {
+                let backoff = compute_connect_backoff(num_failures);
+                assert!(
+                    backoff >= Duration::from_secs(1) && backoff <= Duration::from_secs(10240),
+                    "backoff for {num_failures} failures should be in [1s, 10240s], got {backoff:?}"
+                );
+            }
+        }
+    }
+
+    /// The maximum possible ceiling (in seconds) `compute_connect_backoff`
+    /// could draw for a given failure count. Mirrors the production formula
+    /// so the test can safely advance simulated time past any possible
+    /// jittered draw, without depending on (non-seedable) RNG internals.
+    fn max_connect_backoff_secs(num_failures: u32) -> u64 {
+        const SECONDS_PER_BACKOFF: u32 = 10;
+        const MAX_BACKOFF_EXPONENT: u32 = 10;
+        let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
+        ((1u32 << backoff_count) * SECONDS_PER_BACKOFF) as u64
+    }
+
+    /// Repeated failures against the same preferred peer must accumulate a
+    /// persistent per-key failure count (1, 2, 3, ...) in `retry_after`, and a
+    /// subsequent success must reset it via `.remove(&key)`.
+    #[tokio::test]
+    async fn test_connect_preferred_peers_backoff_increments_and_resets() {
+        let preferred_addr = PeerAddress::new("127.0.0.1", 11625);
+        let mut config = OverlayConfig::default();
+        config.preferred_peers = vec![preferred_addr.clone()];
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager = OverlayManager::new_with_connection_factory(
+            config,
+            local_node.clone(),
+            Arc::new(FailingConnectionFactory),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let preferred_set =
+            PreferredPeerSet::from_config(vec![preferred_addr.clone()], HashSet::new());
+        let mut retry_after: HashMap<DialKey, (Instant, u32)> = HashMap::new();
+        let key = preferred_addr.dial_key();
+
+        let mut now = Instant::now();
+        let failing_ctx = TickConnectCtx {
+            local_node: local_node.clone(),
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: Arc::new(FailingConnectionFactory),
+        };
+
+        for expected_failures in 1..=3u32 {
+            OverlayManager::connect_preferred_peers(
+                &preferred_set,
+                &mut retry_after,
+                now,
+                1,
+                1,
+                &manager.outbound_pool,
+                &shared,
+                &failing_ctx,
+            )
+            .await;
+
+            let (_, failures) = retry_after
+                .get(&key)
+                .expect("failed preferred dial must record a retry_after entry");
+            assert_eq!(
+                *failures, expected_failures,
+                "failure count should increment monotonically on each consecutive failure"
+            );
+
+            // Advance simulated time safely past the maximum possible jittered
+            // backoff at this failure count, so the next call isn't gated by
+            // retry_after (compute_connect_backoff isn't seedable).
+            now += Duration::from_secs(max_connect_backoff_secs(expected_failures) + 1);
+        }
+
+        // Now succeed: stand up a real listener peer reachable over the
+        // loopback connection factory, and reuse the same preferred_addr/port
+        // so the gate check (already past due to the time advance above)
+        // lets the dial through.
+        let factory = Arc::new(crate::loopback::LoopbackConnectionFactory::default());
+        let mut config_b = OverlayConfig::testnet();
+        config_b.listen_port = preferred_addr.port;
+        config_b.listen_enabled = true;
+        config_b.known_peers.clear();
+        config_b.connect_timeout_secs = 1;
+        let local_b = LocalNode::new_testnet(SecretKey::generate());
+        let mut manager_b = OverlayManager::new_with_connection_factory(
+            config_b,
+            local_b,
+            Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+        manager_b.start(None).await.expect("start listener peer");
+
+        let success_ctx = TickConnectCtx {
+            local_node,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        };
+
+        OverlayManager::connect_preferred_peers(
+            &preferred_set,
+            &mut retry_after,
+            now,
+            1,
+            1,
+            &manager.outbound_pool,
+            &shared,
+            &success_ctx,
+        )
+        .await;
+
+        assert!(
+            !retry_after.contains_key(&key),
+            "a successful connect must reset (remove) the failure count"
+        );
+
+        manager_b.shutdown().await.expect("shutdown listener peer");
+    }
+
+    /// Sibling of `test_connect_preferred_peers_backoff_increments_and_resets`
+    /// for the general known-peer pass. Repeated failures against the same
+    /// known peer must accumulate a persistent per-key failure count
+    /// (1, 2, 3, ...) in `retry_after`, and a subsequent success must reset it
+    /// via `.remove(&key)`. Both `Err`/`Ok` arms of `fill_outbound_slots` were
+    /// changed identically to `connect_preferred_peers`, so this locks in the
+    /// symmetric behavior.
+    #[tokio::test]
+    async fn test_fill_outbound_slots_backoff_increments_and_resets() {
+        let known_addr = PeerAddress::new("127.0.0.1", 11626);
+        let mut config = OverlayConfig::default();
+        config.known_peers = vec![known_addr.clone()];
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager = OverlayManager::new_with_connection_factory(
+            config,
+            local_node.clone(),
+            Arc::new(FailingConnectionFactory),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let known_peers = RwLock::new(super::super::KnownPeerSet::from_config(vec![
+            known_addr.clone()
+        ]));
+        let mut retry_after: HashMap<DialKey, (Instant, u32)> = HashMap::new();
+        let key = known_addr.dial_key();
+
+        let mut now = Instant::now();
+        let failing_ctx = TickConnectCtx {
+            local_node: local_node.clone(),
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: Arc::new(FailingConnectionFactory),
+        };
+
+        for expected_failures in 1..=3u32 {
+            OverlayManager::fill_outbound_slots(
+                &known_peers,
+                &mut retry_after,
+                now,
+                1,
+                &manager.outbound_pool,
+                &shared,
+                &failing_ctx,
+            )
+            .await;
+
+            let (_, failures) = retry_after
+                .get(&key)
+                .expect("failed known-peer dial must record a retry_after entry");
+            assert_eq!(
+                *failures, expected_failures,
+                "failure count should increment monotonically on each consecutive failure"
+            );
+
+            // Advance simulated time safely past the maximum possible jittered
+            // backoff at this failure count, so the next call isn't gated by
+            // retry_after (compute_connect_backoff isn't seedable).
+            now += Duration::from_secs(max_connect_backoff_secs(expected_failures) + 1);
+        }
+
+        // Now succeed: stand up a real listener peer reachable over the
+        // loopback connection factory, reusing the same known_addr/port so the
+        // gate check (already past due to the time advance above) lets the dial
+        // through.
+        let factory = Arc::new(crate::loopback::LoopbackConnectionFactory::default());
+        let mut config_b = OverlayConfig::testnet();
+        config_b.listen_port = known_addr.port;
+        config_b.listen_enabled = true;
+        config_b.known_peers.clear();
+        config_b.connect_timeout_secs = 1;
+        let local_b = LocalNode::new_testnet(SecretKey::generate());
+        let mut manager_b = OverlayManager::new_with_connection_factory(
+            config_b,
+            local_b,
+            Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+        manager_b.start(None).await.expect("start listener peer");
+
+        let success_ctx = TickConnectCtx {
+            local_node,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        };
+
+        OverlayManager::fill_outbound_slots(
+            &known_peers,
+            &mut retry_after,
+            now,
+            1,
+            &manager.outbound_pool,
+            &shared,
+            &success_ctx,
+        )
+        .await;
+
+        assert!(
+            !retry_after.contains_key(&key),
+            "a successful connect must reset (remove) the failure count"
+        );
+
+        manager_b.shutdown().await.expect("shutdown listener peer");
+    }
+
+    /// Over a simulated 1-hour window (1200 ticks * TICK_INTERVAL=3s) against a
+    /// permanently-unreachable preferred peer, escalating backoff must
+    /// collapse the dial volume dramatically below the old flat-cadence
+    /// baseline (~300-360 dials at the old 10s constant over the same
+    /// window).
+    #[tokio::test]
+    async fn test_connect_preferred_peers_dial_volume_collapses_over_simulated_time() {
+        let preferred_addr = PeerAddress::new("10.0.0.42", 11625);
+        let mut config = OverlayConfig::default();
+        config.preferred_peers = vec![preferred_addr.clone()];
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let factory = Arc::new(RecordingConnectionFactory::default());
+        let manager = OverlayManager::new_with_connection_factory(
+            config,
+            local_node.clone(),
+            factory.clone(),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let preferred_set =
+            PreferredPeerSet::from_config(vec![preferred_addr.clone()], HashSet::new());
+        let mut retry_after: HashMap<DialKey, (Instant, u32)> = HashMap::new();
+        let ctx = TickConnectCtx {
+            local_node,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 1,
+            connection_factory: factory.clone(),
+        };
+
+        const NUM_TICKS: usize = 1200; // 1200 * 3s = 3600s = simulated 1 hour.
+        let mut now = Instant::now();
+        for _ in 0..NUM_TICKS {
+            OverlayManager::connect_preferred_peers(
+                &preferred_set,
+                &mut retry_after,
+                now,
+                1,
+                1,
+                &manager.outbound_pool,
+                &shared,
+                &ctx,
+            )
+            .await;
+            now += TICK_INTERVAL;
+        }
+
+        let dial_count = factory.dialed().len();
+        assert!(
+            dial_count < 20,
+            "escalating backoff should collapse dial volume over a simulated 1h window \
+             (flat-cadence baseline ~300-360 dials); got {dial_count} dials"
+        );
     }
 }
