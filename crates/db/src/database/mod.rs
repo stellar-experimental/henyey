@@ -217,6 +217,33 @@ impl Database {
         })
     }
 
+    /// Removes history rows left *ahead* of the durable last-closed-ledger by
+    /// an interrupted catchup (#3812), mirroring stellar-core's
+    /// `CheckpointBuilder::cleanup(lcl)`.
+    ///
+    /// Reads the durable LCL (`lastclosedledger`) and, when present, truncates
+    /// every history row strictly above it via
+    /// [`HistoryQueries::truncate_history_above_lcl`]. The read and the delete
+    /// run in a single transaction so no concurrent writer can advance the LCL
+    /// between them (no TOCTOU).
+    ///
+    /// Returns `Some(rows_deleted)` when a durable LCL was present (possibly
+    /// `Some(0)` on a healthy database with nothing ahead of the LCL), or
+    /// `Ok(None)` when no durable LCL exists yet (a fresh or legacy database
+    /// with no authoritative anchor to truncate against).
+    ///
+    /// Intended to run before any reader that anchors on `MAX(ledgerseq)` —
+    /// node startup (before live close begins) and the offline CLI readers.
+    pub fn cleanup_ahead_of_lcl(&self) -> Result<Option<u64>> {
+        self.transaction(|tx| {
+            use queries::{HistoryQueries, StateQueries};
+            match tx.get_last_closed_ledger()? {
+                Some(lcl) => Ok(Some(tx.truncate_history_above_lcl(lcl)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
     /// Returns the stored network passphrase, if set.
     ///
     /// The network passphrase identifies the Stellar network (mainnet, testnet, etc.)

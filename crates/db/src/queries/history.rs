@@ -180,6 +180,35 @@ pub trait HistoryQueries {
     /// tables (`txsets`, `txresults`) use the same count independently.
     /// Returns the total number of rows deleted across all tables.
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+
+    /// Truncates ahead-of-LCL history rows: deletes every row whose ledger
+    /// sequence is strictly greater than `lcl` from `ledgerheaders`,
+    /// `txhistory`, `txsets`, `txresults`, and `ledger_close_meta`. Returns the
+    /// total number of rows deleted across all five tables.
+    ///
+    /// Ports the truncate-above-LCL half of stellar-core's
+    /// `CheckpointBuilder::cleanup(lcl)` (`CheckpointBuilder.cpp:199-345`). A
+    /// catchup that aborts partway through a checkpoint batch can persist
+    /// history rows up to one checkpoint (~64 ledgers) *ahead* of the durable
+    /// LCL (#3811 Window 1); those rows are never authoritative for the startup
+    /// restore path but are visible to readers that anchor on `MAX(ledgerseq)`.
+    /// This sweep removes them so `MAX(ledgerseq) == lcl` afterwards.
+    ///
+    /// Because it deletes only rows strictly above the authoritative durable
+    /// LCL, it is a no-op on a healthy or cleanly-shut-down database (where
+    /// `MAX(ledgerseq) <= lcl`). `bucketlist` is intentionally excluded — it is
+    /// checkpoint-keyed and wholesale-overwritten by the next catchup, hence
+    /// self-healing.
+    ///
+    /// **Offline-only / cross-process caveat:** callers must invoke this while
+    /// no other process is advancing the ledger (node startup before live
+    /// close begins, or an offline CLI reader that opened the DB directly).
+    /// stellar-core's `enforceLCL` throw for a header file ending *below* LCL is
+    /// deliberately not ported: henyey's SQL tables are not a contiguous
+    /// checkpoint-start-anchored file (after bucket-apply only the checkpoint
+    /// header plus later closes are present), so `MAX(ledgerseq) < lcl` is not
+    /// upstream-equivalent corruption and must not abort.
+    fn truncate_history_above_lcl(&self, lcl: u32) -> Result<u64, DbError>;
 }
 
 use super::{install_query_budget, is_query_interrupted};
@@ -508,6 +537,32 @@ impl HistoryQueries for Connection {
 
         Ok(total)
     }
+
+    fn truncate_history_above_lcl(&self, lcl: u32) -> Result<u64, DbError> {
+        // (table, ledger-sequence column) for every table that catchup can
+        // populate ahead of the durable LCL. `ledger_close_meta` keys its
+        // sequence column `sequence`; the rest use `ledgerseq`. `bucketlist`
+        // is deliberately absent (checkpoint-keyed, self-healing on re-catchup).
+        const TABLES: [(&str, &str); 5] = [
+            ("ledgerheaders", "ledgerseq"),
+            ("txhistory", "ledgerseq"),
+            ("txsets", "ledgerseq"),
+            ("txresults", "ledgerseq"),
+            ("ledger_close_meta", "sequence"),
+        ];
+
+        let mut total = 0u64;
+        for (table, col) in TABLES {
+            // Table/column names are compile-time constants (no injection); the
+            // LCL is bound as a parameter.
+            let deleted = self.execute(
+                &format!("DELETE FROM {table} WHERE {col} > ?1"),
+                params![lcl],
+            )?;
+            total += deleted as u64;
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -639,18 +694,48 @@ mod tests {
         let count = |sql: &str| -> u32 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
 
         // Rows strictly above LCL are gone in every table.
-        assert_eq!(count("SELECT COUNT(*) FROM ledgerheaders WHERE ledgerseq > 100"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM txhistory WHERE ledgerseq > 100"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM txsets WHERE ledgerseq > 100"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM txresults WHERE ledgerseq > 100"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM ledger_close_meta WHERE sequence > 100"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ledgerheaders WHERE ledgerseq > 100"),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM txhistory WHERE ledgerseq > 100"),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM txsets WHERE ledgerseq > 100"),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM txresults WHERE ledgerseq > 100"),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ledger_close_meta WHERE sequence > 100"),
+            0
+        );
 
         // Strict-`>` boundary: the row at exactly seq == LCL survives everywhere.
-        assert_eq!(count("SELECT COUNT(*) FROM ledgerheaders WHERE ledgerseq = 100"), 1);
-        assert_eq!(count("SELECT COUNT(*) FROM txhistory WHERE ledgerseq = 100"), 1);
-        assert_eq!(count("SELECT COUNT(*) FROM txsets WHERE ledgerseq = 100"), 1);
-        assert_eq!(count("SELECT COUNT(*) FROM txresults WHERE ledgerseq = 100"), 1);
-        assert_eq!(count("SELECT COUNT(*) FROM ledger_close_meta WHERE sequence = 100"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ledgerheaders WHERE ledgerseq = 100"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM txhistory WHERE ledgerseq = 100"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM txsets WHERE ledgerseq = 100"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM txresults WHERE ledgerseq = 100"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ledger_close_meta WHERE sequence = 100"),
+            1
+        );
 
         // Rows at or below LCL remain untouched.
         assert_eq!(count("SELECT COUNT(*) FROM ledgerheaders"), 100);

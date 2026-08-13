@@ -1436,6 +1436,20 @@ impl App {
         // Ensure network passphrase matches stored state.
         Self::ensure_network_passphrase(&db, &config.network.passphrase)?;
 
+        // #3812: truncate any ahead-of-LCL history rows left by an interrupted
+        // catchup (ports stellar-core CheckpointBuilder::cleanup(lcl)). Must run
+        // before verify_on_disk_integrity and before any live reader so the whole
+        // startup path observes MAX(ledgerseq) == durable LCL. No-op on a healthy
+        // or cleanly-shut-down database.
+        if let Some(deleted) = db.cleanup_ahead_of_lcl()? {
+            if deleted > 0 {
+                tracing::warn!(
+                    rows_deleted = deleted,
+                    "Truncated ahead-of-LCL history rows left by an interrupted catchup (#3812)"
+                );
+            }
+        }
+
         // Verify on-disk ledger headers before loading state.
         Self::verify_on_disk_integrity(&db)?;
 
