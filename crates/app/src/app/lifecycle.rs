@@ -535,6 +535,18 @@ impl App {
         // `dispatch_peer_maintenance`, which keeps rounds strictly serial (skip a
         // tick if a prior round is still running) and is aborted on shutdown.
         let mut peer_maintenance_task: Option<tokio::task::JoinHandle<()>> = None;
+        // Loop-local in-flight handle for offloaded known-peers refresh
+        // (phase=29, #3756 — recurrence of #3582/#3689 through the sibling
+        // `peer_refresh_interval` arm the #3689 fix did not cover).
+        // `refresh_known_peers` awaits `tokio::net::lookup_host` DNS resolution
+        // plus `db_blocking("refresh-known-peers")`; under contention (e.g. the
+        // periodic tx-set GC holding a SQLite write lock) the latter retries up
+        // to busy_timeout, and running it inline inside the `select!` arm froze
+        // the loop for 13-29s once per minute. It is offloaded via
+        // `tick_peer_refresh` / `dispatch_peer_maintenance`, which keeps rounds
+        // strictly serial (skip a tick if a prior round is still running) and
+        // is aborted on shutdown.
+        let mut peer_refresh_task: Option<tokio::task::JoinHandle<()>> = None;
 
         // In-flight guard for the offloaded batched tx-advert flush (maxtps
         // iter 6). Same coalesced serial pattern as peer maintenance above:
@@ -1393,12 +1405,24 @@ impl App {
                     }
                 }
 
-                // Refresh known peers from config + SQLite cache
+                // Refresh known peers from config + SQLite cache. Offloaded off
+                // the event loop (#3756, recurrence of #3582/#3689): this arm
+                // used to await `refresh_known_peers` inline, which awaits DNS
+                // resolution plus `db_blocking("refresh-known-peers")` — a
+                // production node observed the loop parked 13-29s once per
+                // minute (28% duty-cycle loss) while that call contended with
+                // the periodic tx-set GC's SQLite write lock. The growing
+                // contention duration itself traces to the deployed binary
+                // missing already-merged #3722 (a storestate slot-state trim);
+                // that is a pending-deploy issue outside this fix's control.
+                // This offload is the independent mitigation layer: it caps
+                // the loop's time in phase=29 to a `tokio::spawn` dispatch
+                // (sub-millisecond) regardless of how long the contended work
+                // takes, mirroring `dispatch_peer_maintenance`'s use for
+                // phase=28 (#3689).
                 _ = peer_refresh_interval.tick() => {
                     self.set_phase(29); // 29 = peer_refresh
-                    if let Some(overlay) = self.overlay().await {
-                        let _ = self.refresh_known_peers(&overlay).await;
-                    }
+                    self.tick_peer_refresh(&mut peer_refresh_task).await;
                 }
 
                 // Herder cleanup - evict expired data
@@ -1444,6 +1468,13 @@ impl App {
                     // and best-effort reconnects, so an abort mid-flight is
                     // harmless — a skipped round simply re-runs on next startup.
                     if let Some(h) = peer_maintenance_task.take() {
+                        h.abort();
+                    }
+                    // Abort any in-flight known-peers refresh (#3756). Its only
+                    // side effects are idempotent upserts (`store_peer`/
+                    // `load_peer`), so an abort mid-flight is harmless — a
+                    // skipped refresh simply re-runs on the next 60s tick.
+                    if let Some(h) = peer_refresh_task.take() {
                         h.abort();
                     }
                     // Abort any in-flight advert flush (maxtps iter 6) — the
@@ -1662,6 +1693,33 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Dispatches the periodic known-peers refresh off the event-loop thread,
+    /// mirroring dispatch_peer_maintenance's use for phase 28 (#3689).
+    ///
+    /// Fixes #3756: `refresh_known_peers` awaits `tokio::net::lookup_host` DNS
+    /// resolution plus `db_blocking("refresh-known-peers")`, which retries
+    /// under SQLite write-lock contention. Running it inline in the
+    /// `peer_refresh_interval.tick()` `select!` arm parked the whole event
+    /// loop for 13-29s once per minute on a production validator, starving
+    /// SCP and other timers (recurrence of #3582 through the sibling code path
+    /// the #3689 fix did not cover). `task_slot` is the loop-local in-flight
+    /// handle: `dispatch_peer_maintenance` keeps rounds strictly serial (skip
+    /// this tick if a prior round is still running) and the caller aborts the
+    /// handle on shutdown.
+    async fn tick_peer_refresh(&self, task_slot: &mut Option<tokio::task::JoinHandle<()>>) {
+        let app = self.self_arc.read().await.upgrade();
+        if let Some(app) = app {
+            dispatch_peer_maintenance(
+                async move {
+                    if let Some(overlay) = app.overlay().await {
+                        let _ = app.refresh_known_peers(&overlay).await;
+                    }
+                },
+                task_slot,
+            );
+        }
     }
 
     /// Reset state after a rapid close cycle ends (no more closes or persists pending).
@@ -4797,6 +4855,168 @@ mod tx_set_gc_offload_tests {
         );
 
         // Release the lock so the detached maintenance task can complete, then
+        // reap the handle to avoid leaking the task into other tests.
+        drop(holder);
+        if let Some(h) = slot.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(35), h).await;
+        }
+    }
+
+    // --- #3756: App::tick_peer_refresh (phase=29 offload) ----------------------
+    //
+    // Before #3756 the phase=29 arm did
+    // `self.refresh_known_peers(&overlay).await` inline on the event-loop
+    // thread. `refresh_known_peers` awaits DNS resolution
+    // (`tokio::net::lookup_host`) plus `db_blocking("refresh-known-peers")`;
+    // under SQLite write-lock contention (e.g. from the periodic tx-set GC
+    // purge) the latter retries for tens of seconds. A production validator
+    // observed the whole event loop parked 13-29s once per minute (28%
+    // duty-cycle loss) — a recurrence of #3582 through the sibling code path
+    // the #3689 fix did not cover. The fix extracts `tick_peer_refresh`, which
+    // dispatches the refresh via the existing `dispatch_peer_maintenance`
+    // coalesced-offload helper (mirroring phase=28).
+    //
+    // Both tests below call `App::tick_peer_refresh` directly, which does not
+    // exist on `origin/main` prior to this fix — they fail to *compile* there
+    // (a genuine pre-fix failure, not merely a runtime one).
+
+    /// The dispatch must return promptly (loop not blocked); the refresh work
+    /// is handed to a detached task rather than run inline.
+    ///
+    /// Fails to compile on `origin/main`: `tick_peer_refresh` does not exist
+    /// there (the arm awaits `refresh_known_peers` inline instead).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_peer_refresh_runs_off_event_loop_thread() {
+        use crate::App;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("peer-refresh-thread.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .build();
+        // Hermetic: no overlay peers / no network. `start_overlay()` is never
+        // called, so `overlay().await` is `None` and the dispatched work is a
+        // fast no-op — this test only exercises the dispatch contract itself
+        // (prompt return, detached handle); the contention test below covers
+        // `refresh_known_peers`'s DB path under lock pressure.
+        config.is_compat_config = true;
+        config.overlay.known_peers = vec![];
+        config.overlay.target_outbound_peers = 0;
+        config.overlay.max_outbound_peers = 0;
+        let app = Arc::new(App::new(config).await.expect("build App"));
+        app.set_self_arc().await;
+
+        let mut slot: Option<JoinHandle<()>> = None;
+
+        let start = Instant::now();
+        app.tick_peer_refresh(&mut slot).await;
+        let elapsed = start.elapsed();
+
+        // (1) The call returned promptly — the event loop was not blocked.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "tick_peer_refresh blocked the caller for {:?} (expected <100ms); \
+             the refresh was not offloaded off the event-loop thread",
+            elapsed
+        );
+
+        // (2) The work was handed to a detached task, not executed inline:
+        // the in-flight slot is populated immediately after the call returns,
+        // and the handle can be awaited independently to completion.
+        let handle = slot
+            .take()
+            .expect("tick_peer_refresh should have stored a handle");
+        handle
+            .await
+            .expect("spawned peer-refresh task should complete");
+    }
+
+    /// Regression for #3756: a contended SQLite write lock must NOT stall the
+    /// dispatch (and therefore the event loop). We hold a long-lived
+    /// `BEGIN IMMEDIATE` write transaction on the app's DB from a SECOND
+    /// rusqlite connection, then drive the REAL phase=29 path
+    /// (`app.tick_peer_refresh`) and assert the call returns well under a 2s
+    /// watchdog — a regressed inline-await build would stall for as long as
+    /// the lock is held (tens of seconds against `busy_timeout`, matching the
+    /// 13-29s production observation) and trip the watchdog instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_contended_peer_refresh_does_not_stall_loop() {
+        use crate::App;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("peer-refresh-contention.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .build();
+        // Hermetic: no seed peers / no listening, so `start_overlay()` makes
+        // no real network connections; `refresh_known_peers` still runs its
+        // full DB path (the part that contends with the held write lock).
+        config.is_compat_config = true;
+        config.overlay.known_peers = vec![];
+        config.overlay.target_outbound_peers = 0;
+        config.overlay.max_outbound_peers = 0;
+        let app = Arc::new(App::new(config).await.expect("build App"));
+        app.set_self_arc().await;
+        app.start_overlay().await.expect("start_overlay");
+
+        // Resolve the actual on-disk DB file the app opened. App::new may
+        // append a fixed filename or normalize the path; glob the temp dir
+        // for the .db.
+        let app_db_file = {
+            let mut found = db_path.clone();
+            if !found.exists() {
+                for entry in std::fs::read_dir(dir.path()).expect("read temp dir") {
+                    let p = entry.expect("dir entry").path();
+                    if p.extension().map(|e| e == "db").unwrap_or(false) {
+                        found = p;
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        // Second connection holds a write lock for the duration via BEGIN
+        // IMMEDIATE (acquires the RESERVED lock immediately). A short
+        // busy_timeout here just avoids the holder itself blocking on open.
+        let holder = rusqlite::Connection::open(&app_db_file).expect("open holder conn");
+        holder
+            .busy_timeout(Duration::from_millis(100))
+            .expect("set holder busy_timeout");
+        holder
+            .execute_batch(
+                "BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS _lk(x); INSERT INTO _lk VALUES (1);",
+            )
+            .expect("acquire write lock via BEGIN IMMEDIATE");
+
+        // Drive the real phase=29 dispatch: tick_peer_refresh spawns
+        // refresh_known_peers via the offload helper; assert the DISPATCH
+        // returns promptly even though the write lock is held (the detached
+        // task absorbs the busy_timeout retry).
+        let mut slot: Option<JoinHandle<()>> = None;
+
+        let dispatch_fut = async {
+            let start = Instant::now();
+            app.tick_peer_refresh(&mut slot).await;
+            start.elapsed()
+        };
+
+        let dispatch_elapsed = tokio::time::timeout(Duration::from_secs(2), dispatch_fut)
+            .await
+            .expect(
+                "tick_peer_refresh did not return within the 2s watchdog — the \
+                 contended write lock stalled the caller (event loop); phase=29 was \
+                 not offloaded (regression of #3756/#3582)",
+            );
+
+        assert!(
+            dispatch_elapsed < Duration::from_millis(500),
+            "tick_peer_refresh blocked the caller for {:?} (expected <500ms) while \
+             the DB write lock was contended; the busy_timeout retry was not offloaded",
+            dispatch_elapsed
+        );
+
+        // Release the lock so the detached refresh task can complete, then
         // reap the handle to avoid leaking the task into other tests.
         drop(holder);
         if let Some(h) = slot.take() {
