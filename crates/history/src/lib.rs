@@ -1004,4 +1004,32 @@ mod archive_manager_tests {
             "recovered HAS must have one entry per live bucket level"
         );
     }
+
+    /// #3801: a dropped `ledger_close_meta` row is an RPC-visible gap, so the
+    /// catchup summary must name it when non-zero — and stay quiet when zero.
+    #[test]
+    fn test_catchup_result_display_reports_dropped_meta() {
+        let base = CatchupResult {
+            ledger_seq: 100,
+            ledger_hash: henyey_common::Hash256::ZERO,
+            ledgers_applied: 5,
+            buckets_downloaded: 3,
+            meta_rows_dropped: 0,
+        };
+        let clean = base.to_string();
+        assert!(
+            !clean.contains("meta"),
+            "a clean catchup must not mention dropped meta: {clean}"
+        );
+
+        let lossy = CatchupResult {
+            meta_rows_dropped: 2,
+            ..base
+        }
+        .to_string();
+        assert!(
+            lossy.contains('2') && lossy.contains("meta"),
+            "a lossy catchup must report the dropped meta count: {lossy}"
+        );
+    }
 }

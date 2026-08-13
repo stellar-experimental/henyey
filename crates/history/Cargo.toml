@@ -63,6 +63,10 @@ test-utils = ["dep:axum"]
 [dev-dependencies]
 tempfile.workspace = true
 axum.workspace = true
+# Local (thread-local) Prometheus recorder for asserting counter emission in
+# unit tests — see `metrics::with_local_recorder`. Test-only: the crate itself
+# emits fire-and-forget through the global `metrics` facade.
+metrics-exporter-prometheus.workspace = true
 # Shared deterministic tracing-capture test helper (replaces the deleted local
 # `tracing_test_support` module). See #3559.
 henyey-common = { workspace = true, features = ["test-support"] }

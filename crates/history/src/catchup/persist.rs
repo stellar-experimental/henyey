@@ -947,4 +947,200 @@ mod tests {
         verify_tx_set(&header, &tx_set_v0)
             .expect_err("v0 tx set should fail verification against v23 header");
     }
+
+    // --- #3801: transient-busy retry around the catchup meta write ---
+
+    /// Build a `DbError::Sqlite(SqliteFailure(ffi::Error { code, .. }, msg))`,
+    /// mirroring how rusqlite materializes a SQLite error on a contended write.
+    fn db_sqlite_error(code: rusqlite::ffi::ErrorCode, msg: &str) -> henyey_db::DbError {
+        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            Some(msg.to_string()),
+        ))
+    }
+
+    fn busy_error() -> henyey_db::DbError {
+        db_sqlite_error(rusqlite::ffi::ErrorCode::DatabaseBusy, "database is locked")
+    }
+
+    /// A transient busy on the first attempt must be retried, not dropped.
+    #[test]
+    fn test_store_meta_with_busy_retry_retries_transient_busy_then_stores() {
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = store_meta_with_busy_retry(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(busy_error())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(calls.get(), 2, "the store must be re-issued after a busy");
+        assert!(
+            matches!(outcome, MetaStoreOutcome::Stored),
+            "the retried write succeeded, so the outcome must be Stored"
+        );
+    }
+
+    /// A persistently busy DB must stop at the retry bound (no spin), report
+    /// `DroppedBusy`, and emit exactly the #3802 telemetry: one drop and
+    /// `MAX_ATTEMPTS - 1` retried attempts.
+    #[test]
+    fn test_store_meta_with_busy_retry_gives_up_after_max_attempts_and_counts_drop() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = metrics::with_local_recorder(&recorder, || {
+            store_meta_with_busy_retry(|| {
+                calls.set(calls.get() + 1);
+                Err(busy_error())
+            })
+        });
+
+        assert_eq!(
+            calls.get(),
+            CATCHUP_META_MAX_ATTEMPTS,
+            "the retry must be bounded at CATCHUP_META_MAX_ATTEMPTS"
+        );
+        assert!(
+            matches!(outcome, MetaStoreOutcome::DroppedBusy(_)),
+            "exhausting the budget on a busy error must report DroppedBusy"
+        );
+
+        let output = handle.render();
+        assert!(
+            output.contains("henyey_db_busy_write_dropped_total{site=\"catchup_meta\"} 1"),
+            "the abandoned write must increment the drop series.\nOutput:\n{output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "henyey_db_busy_retry_attempts_total{{site=\"catchup_meta\"}} {}",
+                CATCHUP_META_MAX_ATTEMPTS - 1
+            )),
+            "one retry-attempt increment per retried attempt.\nOutput:\n{output}"
+        );
+    }
+
+    /// Contract point 4 of #3802: non-transient errors are neither retried nor
+    /// counted against the busy-loss series.
+    #[test]
+    fn test_store_meta_with_busy_retry_does_not_retry_non_transient() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = metrics::with_local_recorder(&recorder, || {
+            store_meta_with_busy_retry(|| {
+                calls.set(calls.get() + 1);
+                Err(henyey_db::DbError::Integrity("corrupt row".to_string()))
+            })
+        });
+
+        assert_eq!(calls.get(), 1, "a non-transient error must not be retried");
+        assert!(
+            matches!(outcome, MetaStoreOutcome::Failed(_)),
+            "a non-transient error must report Failed"
+        );
+
+        let output = handle.render();
+        assert!(
+            !output.contains("henyey_db_busy_write_dropped_total"),
+            "non-transient losses must not inflate the busy-drop series.\nOutput:\n{output}"
+        );
+        assert!(
+            !output.contains("henyey_db_busy_retry_attempts_total"),
+            "non-transient losses must not inflate the retry series.\nOutput:\n{output}"
+        );
+    }
+
+    /// End-to-end wiring: `emit_meta` must route its store through the retry
+    /// helper, count the loss, and still stream the frame to the fd:3 callback.
+    /// Uses a REAL DB fault (the table is dropped) rather than the closure seam,
+    /// so a correct-but-uncalled helper cannot pass the suite.
+    #[test]
+    fn test_emit_meta_routes_store_through_retry_helper() {
+        let (_tmp_dir, mut manager) = make_test_catchup_manager();
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fired_cb = fired.clone();
+        manager.set_meta_callback(Box::new(move |_meta| {
+            fired_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+
+        // Deterministic, non-transient DB fault on the meta write path.
+        manager
+            .db
+            .with_connection(|conn| {
+                conn.execute("DROP TABLE ledger_close_meta", [])?;
+                Ok(())
+            })
+            .expect("drop ledger_close_meta");
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let header = make_header(42);
+        let meta = crate::catchup::build_bucket_apply_meta(&header, Hash256::ZERO, false);
+        metrics::with_local_recorder(&recorder, || manager.emit_meta(42, meta));
+
+        assert_eq!(
+            manager.meta_rows_dropped(),
+            1,
+            "the lost meta row must be reported to the caller"
+        );
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the fd:3 callback must stay unconditional on every path"
+        );
+        let output = handle.render();
+        assert!(
+            !output.contains("henyey_db_busy_write_dropped_total"),
+            "a non-transient DB fault must not be counted as a busy drop.\nOutput:\n{output}"
+        );
+    }
+
+    /// Happy path: the refactor must still persist the row AND stream the frame.
+    #[test]
+    fn test_emit_meta_persists_row_and_invokes_callback() {
+        let (_tmp_dir, mut manager) = make_test_catchup_manager();
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fired_cb = fired.clone();
+        manager.set_meta_callback(Box::new(move |_meta| {
+            fired_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+
+        let header = make_header(7);
+        let meta = crate::catchup::build_bucket_apply_meta(&header, Hash256::ZERO, false);
+        let expected = meta.to_xdr(stellar_xdr::Limits::none()).expect("serialize");
+        manager.emit_meta(7, meta);
+
+        let stored = manager
+            .db
+            .with_connection(|conn| {
+                use henyey_db::queries::LedgerCloseMetaQueries;
+                conn.load_ledger_close_meta(7)
+            })
+            .expect("load meta");
+        assert_eq!(
+            stored,
+            Some(expected),
+            "the happy path must still write the ledger_close_meta row"
+        );
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the fd:3 callback must fire exactly once"
+        );
+        assert_eq!(
+            manager.meta_rows_dropped(),
+            0,
+            "no drop on the happy path"
+        );
+    }
 }

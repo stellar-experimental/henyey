@@ -2567,10 +2567,10 @@ mod tests {
         }
     }
 
-    /// #3802: pin the exact `site` vocabulary. #3801 (`catchup_meta`) and
-    /// #3806 (`tx_set_gc`) each add their value in the SAME PR that wires the
-    /// emitter, so this test failing is the intended, reviewed signal — not
-    /// drift. It also pins the label contract #3801's plan was written against.
+    /// #3802: pin the exact `site` vocabulary. #3806 (`tx_set_gc`) adds its
+    /// value in the SAME PR that wires the emitter, so this test failing is the
+    /// intended, reviewed signal — not drift. `catchup_meta` landed with its
+    /// emitter in #3801 (`crates/history/src/catchup/persist.rs`).
     #[test]
     fn test_db_busy_site_label_vocabulary_pinned() {
         assert_eq!(
@@ -2583,16 +2583,13 @@ mod tests {
                 "publish_queue_evict",
                 "peer_failure_prune",
                 "peer_record_update",
+                "catchup_meta",
             ],
             "the db-busy site vocabulary changed; update the catalog entries \
              and confirm the change is deliberate"
         );
 
         // Reserved values must NOT be present until their emitter lands.
-        assert!(
-            !DB_BUSY_SITES.contains(&"catchup_meta"),
-            "catchup_meta is reserved for #3801 and must land with its emitter"
-        );
         assert!(
             !DB_BUSY_SITES.contains(&"tx_set_gc"),
             "tx_set_gc is reserved for #3806 and must land with its emitter"
