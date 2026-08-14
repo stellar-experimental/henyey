@@ -530,7 +530,25 @@ jobs:
           # the soft flag when these are empty. Only the testnet shard sets them.
           SHARD_PROBE_TIMEOUT: ${{ matrix.probe_timeout }}
           SHARD_SOFT_ON_TIMEOUT: ${{ matrix.soft_on_timeout }}
+          # Budget-aware probe scheduling (#3768). The wrapper cannot observe a
+          # GitHub STEP-level timeout kill — the runner just kills the step and
+          # marks it RED, so the #3272 soft-skip never gets to classify the
+          # outcome. Mirror this step's OWN `timeout-minutes` into the env so the
+          # wrapper can compute how much step budget is left and refuse to start
+          # an attempt that provably cannot finish. This MUST stay the identical
+          # expression to the `timeout-minutes:` key above — asserted by
+          # scripts/test-quickstart-harness.sh so the two can never drift.
+          STEP_TIMEOUT_MINUTES: ${{ matrix.step_timeout_minutes || 360 }}
         run: |
+          # Step start epoch (#3768) — captured as the FIRST statement of the
+          # step body so `STEP_START_EPOCH + STEP_BUDGET_SECONDS` is the instant
+          # GitHub's step-level timeout-minutes cap will fire. Exported (with the
+          # budget) so run-quickstart-test.sh sees them.
+          STEP_START_EPOCH="$(date -u +%s)"
+          STEP_BUDGET_SECONDS=$(( STEP_TIMEOUT_MINUTES * 60 ))
+          export STEP_START_EPOCH STEP_BUDGET_SECONDS
+          echo "Step budget: ${STEP_BUDGET_SECONDS}s from epoch ${STEP_START_EPOCH} (#3768)"
+
           # Per-probe budget = github.run_attempt * timeout_multiplier minutes,
           # converted to seconds for GNU `timeout` (* 60). Mirrors upstream
           # internal-test.yml's `minutes = github.run_attempt * timeout_multiplier`
@@ -561,26 +579,37 @@ jobs:
           fi
           DIAG_DIR="/tmp/quickstart-diagnostics"
 
-          # ---- DIAGNOSTIC hang watchdog (#3286), testnet shard only ----
+          # ---- DIAGNOSTIC hang watchdog (#3286/#3768), testnet shard only ----
           # Capture the step shell's PID HERE, in the step body — NOT inside a
           # subshell and NOT via $BASHPID — so the backgrounded watchdog can
-          # dump the fds THIS shell holds. The watchdog sleeps WATCHDOG_DELAY
-          # (default 1200s = 20 min, < the 25-min step_timeout_minutes bound)
-          # then writes a process-tree + open-fd snapshot to the diagnostics
-          # dir, so on the next hang the dump is on disk BEFORE the step kill
-          # and gets swept into the uploaded artifact. It is reaped on the
-          # healthy path (trap EXIT + explicit kill after the loop) so it never
-          # lingers or emits a spurious dump on a passing run. This does NOT fix
+          # dump the fds THIS shell holds.
+          #
+          # PERIODIC, not one-shot (#3768). The original arming was
+          # `( sleep "${WATCHDOG_DELAY:-1200}"; watchdog ) &` — a SINGLE sample
+          # at a fixed wall-clock offset. On run 31745517379 that sample landed
+          # at 23:11:08, one second AFTER the 813-second silent window closed, so
+          # it captured a freshly-spawned HEALTHY probe (every PID `START 23:11`,
+          # `TIME 00:00:00`) and settled nothing. A one-shot sample cannot
+          # characterise an INTERVAL hang. The sleep loop now lives INSIDE
+          # scripts/ci/quickstart-hang-watchdog.sh, which takes a BOUNDED series
+          # of samples (first at WATCHDOG_DELAY, then every WATCHDOG_INTERVAL, at
+          # most WATCHDOG_MAX_SAMPLES) into dump-NN-<ts>.txt, so several land
+          # INSIDE any multi-minute wedge. Defaults here cover 300 + 23*60 =
+          # 1680s > the 25-min step cap; ~24 x 30 KB ~= 720 KB of artifact.
+          # The script also self-reaps when $STEP_PID exits, so it can never
+          # become the lingering fd-holder it exists to hunt. This does NOT fix
           # the hang — its deliverable is DATA from the next hang.
           STEP_PID=$$
           WATCHDOG_PID=""
           if [[ "$NETWORK" == "testnet" ]]; then
-            ( sleep "${WATCHDOG_DELAY:-1200}"; \
+            WATCHDOG_DELAY="${WATCHDOG_DELAY:-300}" \
+            WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-60}" \
+            WATCHDOG_MAX_SAMPLES="${WATCHDOG_MAX_SAMPLES:-24}" \
               bash scripts/ci/quickstart-hang-watchdog.sh \
-                "$DIAG_DIR/testnet-hang-watchdog" "$STEP_PID" ) &
+                "$DIAG_DIR/testnet-hang-watchdog" "$STEP_PID" &
             WATCHDOG_PID=$!
             # Reap the watchdog on any step exit so a passing run never leaks
-            # the backgrounded sleep.
+            # the backgrounded sampler.
             trap '[[ -n "$WATCHDOG_PID" ]] && kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
           fi
 

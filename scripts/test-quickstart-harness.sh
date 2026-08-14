@@ -30,6 +30,9 @@ CONTRACT="$REPO_ROOT/scripts/ci/upstream-quickstart-contract.yml"
 TEST_COUNT=0
 PASS_COUNT=0
 FAIL_COUNT=0
+# Recorded by tap_plan so the end-of-run self-check can report a plan/emitted
+# mismatch explicitly instead of leaving a silently wrong `1..N` header.
+TAP_PLANNED=0
 
 tap_ok() {
     TEST_COUNT=$((TEST_COUNT + 1))
@@ -47,6 +50,7 @@ tap_not_ok() {
 }
 
 tap_plan() {
+    TAP_PLANNED="$1"
     echo "1..$1"
 }
 
@@ -1699,6 +1703,22 @@ test_testnet_hang_watchdog_emits_process_dump_before_step_kill() {
     local marker="qs-hang-wd-test28-$$-${RANDOM}"
     local hang_sentinel="$TMPDIR_BASE/$marker.hung"
 
+    # The hung "probe" is a SCRIPT whose PATH carries the unique marker, so
+    # `pkill -f "$marker"` matches exactly this process and nothing else.
+    #
+    # It used to be `exec sleep 30 "$marker"` — which does NOT hang: GNU sleep
+    # rejects the non-numeric extra operand ("invalid time interval") and exits
+    # ~immediately, so the simulated step shell was already dead when the
+    # watchdog fired. That passed only because the watchdog was fire-and-forget.
+    # The watchdog now polls step liveness (#3768) so it can never outlive its
+    # step, which makes a genuinely-hung step mandatory for this scenario.
+    local hung_probe="$TMPDIR_BASE/$marker.probe.sh"
+    cat > "$hung_probe" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+    chmod +x "$hung_probe"
+
     # Reap any leftovers from this test on function return, scoped to the
     # unique marker (so it never kills unrelated processes).
     # shellcheck disable=SC2064
@@ -1716,10 +1736,10 @@ STEP_PID=\$\$
 # Watchdog fires at ~1s — well before the outer 3s simulated step kill.
 WATCHDOG_DELAY=1 bash "$watchdog" "$out_dir" "\$STEP_PID" &
 WATCHDOG_PID=\$!
-# Hung 'probe' that outlives the outer timeout; tagged with the unique marker
-# in its argv so cleanup's pkill -f matches only this process.
+# Hung 'probe' that outlives the outer timeout; \`exec\` keeps STEP_PID alive as
+# the hung process, so the watchdog's step-liveness poll still sees a live step.
 touch "$hang_sentinel"
-exec sleep 30 "$marker"
+exec "$hung_probe"
 EOF
     chmod +x "$step_body"
 
@@ -2017,7 +2037,23 @@ test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow() {
 # ============================================================
 test_pubnet_block_extraction_byte_identical_to_original_shape() {
     local reference helper_out
-    reference=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
+    # `set +o pipefail` inside the (subshell) command substitution: the REFERENCE
+    # is the original two-awk shape, which is exactly the SIGPIPE-racy pipeline
+    # #3835 fixed in the helper — the reference half was left racy. The reader
+    # awk exits at `steps:` (very early in the pubnet block) and the producer awk
+    # keeps writing the rest of the file; whether the producer's later write()
+    # lands before the reader's fd closes is pure scheduling. When it loses, the
+    # producer dies with SIGPIPE, pipefail surfaces 141 and `set -e` aborts the
+    # whole harness mid-plan. Reproduced 1-in-8 locally after the #3768 workflow
+    # additions grew the post-`steps:` remainder 7953 -> 9952 bytes (0-in-8 on
+    # the smaller pre-#3768 workflow) — i.e. a latent flake this change would
+    # otherwise have made routine.
+    #
+    # Turning pipefail off changes the STATUS only, never the OUTPUT: any bytes
+    # the producer fails to write are bytes the reader had already stopped
+    # consuming, so `reference` is byte-identical either way and the test keeps
+    # comparing against the original shape.
+    reference=$(set +o pipefail; awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
         | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#')
     helper_out=$(extract_pubnet_matrix_block "$WORKFLOW")
     if [[ "$helper_out" == "$reference" ]]; then
@@ -2028,8 +2064,533 @@ test_pubnet_block_extraction_byte_identical_to_original_shape() {
     fi
 }
 
+# ============================================================
+# Test 32: test_watchdog_samples_periodically_and_respects_cap
+#
+# Regression for #3768 (defect 3). The #3286 watchdog armed a SINGLE dump at a
+# fixed T+1200s offset. On run 31745517379 that one sample landed at 23:11:08 —
+# one second AFTER the 813-second silent window closed — so it captured a
+# freshly-spawned HEALTHY probe (every PID `START 23:11`, `TIME 00:00:00`) and
+# proved nothing about a survivor. A one-shot wall-clock sample cannot
+# characterise an INTERVAL hang.
+#
+# The watchdog must now sample PERIODICALLY (a time series of distinct files, so
+# several samples land inside a multi-minute wedge) and BOUNDEDLY (a hard cap so
+# a pathological run cannot fill the runner disk or the uploaded artifact), and
+# must SAY SO when the cap is hit rather than going silently quiet.
+#
+# FAILS on origin/main: the script takes exactly one dump and exits, so only
+# `dump.txt` ever exists and there is no `dump-NN-*.txt` series at all.
+# ============================================================
+test_watchdog_samples_periodically_and_respects_cap() {
+    local watchdog="$REPO_ROOT/scripts/ci/quickstart-hang-watchdog.sh"
+    if [[ ! -f "$watchdog" ]]; then
+        tap_not_ok "watchdog_takes_multiple_samples" "watchdog script missing"
+        tap_not_ok "watchdog_respects_sample_cap" "watchdog script missing"
+        tap_not_ok "watchdog_logs_when_cap_reached" "watchdog script missing"
+        tap_not_ok "watchdog_keeps_dump_txt_for_back_compat" "watchdog script missing"
+        return
+    fi
+
+    local out_dir="$TMPDIR_BASE/diag-test32/testnet-hang-watchdog"
+    # Unique sentinel so cleanup never kills unrelated processes on a shared
+    # CI runner. The fake "step" carries it in its argv (via its script path).
+    local marker="qs-wd-periodic-$$-${RANDOM}"
+    local fake_step="$TMPDIR_BASE/$marker.sh"
+    cat > "$fake_step" <<'EOF'
+#!/usr/bin/env bash
+sleep 120
+EOF
+    chmod +x "$fake_step"
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    # Long-lived fake step shell: the watchdog polls it with `kill -0` and keeps
+    # sampling while it lives, so the run terminates on the CAP, not on the step
+    # exiting — which is exactly what this test is measuring.
+    "$fake_step" &
+    local step_pid=$!
+
+    # Foreground run with a tight cap so the assertion is deterministic:
+    # first sample at 1s, then every 1s, cap 3. The outer `timeout 30` is a
+    # safety net only — if it ever fires (rc 124) the cap did not bound the loop.
+    local log="$TMPDIR_BASE/watchdog-test32.log"
+    local rc=0
+    WATCHDOG_DELAY=1 WATCHDOG_INTERVAL=1 WATCHDOG_MAX_SAMPLES=3 WATCHDOG_POLL=1 \
+        timeout 30 bash "$watchdog" "$out_dir" "$step_pid" > "$log" 2>&1 || rc=$?
+
+    kill "$step_pid" 2>/dev/null || true
+
+    # Count the per-sample dump files (the time series). `dump.txt` is the
+    # back-compat alias and is deliberately excluded from this count.
+    local samples
+    samples=$(find "$out_dir" -maxdepth 1 -name 'dump-*.txt' 2>/dev/null | wc -l | tr -d ' ')
+
+    # (a) MORE THAN ONE sample — the whole point: a periodic time series, not a
+    #     single fixed-delay snapshot that can miss the hang interval entirely.
+    if [[ "$samples" -gt 1 ]]; then
+        tap_ok "watchdog_takes_multiple_samples"
+    else
+        tap_not_ok "watchdog_takes_multiple_samples" \
+            "found $samples dump-*.txt file(s) (rc=$rc) — expected a periodic series (>1)"
+    fi
+
+    # (b) BOUNDED: exactly the cap, never more, and the loop returned on its own
+    #     (rc 0, not the outer safety-net 124).
+    if [[ "$samples" -eq 3 && "$rc" -eq 0 ]]; then
+        tap_ok "watchdog_respects_sample_cap"
+    else
+        tap_not_ok "watchdog_respects_sample_cap" \
+            "samples=$samples rc=$rc (expected exactly 3 samples and rc 0 — cap must bound the loop)"
+    fi
+
+    # (c) The cap must be ANNOUNCED, not silent, so a reader of the artifact can
+    #     tell a truncated series from a hang that ended.
+    if grep -qi 'cap reached' "$log" && grep -qi 'cap reached' "$out_dir/index.txt" 2>/dev/null; then
+        tap_ok "watchdog_logs_when_cap_reached"
+    else
+        tap_not_ok "watchdog_logs_when_cap_reached" \
+            "no cap-reached announcement on stderr and in index.txt"
+    fi
+
+    # (d) Back-compat: the original single-dump filename still exists (and holds
+    #     a real process table), so any existing consumer keeps working.
+    if [[ -s "$out_dir/dump.txt" ]] && grep -qE '\bPID\b' "$out_dir/dump.txt" 2>/dev/null; then
+        tap_ok "watchdog_keeps_dump_txt_for_back_compat"
+    else
+        tap_not_ok "watchdog_keeps_dump_txt_for_back_compat" \
+            "dump.txt missing/empty or lacks a process-table signature"
+    fi
+
+    pkill -f "$marker" 2>/dev/null || true
+}
+
+# ============================================================
+# Test 33: test_watchdog_stops_when_step_pid_exits
+#
+# Scope guard for #3768. Making the watchdog periodic must NOT create a process
+# that outlives the step — a backgrounded process holding the step's stdout is
+# the exact wedge the watchdog exists to hunt, so it must never become one. The
+# loop polls the step PID with `kill -0` and self-reaps within ~WATCHDOG_POLL
+# seconds of the step exiting, independently of any signal reaching it.
+# ============================================================
+test_watchdog_stops_when_step_pid_exits() {
+    local watchdog="$REPO_ROOT/scripts/ci/quickstart-hang-watchdog.sh"
+    if [[ ! -f "$watchdog" ]]; then
+        tap_not_ok "watchdog_self_reaps_when_step_exits" "watchdog script missing"
+        tap_not_ok "watchdog_records_stop_reason" "watchdog script missing"
+        return
+    fi
+
+    local out_dir="$TMPDIR_BASE/diag-test33/testnet-hang-watchdog"
+    local marker="qs-wd-reap-$$-${RANDOM}"
+    local fake_step="$TMPDIR_BASE/$marker.sh"
+    cat > "$fake_step" <<'EOF'
+#!/usr/bin/env bash
+sleep 3
+EOF
+    chmod +x "$fake_step"
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    "$fake_step" &
+    local step_pid=$!
+
+    # Cap set high (30) so the ONLY way this returns quickly is the step-liveness
+    # poll. The outer `timeout 25` is a safety net: rc 124 would mean the
+    # watchdog kept sampling after its step died (i.e. it leaked).
+    local log="$TMPDIR_BASE/watchdog-test33.log"
+    local rc=0
+    WATCHDOG_DELAY=1 WATCHDOG_INTERVAL=1 WATCHDOG_MAX_SAMPLES=30 WATCHDOG_POLL=1 \
+        timeout 25 bash "$watchdog" "$out_dir" "$step_pid" > "$log" 2>&1 || rc=$?
+
+    local samples
+    samples=$(find "$out_dir" -maxdepth 1 -name 'dump-*.txt' 2>/dev/null | wc -l | tr -d ' ')
+
+    # Returned on its own (rc 0, not the 124 safety net) and well short of the cap.
+    if [[ "$rc" -eq 0 && "$samples" -ge 1 && "$samples" -lt 30 ]]; then
+        tap_ok "watchdog_self_reaps_when_step_exits"
+    else
+        tap_not_ok "watchdog_self_reaps_when_step_exits" \
+            "rc=$rc samples=$samples (expected rc 0 and 1..29 samples — it must stop when the step dies)"
+    fi
+
+    if grep -q 'stopped after' "$out_dir/index.txt" 2>/dev/null; then
+        tap_ok "watchdog_records_stop_reason"
+    else
+        tap_not_ok "watchdog_records_stop_reason" "index.txt has no stop-reason line"
+    fi
+
+    pkill -f "$marker" 2>/dev/null || true
+}
+
+# ============================================================
+# Test 34: test_budget_exhausted_soft_skips_before_starting_a_probe
+#
+# PRIMARY regression for #3768 (defect 2 — the actual red). The wrapper can only
+# soft-skip an outcome it OBSERVES; a GitHub step-level `timeout-minutes` kill is
+# invisible to it. On run 31745517379 every probe disposition was `exit 124` on a
+# `--soft-on-timeout` shard (the exact environmental class #3272 de-gates), but
+# `horizon-core-up` burned 19m33s of the 25-minute step budget, so the step cap
+# fired during `horizon-ingesting` attempt 2 and the run went hard RED.
+#
+# With the step budget threaded in, a probe attempt that provably cannot finish
+# must not be started at all: emit the grep-able SOFT-SKIP marker (with the
+# distinct BUDGET-EXHAUSTED token so triage cannot confuse it with a genuine
+# 124) and exit neutral 0.
+#
+# FAILS on origin/main: the budget env vars are ignored, so the wrapper starts a
+# 240s attempt with no budget left and the step cap converts it to RED.
+# ============================================================
+test_budget_exhausted_soft_skips_before_starting_a_probe() {
+    local diag_dir="$TMPDIR_BASE/diag-test34"
+    mkdir -p "$diag_dir"
+
+    # A probe that would hang forever if it were ever started.
+    local probe
+    probe=$(make_probe "test34" 0 999)
+
+    # Step budget 60s, but the step started 600s ago → the budget is long gone.
+    # Margin/floor left at their DEFAULTS so this also exercises the defaults.
+    local now
+    now=$(date -u +%s)
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test34.txt"
+    local started ended elapsed rc=0
+    started=$(date -u +%s)
+    STEP_BUDGET_SECONDS=60 STEP_START_EPOCH=$((now - 600)) \
+        "$WRAPPER" \
+            --soft-on-timeout \
+            --network testnet --enable "core,horizon" --probe horizon-ingesting \
+            --timeout 240 --diagnostics-dir "$diag_dir" \
+            -- "$probe" >/dev/null 2>"$wrapper_log" || rc=$?
+    ended=$(date -u +%s)
+    elapsed=$((ended - started))
+
+    # (a) Neutral exit, not RED.
+    if [[ "$rc" -eq 0 ]]; then
+        tap_ok "test_budget_exhausted_soft_skips_before_starting_a_probe"
+    else
+        tap_not_ok "test_budget_exhausted_soft_skips_before_starting_a_probe" \
+            "rc=$rc (expected 0 — an exhausted step budget must be a neutral skip, not RED)"
+    fi
+
+    # (b) It returned IMMEDIATELY — proving no attempt was started (an attempt
+    #     would have burned the 240s probe timeout).
+    if [[ "$elapsed" -lt 10 ]]; then
+        tap_ok "budget_skip_starts_no_probe_attempt"
+    else
+        tap_not_ok "budget_skip_starts_no_probe_attempt" \
+            "wrapper took ${elapsed}s (expected <10s — it must not start an unfinishable attempt)"
+    fi
+
+    # (c) No attempt output at all.
+    if [[ ! -e "$diag_dir/attempt-1-output.log" ]]; then
+        tap_ok "budget_skip_leaves_no_attempt_output"
+    else
+        tap_not_ok "budget_skip_leaves_no_attempt_output" "attempt-1-output.log exists — an attempt was started"
+    fi
+
+    # (d) The stable, grep-able SOFT-SKIP marker is preserved AND carries the
+    #     distinct BUDGET-EXHAUSTED token, so triage can never mistake a budget
+    #     skip for a genuine probe timeout (which logs `exit 124`/`exit 137`).
+    if grep -q 'SOFT-SKIP' "$wrapper_log" && grep -q 'BUDGET-EXHAUSTED' "$wrapper_log"; then
+        tap_ok "budget_skip_emits_distinct_soft_skip_marker"
+    else
+        tap_not_ok "budget_skip_emits_distinct_soft_skip_marker" \
+            "missing SOFT-SKIP and/or BUDGET-EXHAUSTED marker in wrapper output"
+    fi
+
+    # (e) A breadcrumb lands in the diagnostics dir so the skip is observable in
+    #     the uploaded artifact, not only in the job log.
+    if [[ -s "$diag_dir/budget-skip.txt" ]]; then
+        tap_ok "budget_skip_writes_diagnostics_breadcrumb"
+    else
+        tap_not_ok "budget_skip_writes_diagnostics_breadcrumb" "no budget-skip.txt breadcrumb written"
+    fi
+}
+
+# ============================================================
+# Test 35: test_ample_budget_runs_probe_at_full_timeout
+#
+# Scope guard for #3768: with plenty of step budget left, budget-awareness must
+# be a NO-OP — the probe runs, at the FULL per-probe --timeout, and no
+# BUDGET-EXHAUSTED marker is emitted.
+# ============================================================
+test_ample_budget_runs_probe_at_full_timeout() {
+    local diag_dir="$TMPDIR_BASE/diag-test35"
+    mkdir -p "$diag_dir"
+
+    local probe
+    probe=$(make_probe "test35" 0 0)
+
+    local now
+    now=$(date -u +%s)
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test35.txt"
+    local rc=0
+    STEP_BUDGET_SECONDS=3600 STEP_START_EPOCH="$now" \
+        "$WRAPPER" \
+            --soft-on-timeout \
+            --network testnet --enable "core,horizon" --probe horizon-core-up \
+            --timeout 10 --diagnostics-dir "$diag_dir" \
+            -- "$probe" >/dev/null 2>"$wrapper_log" || rc=$?
+
+    # (a) The probe actually RAN and passed — no skip.
+    if [[ "$rc" -eq 0 && -e "$diag_dir/attempt-1-output.log" ]] && ! grep -q 'BUDGET-EXHAUSTED' "$wrapper_log"; then
+        tap_ok "test_ample_budget_runs_probe_at_full_timeout"
+    else
+        tap_not_ok "test_ample_budget_runs_probe_at_full_timeout" \
+            "rc=$rc (expected the probe to run with no budget skip when budget is ample)"
+    fi
+
+    # (b) It ran at the FULL per-probe budget — no cap applied.
+    if grep -q 'timeout -k [0-9]*s 10s' "$wrapper_log" && ! grep -q 'Step budget short' "$wrapper_log"; then
+        tap_ok "ample_budget_does_not_cap_attempt_timeout"
+    else
+        tap_not_ok "ample_budget_does_not_cap_attempt_timeout" \
+            "attempt did not run at the full 10s per-probe budget"
+    fi
+}
+
+# ============================================================
+# Test 36: test_short_budget_still_reds_a_genuine_assertion_failure
+#
+# LOAD-BEARING safety contract for #3768. Budget-awareness must NEVER widen the
+# soft-skip to non-timeout exits. When the step budget is short but not gone, the
+# wrapper caps the attempt's `timeout` instead of skipping it, so a genuine probe
+# assertion failure (`go` exits 1 — NOT 124/137/143) is still OBSERVED and still
+# fails RED, with no SOFT-SKIP marker. A skip-everything-when-short design would
+# silently mask a real henyey-on-testnet break; this asserts we do not.
+# ============================================================
+test_short_budget_still_reds_a_genuine_assertion_failure() {
+    local diag_dir="$TMPDIR_BASE/diag-test36"
+    mkdir -p "$diag_dir"
+
+    # Genuine assertion failure: exits 1 immediately (well under any cap).
+    local probe
+    probe=$(make_probe "test36" 1 0)
+
+    # usable = 100 - ~0 - 60 (default margin) ≈ 40s: above the 15s floor, but far
+    # below the 240s per-probe timeout → the attempt is CAPPED, not skipped.
+    local now
+    now=$(date -u +%s)
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test36.txt"
+    local rc=0
+    STEP_BUDGET_SECONDS=100 STEP_START_EPOCH="$now" \
+        "$WRAPPER" \
+            --soft-on-timeout \
+            --network testnet --enable "core,horizon" --probe horizon-core-up \
+            --timeout 240 --diagnostics-dir "$diag_dir" \
+            -- "$probe" >/dev/null 2>"$wrapper_log" || rc=$?
+
+    # (a) RED, with the child's exit code propagated unchanged.
+    if [[ "$rc" -eq 1 ]]; then
+        tap_ok "test_short_budget_still_reds_a_genuine_assertion_failure"
+    else
+        tap_not_ok "test_short_budget_still_reds_a_genuine_assertion_failure" \
+            "rc=$rc (expected 1 — a real assertion failure must stay RED regardless of budget)"
+    fi
+
+    # (b) No soft-skip of ANY kind for a non-timeout exit.
+    if ! grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "short_budget_does_not_soft_skip_assertion_failure"
+    else
+        tap_not_ok "short_budget_does_not_soft_skip_assertion_failure" \
+            "SOFT-SKIP emitted for a non-timeout exit — this masks a real break"
+    fi
+
+    # (c) The attempt really did run under a CAPPED timeout (the branch that
+    #     keeps the failure observable rather than skipping it).
+    if grep -q 'Step budget short' "$wrapper_log" && [[ -e "$diag_dir/attempt-1-output.log" ]]; then
+        tap_ok "short_budget_caps_attempt_instead_of_skipping"
+    else
+        tap_not_ok "short_budget_caps_attempt_instead_of_skipping" \
+            "expected a capped attempt to have been run, not a skip"
+    fi
+}
+
+# ============================================================
+# Test 37: test_budget_awareness_is_inert_without_soft_on_timeout
+#
+# Scope guard for #3768: budget-awareness is gated on --soft-on-timeout, so it
+# can only ever apply to the shards that already declared their TIMEOUTS
+# non-gating (testnet/core,horizon and local/galexie). On every other shard the
+# budget env vars must be completely inert — an exhausted budget must NOT create
+# a neutral exit, and a failure must stay RED.
+# ============================================================
+test_budget_awareness_is_inert_without_soft_on_timeout() {
+    local diag_dir="$TMPDIR_BASE/diag-test37"
+    mkdir -p "$diag_dir"
+
+    local probe
+    probe=$(make_probe "test37" 1 0)
+
+    local now
+    now=$(date -u +%s)
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test37.txt"
+    local rc=0
+    # Budget long gone, but NO --soft-on-timeout (a non-de-gated shard).
+    STEP_BUDGET_SECONDS=60 STEP_START_EPOCH=$((now - 600)) \
+        "$WRAPPER" \
+            --network local --enable "core" --probe core \
+            --timeout 240 --diagnostics-dir "$diag_dir" \
+            -- "$probe" >/dev/null 2>"$wrapper_log" || rc=$?
+
+    if [[ "$rc" -eq 1 ]] && ! grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "test_budget_awareness_is_inert_without_soft_on_timeout"
+    else
+        tap_not_ok "test_budget_awareness_is_inert_without_soft_on_timeout" \
+            "rc=$rc (expected 1 with no SOFT-SKIP — budget skip must not leak to non-soft shards)"
+    fi
+
+    # The probe must actually have been run on a non-soft shard.
+    if [[ -e "$diag_dir/attempt-1-output.log" ]]; then
+        tap_ok "non_soft_shard_still_runs_the_probe_when_budget_is_gone"
+    else
+        tap_not_ok "non_soft_shard_still_runs_the_probe_when_budget_is_gone" \
+            "no attempt output — the budget gate leaked to a non-soft shard"
+    fi
+}
+
+# ============================================================
+# Test 38: test_budget_skip_before_retry_reproduces_failing_run_shape
+#
+# Reproduces the exact shape of run 31745517379's fatal step: attempt 1 consumes
+# its budget and times out, and there is no longer enough STEP budget for
+# attempt 2. On origin/main the wrapper starts attempt 2 anyway and the step cap
+# kills it mid-flight (hard RED, no soft-skip possible). With budget awareness,
+# attempt 2 is never started and the shard ends neutral-green.
+# ============================================================
+test_budget_skip_before_retry_reproduces_failing_run_shape() {
+    local diag_dir="$TMPDIR_BASE/diag-test38"
+    mkdir -p "$diag_dir"
+
+    # Always-timing-out probe (the stuck-sync signature).
+    local probe
+    probe=$(make_probe "test38" 0 999)
+
+    # Budget arithmetic (margin 0, floor 3, budget 6, per-probe timeout 4):
+    #   pre-attempt-1: usable = 6 - ~0 - 0 = ~6  >= floor 3 and >= timeout 4
+    #                  → attempt 1 runs at the full 4s and times out (124).
+    #   pre-retry:     usable = 6 - (>=4) - 0 <= 2 < floor 3
+    #                  → attempt 2 is NEVER started; neutral BUDGET-EXHAUSTED skip.
+    # Deterministic: attempt 1 always consumes >= 4s of the 6s budget.
+    local now
+    now=$(date -u +%s)
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test38.txt"
+    local rc=0
+    STEP_BUDGET_SECONDS=6 STEP_START_EPOCH="$now" \
+    BUDGET_MARGIN_SECONDS=0 BUDGET_MIN_ATTEMPT_SECONDS=3 KILL_GRACE=1s \
+        "$WRAPPER" \
+            --soft-on-timeout \
+            --network testnet --enable "core,horizon" --probe horizon-ingesting \
+            --timeout 4 --diagnostics-dir "$diag_dir" \
+            -- "$probe" >/dev/null 2>"$wrapper_log" || rc=$?
+
+    # (a) Neutral, not RED.
+    if [[ "$rc" -eq 0 ]]; then
+        tap_ok "test_budget_skip_before_retry_reproduces_failing_run_shape"
+    else
+        tap_not_ok "test_budget_skip_before_retry_reproduces_failing_run_shape" \
+            "rc=$rc (expected 0 — budget-exhausted retry must be neutral, not RED)"
+    fi
+
+    # (b) Attempt 1 ran; attempt 2 was never started.
+    if [[ -e "$diag_dir/attempt-1-output.log" && ! -e "$diag_dir/attempt-2-output.log" ]]; then
+        tap_ok "budget_skip_suppresses_only_the_unfinishable_retry"
+    else
+        tap_not_ok "budget_skip_suppresses_only_the_unfinishable_retry" \
+            "expected attempt-1 to have run and attempt-2 to have been skipped"
+    fi
+
+    # (c) It is reported as a BUDGET exhaustion, not as a probe timeout.
+    if grep -q 'BUDGET-EXHAUSTED' "$wrapper_log"; then
+        tap_ok "budget_skip_before_retry_is_labelled_budget_exhausted"
+    else
+        tap_not_ok "budget_skip_before_retry_is_labelled_budget_exhausted" \
+            "no BUDGET-EXHAUSTED marker — a budget skip must be distinguishable from a genuine 124"
+    fi
+}
+
+# ============================================================
+# Test 39: test_workflow_wires_step_budget_and_periodic_watchdog
+#
+# Correct-by-construction workflow contract for #3768 (no CI hang required).
+#   (a) The step mirrors its OWN `timeout-minutes` expression into
+#       STEP_TIMEOUT_MINUTES — asserted by comparing the two parsed YAML values,
+#       so the budget the wrapper sees can never drift from the cap that kills it.
+#   (b) The step body exports STEP_START_EPOCH and STEP_BUDGET_SECONDS.
+#   (c) The watchdog is armed PERIODICALLY (interval + cap knobs present) and the
+#       one-shot `sleep "${WATCHDOG_DELAY:-1200}"` arming is gone.
+#   (d) The watchdog stays testnet-only and is still reaped via the EXIT trap.
+# ============================================================
+test_workflow_wires_step_budget_and_periodic_watchdog() {
+    if [[ ! -f "$WORKFLOW" ]]; then
+        tap_not_ok "workflow_step_budget_matches_step_timeout_expression" "workflow file not found"
+        tap_not_ok "workflow_exports_step_budget_to_wrapper" "workflow file not found"
+        tap_not_ok "workflow_arms_watchdog_periodically" "workflow file not found"
+        tap_not_ok "workflow_watchdog_stays_testnet_only_and_reaped" "workflow file not found"
+        return
+    fi
+
+    # Assert on the EXECUTABLE content only: comment lines are stripped so a
+    # comment that quotes the old one-shot arming (for context) cannot satisfy
+    # — or falsify — any assertion below.
+    local wf_code
+    wf_code=$(grep -vE '^[[:space:]]*#' "$WORKFLOW")
+
+    # (a) Parse the YAML and compare the two expressions exactly.
+    local budget_match
+    budget_match=$(python3 - "$WORKFLOW" <<'PY' 2>/dev/null || true
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+steps = doc["jobs"]["test"]["steps"]
+step = next(s for s in steps if s.get("name") == "Run probes through wrapper")
+env = step.get("env") or {}
+print("MATCH" if str(step.get("timeout-minutes")) == str(env.get("STEP_TIMEOUT_MINUTES")) else "MISMATCH")
+PY
+)
+    if [[ "$budget_match" == "MATCH" ]]; then
+        tap_ok "workflow_step_budget_matches_step_timeout_expression"
+    else
+        tap_not_ok "workflow_step_budget_matches_step_timeout_expression" \
+            "STEP_TIMEOUT_MINUTES != timeout-minutes expression ($budget_match) — the budget would drift from the cap"
+    fi
+
+    # (b) The step body must compute and EXPORT the budget so the wrapper sees it.
+    if grep -q 'STEP_START_EPOCH="\$(date -u +%s)"' <<<"$wf_code" \
+        && grep -q 'STEP_BUDGET_SECONDS=\$(( STEP_TIMEOUT_MINUTES \* 60 ))' <<<"$wf_code" \
+        && grep -q 'export STEP_START_EPOCH STEP_BUDGET_SECONDS' <<<"$wf_code"; then
+        tap_ok "workflow_exports_step_budget_to_wrapper"
+    else
+        tap_not_ok "workflow_exports_step_budget_to_wrapper" \
+            "step body does not compute/export STEP_START_EPOCH + STEP_BUDGET_SECONDS"
+    fi
+
+    # (c) Periodic arming: interval + cap knobs present, one-shot arming gone.
+    if grep -q 'WATCHDOG_INTERVAL' <<<"$wf_code" \
+        && grep -q 'WATCHDOG_MAX_SAMPLES' <<<"$wf_code" \
+        && grep -q 'WATCHDOG_DELAY' <<<"$wf_code" \
+        && ! grep -qE '\([[:space:]]*sleep "\$\{WATCHDOG_DELAY' <<<"$wf_code"; then
+        tap_ok "workflow_arms_watchdog_periodically"
+    else
+        tap_not_ok "workflow_arms_watchdog_periodically" \
+            "watchdog still armed one-shot, or the interval/cap knobs are missing"
+    fi
+
+    # (d) Scope + hygiene guards, unchanged from #3286.
+    if grep -q 'if \[\[ "\$NETWORK" == "testnet" \]\]; then' <<<"$wf_code" \
+        && grep -q "kill \"\$WATCHDOG_PID\"" <<<"$wf_code"; then
+        tap_ok "workflow_watchdog_stays_testnet_only_and_reaped"
+    else
+        tap_not_ok "workflow_watchdog_stays_testnet_only_and_reaped" \
+            "watchdog is no longer testnet-only, or the reaping kill was dropped"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 103
+# Set EMPIRICALLY: run the harness, read the `# PLAN MISMATCH: planned N,
+# emitted M` line at the end, set this to M. Do not compute it by hand.
+tap_plan 128
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -2064,9 +2625,27 @@ test_testnet_shard_renders_step_timeout_25_others_360
 test_capture_diagnostics_docker_calls_are_time_bounded
 test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow
 test_pubnet_block_extraction_byte_identical_to_original_shape
+test_watchdog_samples_periodically_and_respects_cap
+test_watchdog_stops_when_step_pid_exits
+test_budget_exhausted_soft_skips_before_starting_a_probe
+test_ample_budget_runs_probe_at_full_timeout
+test_short_budget_still_reds_a_genuine_assertion_failure
+test_budget_awareness_is_inert_without_soft_on_timeout
+test_budget_skip_before_retry_reproduces_failing_run_shape
+test_workflow_wires_step_budget_and_periodic_watchdog
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
+
+# TAP plan self-check. The `1..N` plan above is set EMPIRICALLY (run the harness,
+# read the line below, set the plan to the emitted count, re-run). Emitting the
+# mismatch explicitly — and failing on it — means a newly added assertion can
+# never silently drift the plan out of sync with what is actually run.
+if [[ $TEST_COUNT -ne $TAP_PLANNED ]]; then
+    echo "# PLAN MISMATCH: planned $TAP_PLANNED, emitted $TEST_COUNT"
+    echo "# Set the tap_plan call to $TEST_COUNT and re-run."
+    exit 1
+fi
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
     exit 1
