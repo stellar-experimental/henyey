@@ -407,6 +407,23 @@ grep -E '^[^ ]+Z\s+ERROR\s' "$LOG" \
   | grep -vF 'Event loop stall (loop-side exact accounting)'
 ```
 
+**overlay peer-resolution ERROR carve-out**: `henyey_overlay::manager::tick`
+logs `Unable to resolve peer '<host>:<port>': failed to lookup address
+information: Name or service not known` at the **ERROR tier** when an external
+peer *hostname* (e.g. `v3.stellar.lobstr.co`) does not resolve in this host's
+DNS. This is **environmental overlay churn** — the exact ERROR-tier analogue of
+the `recv error` peer-disconnect INFO carved out above — not a node fault: a
+single peer's DNS failing cannot stop consensus, and a *total* resolver outage
+would surface separately as a dropping `authenticated_count` / heartbeat
+`peers=` / peer-count gauge, not via these per-host lines. Exclude it from the
+unexpected-ERROR fault count, e.g.:
+
+```bash
+grep -E '^[^ ]+Z\s+ERROR\s' "$LOG" \
+  | grep -vF 'Event loop stall (loop-side exact accounting)' \
+  | grep -vF 'Unable to resolve peer'
+```
+
 Do NOT read a `stall_recovered=true` ERROR line as a regression on a node that
 previously read `0 ERROR` in-window — (3f) accounts for it explicitly. The
 unrecovered-wedge line (`watchdog_freeze=true` / `WATCHDOG: Event loop appears
