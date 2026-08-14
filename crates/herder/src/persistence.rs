@@ -1765,14 +1765,11 @@ impl ScpStatePersistence for SqliteScpPersistence {
         let json = state.to_json()?;
         self.inner
             .save_scp_state(slot, &json)
-            .map_err(HerderError::Internal)
+            .map_err(HerderError::Db)
     }
 
     fn load_scp_state(&self, slot: u64) -> Result<Option<PersistedSlotState>> {
-        let json = self
-            .inner
-            .load_scp_state(slot)
-            .map_err(HerderError::Internal)?;
+        let json = self.inner.load_scp_state(slot).map_err(HerderError::Db)?;
         match json {
             Some(j) => Ok(Some(PersistedSlotState::from_json(&j)?)),
             None => Ok(None),
@@ -1780,10 +1777,7 @@ impl ScpStatePersistence for SqliteScpPersistence {
     }
 
     fn load_all_scp_states(&self) -> Result<Vec<(u64, PersistedSlotState)>> {
-        let states = self
-            .inner
-            .load_all_scp_states()
-            .map_err(HerderError::Internal)?;
+        let states = self.inner.load_all_scp_states().map_err(HerderError::Db)?;
         let mut result = Vec::new();
         for (slot, json) in states {
             match PersistedSlotState::from_json(&json) {
@@ -1799,37 +1793,35 @@ impl ScpStatePersistence for SqliteScpPersistence {
     fn delete_scp_state_below(&self, slot: u64) -> Result<()> {
         self.inner
             .delete_scp_state_below(slot)
-            .map_err(HerderError::Internal)
+            .map_err(HerderError::Db)
     }
 
     fn save_tx_set(&self, hash: &Hash, tx_set: &[u8]) -> Result<()> {
         self.inner
             .save_tx_set(hash, tx_set)
-            .map_err(HerderError::Internal)
+            .map_err(HerderError::Db)
     }
 
     fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
-        self.inner.load_tx_set(hash).map_err(HerderError::Internal)
+        self.inner.load_tx_set(hash).map_err(HerderError::Db)
     }
 
     fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>> {
-        self.inner.load_all_tx_sets().map_err(HerderError::Internal)
+        self.inner.load_all_tx_sets().map_err(HerderError::Db)
     }
 
     fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
-        self.inner.has_tx_set(hash).map_err(HerderError::Internal)
+        self.inner.has_tx_set(hash).map_err(HerderError::Db)
     }
 
     fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>> {
-        self.inner
-            .get_all_tx_set_hashes()
-            .map_err(HerderError::Internal)
+        self.inner.get_all_tx_set_hashes().map_err(HerderError::Db)
     }
 
     fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<()> {
         self.inner
             .delete_tx_sets_by_hashes(hashes)
-            .map_err(HerderError::Internal)
+            .map_err(HerderError::Db)
     }
 
     /// Override the trait default with a SQLite-transactional implementation
@@ -1839,7 +1831,7 @@ impl ScpStatePersistence for SqliteScpPersistence {
     fn purge_unreferenced_tx_sets_atomic(&self) -> Result<()> {
         self.inner
             .purge_unreferenced_tx_sets_atomic()
-            .map_err(HerderError::Internal)
+            .map_err(HerderError::Db)
     }
 }
 

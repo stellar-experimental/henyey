@@ -543,26 +543,12 @@ fn handle_persist_error(context: &str, error: &BucketError, shutdown: &Recoverab
 /// recoverable, environmental class — analogous to the bucket-IO ENOSPC class
 /// handled by [`BucketError::is_transient_io`] (#3478).
 ///
-/// The match is NARROW by design (the load-bearing consensus-safety guard):
-/// only the two busy/locked primary `ErrorCode`s are recoverable. Every other
-/// SQLite code (`DatabaseCorrupt`, `SystemIoFailure`, …), every other
-/// [`DbError`] variant (`Integrity`, `Xdr`, …), and any non-`DbError` error
-/// stay on the fatal `abort()`+wipe path — genuine corruption must NEVER be
-/// reclassified recoverable. Mirrors the `is_query_interrupted` shape in
-/// `henyey_db::queries` (matching the structured `ErrorCode`, NOT the message
-/// string).
+/// Delegates to the canonical [`henyey_db::DbError::is_transient_busy`] so
+/// exactly one definition of the (NARROW, consensus-safety-critical) busy/locked
+/// predicate exists in the workspace (#3806 / #3871). Kept as a `pub(crate)`
+/// free function so the ~20 call sites and `crate::metrics` need not change.
 pub(crate) fn is_transient_db_busy(error: &henyey_db::DbError) -> bool {
-    matches!(
-        error,
-        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::DatabaseBusy
-                    | rusqlite::ffi::ErrorCode::DatabaseLocked,
-                ..
-            },
-            _,
-        ))
-    )
+    error.is_transient_busy()
 }
 
 /// `&anyhow::Error` sibling of [`is_transient_db_busy`] for the ledger-close

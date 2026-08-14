@@ -36,19 +36,15 @@ impl SqliteScpPersistence {
         Self { db }
     }
 
-    fn map_error(e: DbError) -> String {
-        format!("database error: {}", e)
-    }
-
     fn with_connection<T>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> Result<T, DbError>,
-    ) -> Result<T, String> {
-        self.db.with_connection(f).map_err(Self::map_error)
+    ) -> Result<T, DbError> {
+        self.db.with_connection(f)
     }
 
     /// Save SCP state for a slot.
-    pub fn save_scp_state(&self, slot: u64, state_json: &str) -> Result<(), String> {
+    pub fn save_scp_state(&self, slot: u64, state_json: &str) -> Result<(), DbError> {
         self.with_connection(|conn| {
             conn.save_scp_slot_state(slot, state_json)?;
             Ok(())
@@ -56,17 +52,17 @@ impl SqliteScpPersistence {
     }
 
     /// Load SCP state for a slot.
-    pub fn load_scp_state(&self, slot: u64) -> Result<Option<String>, String> {
+    pub fn load_scp_state(&self, slot: u64) -> Result<Option<String>, DbError> {
         self.with_connection(|conn| conn.load_scp_slot_state(slot))
     }
 
     /// Load SCP state for all slots.
-    pub fn load_all_scp_states(&self) -> Result<Vec<(u64, String)>, String> {
+    pub fn load_all_scp_states(&self) -> Result<Vec<(u64, String)>, DbError> {
         self.with_connection(|conn| conn.load_all_scp_slot_states())
     }
 
     /// Delete SCP state for slots below the given threshold.
-    pub fn delete_scp_state_below(&self, slot: u64) -> Result<(), String> {
+    pub fn delete_scp_state_below(&self, slot: u64) -> Result<(), DbError> {
         self.with_connection(|conn| {
             conn.delete_scp_slot_states_below(slot)?;
             debug!("Deleted SCP state below slot {}", slot);
@@ -75,7 +71,7 @@ impl SqliteScpPersistence {
     }
 
     /// Save a transaction set.
-    pub fn save_tx_set(&self, hash: &Hash, tx_set: &[u8]) -> Result<(), String> {
+    pub fn save_tx_set(&self, hash: &Hash, tx_set: &[u8]) -> Result<(), DbError> {
         self.with_connection(|conn| {
             conn.save_tx_set_data(hash, tx_set)?;
             Ok(())
@@ -83,27 +79,27 @@ impl SqliteScpPersistence {
     }
 
     /// Load a transaction set.
-    pub fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>, String> {
+    pub fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError> {
         self.with_connection(|conn| conn.load_tx_set_data(hash))
     }
 
     /// Load all transaction sets.
-    pub fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>, String> {
+    pub fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
         self.with_connection(|conn| conn.load_all_tx_set_data())
     }
 
     /// Check if a transaction set exists.
-    pub fn has_tx_set(&self, hash: &Hash) -> Result<bool, String> {
+    pub fn has_tx_set(&self, hash: &Hash) -> Result<bool, DbError> {
         self.with_connection(|conn| conn.has_tx_set_data(hash))
     }
 
     /// Return the hashes of all persisted transaction sets.
-    pub fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, String> {
+    pub fn get_all_tx_set_hashes(&self) -> Result<Vec<Hash>, DbError> {
         self.with_connection(|conn| conn.get_all_tx_set_hashes())
     }
 
     /// Delete persisted transaction sets by their hashes.
-    pub fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), String> {
+    pub fn delete_tx_sets_by_hashes(&self, hashes: &[Hash]) -> Result<(), DbError> {
         self.with_connection(|conn| conn.delete_tx_sets_by_hashes(hashes))
     }
 
@@ -113,7 +109,7 @@ impl SqliteScpPersistence {
     /// orphans) in a single SQLite transaction so a concurrent writer
     /// (e.g. `persist_scp_state`) cannot have its freshly-inserted tx-set
     /// deleted as an orphan between steps. See `#2770` for context.
-    pub fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), String> {
+    pub fn purge_unreferenced_tx_sets_atomic(&self) -> Result<(), DbError> {
         // BEGIN IMMEDIATE so the purge holds a RESERVED write lock for the
         // entire read-then-delete sequence — blocks concurrent `save_tx_set`
         // / `save_scp_state` on other pool connections so we cannot delete a
@@ -126,7 +122,6 @@ impl SqliteScpPersistence {
         let _write_ctx = henyey_common::WriteCtxGuard::new("scp-persist-purge");
         self.db
             .transaction_immediate(|tx| tx.purge_unreferenced_tx_sets_atomic())
-            .map_err(Self::map_error)
     }
 }
 

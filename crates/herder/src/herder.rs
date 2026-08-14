@@ -1252,9 +1252,11 @@ impl Herder {
             .saturating_sub(MAX_SLOTS_TO_REMEMBER);
         if min_slot > 0 {
             if let Err(e) = manager.cleanup(min_slot) {
+                record_tx_set_gc_busy_drop(&e);
                 error!(error = %e, min_slot, "Failed to clean up persisted SCP state");
             }
         } else if let Err(e) = manager.purge_unreferenced_tx_sets() {
+            record_tx_set_gc_busy_drop(&e);
             error!(error = %e, "Failed to purge unreferenced persisted tx sets");
         }
     }
@@ -5246,6 +5248,43 @@ pub struct HerderStats {
 
 fn node_id_from_public_key(pk: &PublicKey) -> NodeId {
     NodeId(pk.into())
+}
+
+/// Prometheus counter name for DB writes dropped because of a transient
+/// `SQLITE_BUSY`/`LOCKED`. Registered (with its closed `site` vocabulary) in
+/// `crates/app/src/metrics.rs`; emitted here by string literal (#3806). The
+/// `crates/app` catalog test `test_db_busy_site_label_vocabulary_pinned` pins
+/// the `site` value on the registration side; the herder emit-side tests pin
+/// the exact rendered series, so a typo on either side fails a test.
+const DB_BUSY_WRITE_DROPPED_TOTAL: &str = "henyey_db_busy_write_dropped_total";
+
+/// The `site` label value for the herder tx-set GC purge (#3806).
+///
+/// Covers BOTH sub-steps of the 60 s GC tick (`delete_scp_state_below` via
+/// `cleanup`, and `purge_unreferenced_tx_sets_atomic`): the `site` label
+/// identifies the *consequence*, and it is identical for both — this tick's GC
+/// work is dropped and self-heals on the next tick.
+///
+/// Two honesty caveats for anyone reading these series:
+/// 1. `henyey_db_busy_retry_attempts_total{site="tx_set_gc"}` is structurally
+///    always zero — this is a log-and-continue site that drops on the first
+///    busy with no retry loop — so a `0` there does NOT mean "no contention".
+/// 2. `is_transient_busy` matches only `SQLITE_BUSY`/`LOCKED`. Sustained
+///    contention can also surface as `DbError::Pool(Timeout)` from the r2d2
+///    checkout, which is NOT counted. A `0` here means "no `SQLITE_BUSY`/`LOCKED`
+///    at this site", not "no contention loss at this site".
+const SITE_TX_SET_GC: &str = "tx_set_gc";
+
+/// Count a herder tx-set-GC failure as a busy-caused write loss **iff** the
+/// error is a transient `SQLITE_BUSY`/`LOCKED`. Non-transient errors (genuine
+/// corruption, integrity violations, non-`Db` `HerderError`s) are a different
+/// failure class and must NOT inflate the alertable series (#3802 contract
+/// point 4). Classification is on the structured [`henyey_db::DbError`], never
+/// on the rendered message string.
+fn record_tx_set_gc_busy_drop(err: &HerderError) {
+    if matches!(err, HerderError::Db(e) if e.is_transient_busy()) {
+        metrics::counter!(DB_BUSY_WRITE_DROPPED_TOTAL, "site" => SITE_TX_SET_GC).increment(1);
+    }
 }
 
 #[cfg(test)]
@@ -10033,6 +10072,252 @@ mod tests {
             restored.envelopes.iter().any(|(slot, _)| *slot == 119),
             "live slot state must survive the trim"
         );
+    }
+
+    // -------- tx-set GC busy-drop telemetry (#3806) --------
+
+    /// Construct a transient busy `HerderError::Db` for the emit-side tests.
+    fn busy_herder_error() -> HerderError {
+        HerderError::Db(henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            Some("database is locked".to_string()),
+        )))
+    }
+
+    fn locked_herder_error() -> HerderError {
+        HerderError::Db(henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseLocked,
+                extended_code: 6,
+            },
+            Some("database table is locked".to_string()),
+        )))
+    }
+
+    /// `ScpStatePersistence` double that fails every write with a transient
+    /// busy `DbError`, so both arms of `purge_persisted_tx_sets` observe a
+    /// busy drop. Reads return empty so `set_scp_persistence` (which never
+    /// calls a storage method) and the persist worker install cleanly.
+    struct BusyStorage;
+
+    impl crate::persistence::ScpStatePersistence for BusyStorage {
+        fn save_scp_state(
+            &self,
+            _slot: u64,
+            _state: &crate::persistence::PersistedSlotState,
+        ) -> crate::Result<()> {
+            Err(busy_herder_error())
+        }
+
+        fn load_scp_state(
+            &self,
+            _slot: u64,
+        ) -> crate::Result<Option<crate::persistence::PersistedSlotState>> {
+            Ok(None)
+        }
+
+        fn load_all_scp_states(
+            &self,
+        ) -> crate::Result<Vec<(u64, crate::persistence::PersistedSlotState)>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_scp_state_below(&self, _slot: u64) -> crate::Result<()> {
+            Err(busy_herder_error())
+        }
+
+        fn save_tx_set(&self, _hash: &stellar_xdr::Hash, _tx_set: &[u8]) -> crate::Result<()> {
+            Err(busy_herder_error())
+        }
+
+        fn load_tx_set(&self, _hash: &stellar_xdr::Hash) -> crate::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn load_all_tx_sets(&self) -> crate::Result<Vec<(stellar_xdr::Hash, Vec<u8>)>> {
+            Ok(Vec::new())
+        }
+
+        fn has_tx_set(&self, _hash: &stellar_xdr::Hash) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        fn get_all_tx_set_hashes(&self) -> crate::Result<Vec<stellar_xdr::Hash>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_tx_sets_by_hashes(&self, _hashes: &[stellar_xdr::Hash]) -> crate::Result<()> {
+            Err(busy_herder_error())
+        }
+
+        // Override the atomic purge so the `else` (min_slot == 0) arm also
+        // observes a transient busy rather than the default read-then-delete
+        // sequence over the empty (Ok) getters.
+        fn purge_unreferenced_tx_sets_atomic(&self) -> crate::Result<()> {
+            Err(busy_herder_error())
+        }
+    }
+
+    /// A transient busy `DbError` at the tx-set GC site must increment
+    /// `henyey_db_busy_write_dropped_total{site="tx_set_gc"}`. Pins the exact
+    /// rendered series on the emit side.
+    #[test]
+    fn test_tx_set_gc_busy_drop_counts_transient_busy() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_tx_set_gc_busy_drop(&busy_herder_error());
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"tx_set_gc\"} 1"),
+                "DatabaseBusy must render the tx_set_gc drop series at 1.\nOutput:\n{}",
+                out
+            );
+        });
+
+        // DatabaseLocked is the sibling transient code.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_tx_set_gc_busy_drop(&locked_herder_error());
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"tx_set_gc\"} 1"),
+                "DatabaseLocked must render the tx_set_gc drop series at 1.\nOutput:\n{}",
+                out
+            );
+        });
+    }
+
+    /// A non-transient `DbError` (corruption / integrity) must NOT inflate the
+    /// alertable series — herder has no `register_label_series`, so an
+    /// unincremented labelled series does not appear at all. Enforces the
+    /// #3802 contract point 4.
+    #[test]
+    fn test_tx_set_gc_busy_drop_ignores_non_transient_db_error() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let corrupt = HerderError::Db(henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseCorrupt,
+                extended_code: 11,
+            },
+            Some("database disk image is malformed".to_string()),
+        )));
+        let integrity = HerderError::Db(henyey_db::DbError::Integrity("bad hash".to_string()));
+
+        for err in [corrupt, integrity] {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                record_tx_set_gc_busy_drop(&err);
+                let out = handle.render();
+                assert!(
+                    !out.contains("site=\"tx_set_gc\""),
+                    "non-transient DbError must not emit any tx_set_gc series.\nOutput:\n{}",
+                    out
+                );
+            });
+        }
+    }
+
+    /// The anti-string-matching guard: a `HerderError::Internal` whose message
+    /// renders identically to a real busy must NOT be counted — only the
+    /// structured `DbError` may classify.
+    #[test]
+    fn test_tx_set_gc_busy_drop_ignores_non_db_herder_error() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_tx_set_gc_busy_drop(&HerderError::Internal("database is locked".to_string()));
+            let out = handle.render();
+            assert!(
+                !out.contains("site=\"tx_set_gc\""),
+                "a non-Db HerderError must never be counted, even if its \
+                 message looks busy.\nOutput:\n{}",
+                out
+            );
+        });
+    }
+
+    /// The production `min_slot > 0` (cleanup) arm: a transient busy from
+    /// `delete_scp_state_below` must count exactly one busy drop AND the call
+    /// must return normally (log-and-continue preserved).
+    #[test]
+    fn test_purge_persisted_tx_sets_emits_busy_drop_on_cleanup_arm() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let herder = make_test_herder();
+        {
+            // consensus_index = 20 → tracking_consensus_ledger_index = 19 →
+            // min_slot = 19 - MAX_SLOTS_TO_REMEMBER(12) = 7 > 0 → cleanup arm.
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 20;
+            ts.is_tracking = true;
+        }
+        assert!(
+            herder
+                .set_scp_persistence(Arc::new(crate::persistence::ScpPersistenceManager::new(
+                    Box::new(BusyStorage),
+                )))
+                .is_ok(),
+            "install busy storage"
+        );
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            // Must not panic / must return normally despite the busy error.
+            herder.purge_persisted_tx_sets();
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"tx_set_gc\"} 1"),
+                "cleanup-arm busy must emit exactly one tx_set_gc drop.\nOutput:\n{}",
+                out
+            );
+        });
+    }
+
+    /// The `min_slot == 0` (`else`) arm: a transient busy from
+    /// `purge_unreferenced_tx_sets_atomic` must likewise count one busy drop.
+    /// consensus_index is set to 0 explicitly so arm selection is deterministic.
+    #[test]
+    fn test_purge_persisted_tx_sets_emits_busy_drop_on_purge_arm() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let herder = make_test_herder();
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 0;
+            ts.is_tracking = true;
+        }
+        assert!(
+            herder
+                .set_scp_persistence(Arc::new(crate::persistence::ScpPersistenceManager::new(
+                    Box::new(BusyStorage),
+                )))
+                .is_ok(),
+            "install busy storage"
+        );
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            herder.purge_persisted_tx_sets();
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_db_busy_write_dropped_total{site=\"tx_set_gc\"} 1"),
+                "purge-arm busy must emit exactly one tx_set_gc drop.\nOutput:\n{}",
+                out
+            );
+        });
     }
 
     #[test]
