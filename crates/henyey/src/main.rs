@@ -3896,19 +3896,14 @@ fn self_check_crypto_benchmark() {
 async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     let db = henyey_db::Database::open(&config.database.path)?;
 
-    // #3812: remove any ahead-of-LCL history rows left by an interrupted catchup
-    // before anchoring on MAX(ledgerseq), so the self-check verifies only the
-    // authoritative header chain at or below the durable LCL.
-    if let Some(deleted) = db.cleanup_ahead_of_lcl()? {
-        if deleted > 0 {
-            println!(
-                "  Removed {} ahead-of-LCL history row(s) left by an interrupted catchup",
-                deleted
-            );
-        }
-    }
-
-    let Some(latest_seq) = db.get_latest_ledger_seq()? else {
+    // #3870: self-check is a read-only diagnostic and MUST NOT mutate history.
+    // It takes no single-instance lock, so it can run concurrently with a
+    // catchup that has legitimately persisted ahead-of-LCL rows (#3827);
+    // deleting them here (the pre-#3870 behavior) would leave a permanent
+    // history hole once catchup advances the LCL. Instead, anchor verification
+    // at the durable LCL (falling back to MAX(ledgerseq) only when no durable
+    // LCL exists yet) so ahead-of-LCL rows are never observed and never touched.
+    let Some(latest_seq) = db.durable_read_anchor()? else {
         println!("  No ledger data in database. Skipping header verification.");
         println!();
         return Ok(());
