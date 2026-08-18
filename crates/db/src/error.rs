@@ -79,3 +79,115 @@ pub enum DbError {
     #[error("query exceeded computational budget")]
     QueryBudgetExceeded,
 }
+
+impl DbError {
+    /// Returns `true` iff this is a transient SQLite busy/locked
+    /// (`SQLITE_BUSY` / `SQLITE_LOCKED`, "database is locked"), #3497.
+    ///
+    /// SQLite write transactions are atomic: a `DatabaseBusy`/`DatabaseLocked`
+    /// means the transaction NEVER committed, so the on-disk state is
+    /// consistent and the write can be safely re-issued (or, at a
+    /// log-and-continue site, safely abandoned as a *known* loss rather than
+    /// treated as corruption). This is the recoverable, environmental class.
+    ///
+    /// The match is NARROW by design (the load-bearing consensus-safety
+    /// guard): only the two busy/locked primary `ErrorCode`s are recoverable.
+    /// Every other SQLite code (`DatabaseCorrupt`, `SystemIoFailure`, …) and
+    /// every other [`DbError`] variant (`Integrity`, `Xdr`, …) stay on the
+    /// fatal path — genuine corruption must NEVER be reclassified recoverable.
+    /// Mirrors the `is_query_interrupted` shape in `crate::queries` (matching
+    /// the structured `ErrorCode`, NOT the message string).
+    ///
+    /// Lives here, on the error type, rather than in a single consumer crate
+    /// so that every caller shares ONE definition of "transient": `crates/app`
+    /// (`is_transient_db_busy`, ledger-close/persist/maintenance) and
+    /// `crates/history` (catchup `emit_meta`, #3801) both delegate to it.
+    pub fn is_transient_busy(&self) -> bool {
+        matches!(
+            self,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked,
+                    ..
+                },
+                _,
+            ))
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `DbError::Sqlite(SqliteFailure(ffi::Error { code, .. }, msg))`
+    /// for the given primary code, mirroring how rusqlite materializes a
+    /// SQLite error on a contended write.
+    fn sqlite_error(code: rusqlite::ffi::ErrorCode, msg: &str) -> DbError {
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            Some(msg.to_string()),
+        ))
+    }
+
+    /// Both busy/locked primary codes are the recoverable, environmental class.
+    #[test]
+    fn test_is_transient_busy_matches_busy_and_locked() {
+        assert!(
+            sqlite_error(rusqlite::ffi::ErrorCode::DatabaseBusy, "database is locked")
+                .is_transient_busy(),
+            "SQLITE_BUSY must classify as transient"
+        );
+        assert!(
+            sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseLocked,
+                "database table is locked"
+            )
+            .is_transient_busy(),
+            "SQLITE_LOCKED must classify as transient"
+        );
+    }
+
+    /// The narrow-by-design boundary: genuine corruption and every non-SQLite
+    /// variant must NEVER be reclassified as recoverable.
+    #[test]
+    fn test_is_transient_busy_rejects_corrupt_and_non_sqlite() {
+        assert!(
+            !sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseCorrupt,
+                "database disk image is malformed"
+            )
+            .is_transient_busy(),
+            "SQLITE_CORRUPT must stay on the fatal path"
+        );
+        assert!(
+            !sqlite_error(rusqlite::ffi::ErrorCode::SystemIoFailure, "disk I/O error")
+                .is_transient_busy(),
+            "SQLITE_IOERR must stay on the fatal path"
+        );
+        assert!(
+            !DbError::Integrity("bad hash".to_string()).is_transient_busy(),
+            "Integrity must stay on the fatal path"
+        );
+        assert!(
+            !DbError::Xdr(stellar_xdr::Error::Invalid).is_transient_busy(),
+            "Xdr must stay on the fatal path"
+        );
+        assert!(
+            !DbError::NotFound("row".to_string()).is_transient_busy(),
+            "NotFound must stay on the fatal path"
+        );
+        assert!(
+            !DbError::QueryBudgetExceeded.is_transient_busy(),
+            "QueryBudgetExceeded must stay on the fatal path"
+        );
+        assert!(
+            !DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows).is_transient_busy(),
+            "a non-SqliteFailure rusqlite error must stay on the fatal path"
+        );
+    }
+}

@@ -551,18 +551,15 @@ fn handle_persist_error(context: &str, error: &BucketError, shutdown: &Recoverab
 /// reclassified recoverable. Mirrors the `is_query_interrupted` shape in
 /// `henyey_db::queries` (matching the structured `ErrorCode`, NOT the message
 /// string).
+///
+/// The match itself now lives on the error type as
+/// [`henyey_db::DbError::is_transient_busy`] (#3801) so that `crates/history`
+/// — which cannot see this `pub(crate)` helper, and must not depend on
+/// `henyey-app` — shares ONE definition of "transient" instead of a second
+/// copy that could drift. This wrapper is retained so the ~20 existing call
+/// sites (and the `&anyhow::Error` sibling below) are unchanged.
 pub(crate) fn is_transient_db_busy(error: &henyey_db::DbError) -> bool {
-    matches!(
-        error,
-        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::DatabaseBusy
-                    | rusqlite::ffi::ErrorCode::DatabaseLocked,
-                ..
-            },
-            _,
-        ))
-    )
+    error.is_transient_busy()
 }
 
 /// `&anyhow::Error` sibling of [`is_transient_db_busy`] for the ledger-close

@@ -293,7 +293,6 @@ macro_rules! metric_catalog {
 //
 // Reserved (NOT yet in the vocabulary — added by the PR that wires the
 // emitter, so no misleading always-zero series exists in between):
-//   - `catchup_meta` — `crates/history/src/catchup/persist.rs` `emit_meta` (#3801)
 //   - `tx_set_gc`    — `crates/herder/src/herder.rs` tx-set GC purge (#3806)
 
 /// Ledger-close persist DB commit (`commit_with_busy_retry`, bounded retry).
@@ -311,6 +310,15 @@ pub const SITE_PUBLISH_QUEUE_EVICT: &str = "publish_queue_evict";
 pub const SITE_PEER_FAILURE_PRUNE: &str = "peer_failure_prune";
 /// Peer-record update from the overlay peer-event loop (log-and-continue).
 pub const SITE_PEER_RECORD_UPDATE: &str = "peer_record_update";
+/// Catchup-replay `LedgerCloseMeta` row write (bounded retry, then
+/// log-and-continue — an RPC-visible hole catchup never revisits, #3801).
+///
+/// Emitted from `crates/history/src/catchup/persist.rs`, which cannot see the
+/// `record_db_busy_*` helpers (`app` → `history`, never the reverse) and so
+/// emits by literal counter name through the global `metrics` facade — the
+/// same split as the `stellar_history_*` counters above. This constant exists
+/// for the catalog/pre-registration side of that split.
+pub const SITE_CATCHUP_META: &str = "catchup_meta";
 
 /// The complete, closed `site` label vocabulary for the `henyey_db_busy_*`
 /// labelled counters. Pinned by `test_db_busy_site_label_vocabulary_pinned`.
@@ -322,6 +330,7 @@ pub const DB_BUSY_SITES: &[&str] = &[
     SITE_PUBLISH_QUEUE_EVICT,
     SITE_PEER_FAILURE_PRUNE,
     SITE_PEER_RECORD_UPDATE,
+    SITE_CATCHUP_META,
 ];
 
 // ── Metric catalog ─────────────────────────────────────────────────────
@@ -1008,7 +1017,7 @@ metric_catalog! {
                 retained unchanged for #3640 continuity — do NOT sum the two",
             "site", [SITE_LEDGER_CLOSE_PERSIST, SITE_CATCHUP_PERSIST, SITE_LEDGER_CLOSE_META,
                      SITE_RETENTION_TRIM, SITE_PUBLISH_QUEUE_EVICT, SITE_PEER_FAILURE_PRUNE,
-                     SITE_PEER_RECORD_UPDATE];
+                     SITE_PEER_RECORD_UPDATE, SITE_CATCHUP_META];
         DB_BUSY_WRITE_DROPPED_TOTAL = "henyey_db_busy_write_dropped_total"
             => "DB writes ultimately NOT applied because of a transient \
                 SQLITE_BUSY/LOCKED — retry-budget exhaustion, or a \
@@ -1023,7 +1032,7 @@ metric_catalog! {
                 is not a missing increment",
             "site", [SITE_LEDGER_CLOSE_PERSIST, SITE_CATCHUP_PERSIST, SITE_LEDGER_CLOSE_META,
                      SITE_RETENTION_TRIM, SITE_PUBLISH_QUEUE_EVICT, SITE_PEER_FAILURE_PRUNE,
-                     SITE_PEER_RECORD_UPDATE];
+                     SITE_PEER_RECORD_UPDATE, SITE_CATCHUP_META];
     }
 
     histograms {
@@ -2567,10 +2576,10 @@ mod tests {
         }
     }
 
-    /// #3802: pin the exact `site` vocabulary. #3801 (`catchup_meta`) and
-    /// #3806 (`tx_set_gc`) each add their value in the SAME PR that wires the
-    /// emitter, so this test failing is the intended, reviewed signal — not
-    /// drift. It also pins the label contract #3801's plan was written against.
+    /// #3802: pin the exact `site` vocabulary. #3806 (`tx_set_gc`) adds its
+    /// value in the SAME PR that wires the emitter, so this test failing is the
+    /// intended, reviewed signal — not drift. `catchup_meta` landed with its
+    /// emitter in #3801 (`crates/history/src/catchup/persist.rs`).
     #[test]
     fn test_db_busy_site_label_vocabulary_pinned() {
         assert_eq!(
@@ -2583,16 +2592,13 @@ mod tests {
                 "publish_queue_evict",
                 "peer_failure_prune",
                 "peer_record_update",
+                "catchup_meta",
             ],
             "the db-busy site vocabulary changed; update the catalog entries \
              and confirm the change is deliberate"
         );
 
         // Reserved values must NOT be present until their emitter lands.
-        assert!(
-            !DB_BUSY_SITES.contains(&"catchup_meta"),
-            "catchup_meta is reserved for #3801 and must land with its emitter"
-        );
         assert!(
             !DB_BUSY_SITES.contains(&"tx_set_gc"),
             "tx_set_gc is reserved for #3806 and must land with its emitter"

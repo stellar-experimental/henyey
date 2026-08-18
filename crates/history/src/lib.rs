@@ -215,6 +215,21 @@ pub struct CatchupResult {
 
     /// Number of bucket files downloaded during catchup.
     pub buckets_downloaded: u32,
+
+    /// Number of `ledger_close_meta` rows that could NOT be persisted during
+    /// this run (#3801).
+    ///
+    /// Normally zero. A non-zero value means the `ledger_close_meta` table has
+    /// that many permanent, RPC-visible holes in the replayed range — catchup
+    /// does not revisit a ledger, so the rows are never rewritten. Per-ledger
+    /// detail (sequence + cause) is logged at `error!` by `emit_meta`, and the
+    /// transient-busy subset is also counted by
+    /// `henyey_db_busy_write_dropped_total{site="catchup_meta"}`.
+    ///
+    /// Catchup *completion* is the first boundary at which a caller can react
+    /// safely: reacting per-ledger is not possible, because aborting the replay
+    /// there would discard the whole batch and resume past the gap (see #3811).
+    pub meta_rows_dropped: u32,
 }
 
 impl std::fmt::Display for CatchupResult {
@@ -226,7 +241,18 @@ impl std::fmt::Display for CatchupResult {
             &self.ledger_hash.to_hex()[..16],
             self.buckets_downloaded,
             self.ledgers_applied
-        )
+        )?;
+        // Mentioned only when non-zero: this is a data-loss report, and a
+        // permanent "0 dropped" suffix on every normal catchup would train
+        // operators to skim past it.
+        if self.meta_rows_dropped > 0 {
+            write!(
+                f,
+                " — WARNING: {} ledger_close_meta rows DROPPED (RPC-visible gaps)",
+                self.meta_rows_dropped
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1002,6 +1028,34 @@ mod archive_manager_tests {
             has.current_buckets.len(),
             henyey_bucket::BUCKET_LIST_LEVELS,
             "recovered HAS must have one entry per live bucket level"
+        );
+    }
+
+    /// #3801: a dropped `ledger_close_meta` row is an RPC-visible gap, so the
+    /// catchup summary must name it when non-zero — and stay quiet when zero.
+    #[test]
+    fn test_catchup_result_display_reports_dropped_meta() {
+        let base = CatchupResult {
+            ledger_seq: 100,
+            ledger_hash: henyey_common::Hash256::ZERO,
+            ledgers_applied: 5,
+            buckets_downloaded: 3,
+            meta_rows_dropped: 0,
+        };
+        let clean = base.to_string();
+        assert!(
+            !clean.contains("meta"),
+            "a clean catchup must not mention dropped meta: {clean}"
+        );
+
+        let lossy = CatchupResult {
+            meta_rows_dropped: 2,
+            ..base
+        }
+        .to_string();
+        assert!(
+            lossy.contains('2') && lossy.contains("meta"),
+            "a lossy catchup must report the dropped meta count: {lossy}"
         );
     }
 }
