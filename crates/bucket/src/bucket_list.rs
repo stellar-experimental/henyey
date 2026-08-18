@@ -572,6 +572,61 @@ impl AsyncMergeHandle {
         }
     }
 
+    /// Non-blocking counterpart to [`resolve`](Self::resolve).
+    ///
+    /// If the background merge has already finished, cache its result so a later
+    /// `resolve()` (i.e. the boundary `commit()`) takes the instant `Ready` fast
+    /// path instead of parking the event loop for the rest of a deep-level merge
+    /// (#3867). If the merge is still running, leave the handle `Pending` and
+    /// return immediately — this NEVER blocks. Idempotent: a no-op on an
+    /// already-`Ready` handle.
+    ///
+    /// Success and both failure modes are cached using the EXACT same
+    /// classification as `resolve()` so the eager (poll) and lazy (resolve)
+    /// observation paths can never diverge — in particular the `Closed`
+    /// (cancelled-merge) arm reproduces `resolve()`'s
+    /// `BucketError::Merge("merge task was cancelled")` before wrapping it in a
+    /// structured [`MergeError`], preserving #3478 errno classification.
+    pub fn try_resolve(&mut self) {
+        // Already resolved (success or failure): nothing to do, idempotent.
+        if matches!(self.state, MergeRecvState::Ready(_)) {
+            return;
+        }
+
+        // Non-blocking peek. The borrow of `self.state` ends when `try_recv`
+        // returns an owned value, so the assignments below are free to replace
+        // `self.state`.
+        let recv = match self.state {
+            MergeRecvState::Pending(ref mut rx) => rx.try_recv(),
+            MergeRecvState::Ready(_) => unreachable!("already checked for Ready above"),
+        };
+
+        match recv {
+            Ok(Ok(bucket)) => {
+                self.state = MergeRecvState::Ready(Ok(Arc::new(bucket)));
+            }
+            Ok(Err(e)) => {
+                // Preserve the structured class/errno exactly as resolve() does
+                // (bucket_list.rs resolve() Err arm, #3478).
+                let merge_err = crate::merge_map::MergeError::from_bucket_error(&e);
+                self.state = MergeRecvState::Ready(Err(merge_err));
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                // Merge still running — leave Pending. Never blocks.
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                // Sender dropped without sending. resolve() maps a closed channel
+                // (blocking_recv_oneshot's RecvError) to
+                // BucketError::Merge("merge task was cancelled"); classify it
+                // identically here so the two paths cannot diverge.
+                let merge_err = crate::merge_map::MergeError::from_bucket_error(
+                    &BucketError::Merge("merge task was cancelled".to_string()),
+                );
+                self.state = MergeRecvState::Ready(Err(merge_err));
+            }
+        }
+    }
+
     /// Test-only constructor: build a handle already resolved to a failure
     /// carrying a structured [`MergeError`] (with its real `errno`).
     ///
@@ -682,6 +737,21 @@ impl SharedMergeHandle {
         let result = blocking_recv_watch(&mut self.receiver)?;
         self.cached_result = Some(result.clone());
         result.map_err(|e| e.to_bucket_error())
+    }
+
+    /// Non-blocking counterpart to [`resolve`](Self::resolve). If the shared
+    /// merge has already published its result, cache it so the boundary
+    /// `commit()` takes the fast path; otherwise leave the handle unresolved and
+    /// return immediately. NEVER blocks. Idempotent on an already-cached handle.
+    pub fn try_resolve(&mut self) {
+        if self.cached_result.is_some() {
+            return;
+        }
+        // watch::Receiver::borrow() reads the current value without waiting.
+        let current = self.receiver.borrow().clone();
+        if let Some(result) = current {
+            self.cached_result = Some(result);
+        }
     }
 }
 
@@ -980,6 +1050,23 @@ impl BucketLevel {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Non-blocking pre-resolution of this level's pending merge.
+    ///
+    /// If `next` is an async/shared merge that has already completed in the
+    /// background, cache its result (`Ready`) so the eventual boundary
+    /// `commit()` takes the instant fast path rather than blocking the event
+    /// loop for the remainder of a deep-level merge (#3867). No-op for
+    /// `InMemory`, absent, or still-running merges. Never blocks, never commits,
+    /// and never records into `completed_merges` — `commit()` remains the sole
+    /// site that promotes `next → curr` and records the completed merge.
+    pub fn poll_pending_merge(&mut self) {
+        match &mut self.next {
+            Some(PendingMerge::Async(handle)) => handle.try_resolve(),
+            Some(PendingMerge::Shared(handle)) => handle.try_resolve(),
+            _ => {}
+        }
     }
 
     /// The `MergeKey` of this level's pending merge, if any. Used to clear the
@@ -1809,6 +1896,28 @@ impl BucketList {
         Ok(())
     }
 
+    /// Non-blocking sweep that pre-resolves any completed background merges
+    /// across all levels, so a later boundary `commit()` doesn't park the event
+    /// loop on a deep-level merge that has already finished (#3867).
+    ///
+    /// A level-≥6 merge is *prepared* thousands of ledgers before its commit
+    /// boundary, so it finishes in the background long beforehand; only its
+    /// *observation* was deferred to the blocking `resolve()` under the held
+    /// `RwLock<BucketList>` write lock. Calling this at the top of every
+    /// `add_batch` observes such merges eagerly and non-blockingly (microseconds).
+    ///
+    /// Unlike [`resolve_all_pending_merges`](Self::resolve_all_pending_merges),
+    /// this never blocks and never fails: a still-running merge is left pending,
+    /// and any classified failure stays cached on the handle to be surfaced by
+    /// the eventual blocking `resolve()` at commit. It touches only the `next`
+    /// pending-merge field and never `curr`/`snap`, so it cannot change any
+    /// consensus/interop hash.
+    pub fn poll_pending_merges(&mut self) {
+        for level in &mut self.levels {
+            level.poll_pending_merge();
+        }
+    }
+
     /// Get the hash of the entire BucketList.
     ///
     /// This is computed by hashing all level hashes together.
@@ -2409,6 +2518,15 @@ impl BucketList {
                 "ledger sequence must be > 0".to_string(),
             ));
         }
+
+        // #3867: eagerly, non-blockingly observe any background merge that has
+        // already finished, so the spill/commit loop below takes the instant
+        // `Ready` fast path instead of parking the held write lock (and every
+        // event-loop bucket-list reader) for the rest of a deep-level merge.
+        // This is a microsecond sweep; the genuinely-unavoidable case (a merge
+        // slower than its whole window) still blocks at commit, matching
+        // stellar-core.
+        self.poll_pending_merges();
 
         // Clear completed merges from previous call
         self.completed_merges.clear();
@@ -7308,7 +7426,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_try_resolve_async_empty_leaves_pending() {
         let (sender, receiver) = oneshot::channel::<Result<Bucket>>();
-        let merge_key = MergeKey::new(DeadEntryPolicy::Keep, Hash256::default(), Hash256::default());
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
         let mut handle = AsyncMergeHandle {
             state: MergeRecvState::Pending(receiver),
             level: 6,
@@ -7406,7 +7528,11 @@ mod tests {
 
         let (sender, receiver) = watch::channel::<Option<MergeResult>>(None);
         let metadata = SharedMergeMetadata {
-            merge_key: MergeKey::new(DeadEntryPolicy::Keep, Hash256::default(), Hash256::default()),
+            merge_key: MergeKey::new(
+                DeadEntryPolicy::Keep,
+                Hash256::default(),
+                Hash256::default(),
+            ),
             input_curr_hash: Hash256::from_bytes([3u8; 32]),
             input_snap_hash: Hash256::from_bytes([4u8; 32]),
             input_file_paths: vec![],
@@ -7450,7 +7576,11 @@ mod tests {
         let before = bl.hash();
         bl.poll_pending_merges();
         bl.poll_pending_merges();
-        assert_eq!(bl.hash(), before, "poll on empty levels must not change state");
+        assert_eq!(
+            bl.hash(),
+            before,
+            "poll on empty levels must not change state"
+        );
 
         // InMemory merge (level 0 style): poll must not touch it.
         let inmem = Bucket::from_entries(vec![BucketListEntry::Liveentry(make_account_entry(
@@ -7480,7 +7610,14 @@ mod tests {
         for seq in 1..=8u32 {
             let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
             reference
-                .add_batch(seq, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
+                .add_batch(
+                    seq,
+                    TEST_PROTOCOL,
+                    BucketListType::Live,
+                    vec![entry],
+                    vec![],
+                    vec![],
+                )
                 .unwrap();
         }
         reference.resolve_all_pending_merges().unwrap();
@@ -7499,7 +7636,14 @@ mod tests {
         for seq in 1..=8u32 {
             let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
             polled
-                .add_batch(seq, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
+                .add_batch(
+                    seq,
+                    TEST_PROTOCOL,
+                    BucketListType::Live,
+                    vec![entry],
+                    vec![],
+                    vec![],
+                )
                 .unwrap();
             // Let any in-flight background merge settle, then poll.
             for _ in 0..50 {
