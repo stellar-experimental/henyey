@@ -7195,4 +7195,346 @@ mod tests {
         bl.resolve_all_pending_merges()
             .expect("re-issued merge must resolve cleanly after disk recovery");
     }
+
+    // ============ #3867: non-blocking pre-resolution of background merges ============
+    //
+    // The event loop parked 15-100s in the `broadcast` phase because a deep-level
+    // (>=6) background merge that had already finished was only *observed* by the
+    // blocking `resolve()` at its commit boundary, holding the BucketList write
+    // lock for the whole remaining merge. `poll_pending_merges()` observes such a
+    // completed merge eagerly and non-blockingly so the boundary `commit()` takes
+    // the instant `Ready` fast path. These tests do not exist on `origin/main`
+    // (the `try_resolve`/`poll_pending_merges` API is added by this fix), so the
+    // module fails to compile there — the failing-first signal for the regression.
+
+    /// A completed, real disk-backed async merge is cached `Ready` (HAS state 1
+    /// `Output`) by a non-blocking `poll_pending_merges()`, with no blocking
+    /// `resolve()`. On main a finished-but-unobserved merge stays state 2
+    /// (`Inputs`) until a blocking `resolve()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_poll_pending_merges_caches_completed_async_merge() {
+        use crate::bucket::Bucket;
+        use crate::manager::canonical_bucket_filename;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1_mem = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry1)]).unwrap();
+        let bucket2_mem = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry2)]).unwrap();
+
+        let path1 = dir.join(canonical_bucket_filename(&bucket1_mem.hash()));
+        let path2 = dir.join(canonical_bucket_filename(&bucket2_mem.hash()));
+        bucket1_mem.save_to_xdr_file(&path1).unwrap();
+        bucket2_mem.save_to_xdr_file(&path2).unwrap();
+
+        let bucket1 = Arc::new(Bucket::from_xdr_file_disk_backed(&path1).unwrap());
+        let bucket2 = Arc::new(Bucket::from_xdr_file_disk_backed(&path2).unwrap());
+
+        // Learn the deterministic merge output hash on a throwaway probe (via a
+        // blocking resolve) so we can assert the polled result matches it.
+        let expected_output_hash = {
+            let mut probe = BucketList::new();
+            let probe_handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+                curr: bucket1.clone(),
+                snap: bucket2.clone(),
+                keep_dead_entries: DeadEntryPolicy::Remove,
+                protocol_version: TEST_PROTOCOL,
+                normalize_init: InitEntryPolicy::NormalizeToLive,
+                shadow_buckets: vec![],
+                level: 1,
+                bucket_dir: Some(dir.clone()),
+                counters: None,
+                bucket_list_db: BucketListDbConfig::default(),
+            });
+            probe.levels[1].next = Some(PendingMerge::Async(probe_handle));
+            probe.resolve_all_pending_merges().unwrap();
+            probe.levels[1].next().unwrap().hash()
+        };
+
+        // The system under test: a level whose async merge runs in the background.
+        let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+            curr: bucket1.clone(),
+            snap: bucket2.clone(),
+            keep_dead_entries: DeadEntryPolicy::Remove,
+            protocol_version: TEST_PROTOCOL,
+            normalize_init: InitEntryPolicy::NormalizeToLive,
+            shadow_buckets: vec![],
+            level: 1,
+            bucket_dir: Some(dir.clone()),
+            counters: None,
+            bucket_list_db: BucketListDbConfig::default(),
+        });
+        let mut bl = BucketList::new();
+        bl.levels[1].next = Some(PendingMerge::Async(handle));
+
+        // Drive completion with a bounded NON-BLOCKING poll loop (never resolve()).
+        // The merge is tiny and finishes quickly; poll caches it as state 1.
+        let mut polled_state = None;
+        for _ in 0..500 {
+            bl.poll_pending_merges();
+            polled_state = bl.levels[1].pending_merge_state();
+            if matches!(polled_state, Some(PendingMergeState::Output(_))) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            polled_state,
+            Some(PendingMergeState::Output(expected_output_hash)),
+            "poll_pending_merges() must cache a completed async merge as HAS state 1 (Output) \
+             non-blockingly"
+        );
+
+        // The subsequent commit must take the already-Ready fast path and promote
+        // the pre-cached output into curr.
+        let recorded = bl.levels[1].commit().unwrap();
+        assert!(
+            recorded.is_some(),
+            "commit() of a pre-resolved async merge must still record the completed merge"
+        );
+        assert_eq!(
+            bl.levels[1].curr.hash(),
+            expected_output_hash,
+            "commit() must promote the pre-cached merge output into curr"
+        );
+    }
+
+    /// `try_resolve()` on a still-running async merge leaves it `Pending`
+    /// (HAS state 2) and never blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_try_resolve_async_empty_leaves_pending() {
+        let (sender, receiver) = oneshot::channel::<Result<Bucket>>();
+        let merge_key = MergeKey::new(DeadEntryPolicy::Keep, Hash256::default(), Hash256::default());
+        let mut handle = AsyncMergeHandle {
+            state: MergeRecvState::Pending(receiver),
+            level: 6,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::from_bytes([7u8; 32]),
+            input_snap_hash: Hash256::from_bytes([8u8; 32]),
+            merge_key,
+        };
+
+        handle.try_resolve();
+        assert!(
+            matches!(handle.state, MergeRecvState::Pending(_)),
+            "try_resolve() must leave an unfinished merge Pending (never block)"
+        );
+
+        let mut level = BucketLevel::new(6);
+        level.next = Some(PendingMerge::Async(handle));
+        level.poll_pending_merge();
+        assert_eq!(
+            level.pending_merge_state(),
+            Some(PendingMergeState::Inputs {
+                curr: Hash256::from_bytes([7u8; 32]),
+                snap: Hash256::from_bytes([8u8; 32]),
+            }),
+            "an unfinished merge must still serialize as HAS state 2 (Inputs) after a poll"
+        );
+
+        // keep the sender alive until here so the channel isn't Closed
+        drop(sender);
+    }
+
+    /// A dropped sender (cancelled merge) makes `try_resolve()` cache the EXACT
+    /// same classified `MergeError` that a blocking `resolve()` produces for the
+    /// same closed channel — the two observation paths must not diverge (#3478).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_try_resolve_async_closed_caches_classified_error() {
+        // Reference: what does a blocking resolve() yield on a closed channel?
+        let (ref_sender, ref_receiver) = oneshot::channel::<Result<Bucket>>();
+        let mut ref_handle = AsyncMergeHandle {
+            state: MergeRecvState::Pending(ref_receiver),
+            level: 6,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key: MergeKey::new(
+                DeadEntryPolicy::Keep,
+                Hash256::default(),
+                Hash256::default(),
+            ),
+        };
+        drop(ref_sender);
+        let ref_err = ref_handle
+            .resolve()
+            .expect_err("resolve() on a closed channel must error");
+
+        // Under test: try_resolve() on an equivalently-closed channel.
+        let (sender, receiver) = oneshot::channel::<Result<Bucket>>();
+        let mut handle = AsyncMergeHandle {
+            state: MergeRecvState::Pending(receiver),
+            level: 6,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key: MergeKey::new(
+                DeadEntryPolicy::Keep,
+                Hash256::default(),
+                Hash256::default(),
+            ),
+        };
+        drop(sender);
+        handle.try_resolve();
+
+        // The cached error must be terminal and re-surface identically to resolve().
+        let try_err = handle
+            .resolve()
+            .expect_err("a Closed channel cached by try_resolve() must stay an error");
+        assert_eq!(
+            try_err.to_string(),
+            ref_err.to_string(),
+            "try_resolve()'s Closed classification must match resolve()'s exactly"
+        );
+        assert_eq!(
+            std::mem::discriminant(&try_err),
+            std::mem::discriminant(&ref_err),
+            "try_resolve()'s Closed BucketError variant must match resolve()'s"
+        );
+    }
+
+    /// `SharedMergeHandle::try_resolve()` leaves the handle unresolved while the
+    /// producer is silent, then caches once the producer publishes a result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_try_resolve_shared_pending_then_ready() {
+        use crate::merge_map::SharedMergeMetadata;
+        use tokio::sync::watch;
+
+        let (sender, receiver) = watch::channel::<Option<MergeResult>>(None);
+        let metadata = SharedMergeMetadata {
+            merge_key: MergeKey::new(DeadEntryPolicy::Keep, Hash256::default(), Hash256::default()),
+            input_curr_hash: Hash256::from_bytes([3u8; 32]),
+            input_snap_hash: Hash256::from_bytes([4u8; 32]),
+            input_file_paths: vec![],
+            level: 6,
+        };
+        let mut handle = SharedMergeHandle::new(receiver, metadata);
+
+        handle.try_resolve();
+        assert!(
+            handle.cached_result.is_none(),
+            "try_resolve() must leave a silent shared merge unresolved (never block)"
+        );
+
+        let bucket = Arc::new(
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(make_account_entry(
+                [5u8; 32], 500,
+            ))])
+            .unwrap(),
+        );
+        sender.send(Some(Ok(bucket.clone()))).unwrap();
+
+        handle.try_resolve();
+        assert!(
+            handle.cached_result.is_some(),
+            "try_resolve() must cache the shared merge result once published"
+        );
+        assert_eq!(
+            handle.resolve().unwrap().hash(),
+            bucket.hash(),
+            "the cached shared result must be returned by a subsequent resolve()"
+        );
+    }
+
+    /// `poll_pending_merges()` is idempotent and a no-op on levels with no
+    /// async/shared merge (absent or InMemory).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_poll_pending_merges_idempotent_and_noop_on_empty_level() {
+        let mut bl = BucketList::new();
+
+        // No pending merge anywhere: poll is a harmless no-op, repeatable.
+        let before = bl.hash();
+        bl.poll_pending_merges();
+        bl.poll_pending_merges();
+        assert_eq!(bl.hash(), before, "poll on empty levels must not change state");
+
+        // InMemory merge (level 0 style): poll must not touch it.
+        let inmem = Bucket::from_entries(vec![BucketListEntry::Liveentry(make_account_entry(
+            [9u8; 32], 42,
+        ))])
+        .unwrap();
+        let inmem_hash = inmem.hash();
+        bl.levels[0].next = Some(PendingMerge::InMemory(inmem));
+        bl.poll_pending_merges();
+        bl.poll_pending_merges();
+        assert_eq!(
+            bl.levels[0].pending_merge_state(),
+            Some(PendingMergeState::Output(inmem_hash)),
+            "poll must leave an InMemory merge untouched (already state 1)"
+        );
+    }
+
+    /// Parity guard (Critic B): a non-blocking poll interleaved with `add_batch`
+    /// across a spill boundary yields a BYTE-IDENTICAL bucket-list hash and
+    /// per-level curr/snap hashes vs the same add sequence WITHOUT the poll. The
+    /// poll only changes *when* a finished merge is observed, never the committed
+    /// bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_batch_commit_nonblocking_after_poll() {
+        // Reference run: no interleaved poll.
+        let mut reference = BucketList::new();
+        for seq in 1..=8u32 {
+            let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
+            reference
+                .add_batch(seq, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
+                .unwrap();
+        }
+        reference.resolve_all_pending_merges().unwrap();
+        let ref_hash = reference.hash();
+        let ref_levels: Vec<(Hash256, Hash256)> = reference
+            .levels
+            .iter()
+            .map(|l| (l.curr.hash(), l.snap.hash()))
+            .collect();
+
+        // Polled run: the same adds, but poll (non-blockingly) between each,
+        // giving any finished background merge a chance to be cached as state 1
+        // before its boundary commit.
+        let mut polled = BucketList::new();
+        let mut saw_precached_output = false;
+        for seq in 1..=8u32 {
+            let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
+            polled
+                .add_batch(seq, TEST_PROTOCOL, BucketListType::Live, vec![entry], vec![], vec![])
+                .unwrap();
+            // Let any in-flight background merge settle, then poll.
+            for _ in 0..50 {
+                polled.poll_pending_merges();
+                if polled
+                    .levels
+                    .iter()
+                    .any(|l| matches!(l.pending_merge_state(), Some(PendingMergeState::Output(_))))
+                {
+                    saw_precached_output = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        polled.resolve_all_pending_merges().unwrap();
+
+        assert_eq!(
+            polled.hash(),
+            ref_hash,
+            "poll interleaving must not change the bucket-list hash (parity guard)"
+        );
+        let polled_levels: Vec<(Hash256, Hash256)> = polled
+            .levels
+            .iter()
+            .map(|l| (l.curr.hash(), l.snap.hash()))
+            .collect();
+        assert_eq!(
+            polled_levels, ref_levels,
+            "poll interleaving must not change any per-level curr/snap hash (parity guard)"
+        );
+        assert!(
+            saw_precached_output,
+            "at least one background merge must have been observed as pre-cached state 1 by \
+             poll before its boundary commit"
+        );
+    }
 }
