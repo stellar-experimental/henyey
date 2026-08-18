@@ -112,8 +112,8 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | File | Purpose | Writer |
 |------|---------|--------|
 | `build_sha` | Cache of deployed binary's source commit (authoritative source: runtime `/info.commit_hash`; seeded by build step) | check 10 (after successful build or runtime self-heal) and `monitor-loop` step 5 |
-| `last_ledger` | STUCK detection state (check 4) | check 4 |
-| `last_ledger_count` | STUCK confirmation counter (check 4) | check 4 |
+| `last_ledger` | STUCK detection state (check 2) — MUST be rewritten every tick the ledger advances, or the STUCK arm goes silently inert | check 2 (write), check 3a/3c (remove on wipe) |
+| `last_ledger_count` | STUCK confirmation counter (check 2) | check 2 |
 | `wipe_attempted_at` | Epoch of most recent (3a) wipe; read by (3d) post-wipe recurrence guard | check 3a (write), check 3d marker-clear rule (remove) |
 | `tick-history.jsonl` | daily-summary aggregation | tick epilogue |
 | `metrics/current.prom` | latest Prometheus scrape | check 12 |
