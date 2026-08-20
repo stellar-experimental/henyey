@@ -136,6 +136,60 @@ def test_guard_primary_absent_skipped():
     assert result["skip_reason"] == "metric not found"
 
 
+# ── guard_extraction is honored (#3841) ────────────────────────────────────────
+#
+# The shipped jemalloc-frag-high alarm uses the default guard_extraction=form1,
+# so the guard's `extraction` argument is only exercised implicitly. These tests
+# pin that eval_gauge actually threads `guard_extraction` into extract_value.
+#
+# The discriminator: eval_gauge calls extract_value(current, guard_metric,
+# guard_extraction) with NO label selector, so form1 (the default) returns the
+# FIRST series while a sum extraction (form3) returns the TOTAL. A guard scrape
+# with two labeled sub-series, each individually below the threshold but summing
+# above it, therefore fires ONLY when the sum extraction is honored — and would
+# NOT fire if guard_extraction were ignored and form1 silently used instead.
+
+# jemalloc resident reported as two per-arena labeled sub-series: 20 GiB each,
+# summing to 40 GiB (> the 32 GiB guard). No unlabeled series, so form1 falls
+# back to the first sub-series (20 GiB, below the guard).
+def make_current_split_guard(frag):
+    return {
+        "henyey_jemalloc_fragmentation_pct": [({}, float(frag))],
+        "henyey_jemalloc_resident_bytes": [
+            ({"arena": "0"}, float(20 * GIB)),
+            ({"arena": "1"}, float(20 * GIB)),
+        ],
+    }
+
+
+# Same alarm as GUARD_ALARM but the guard uses a sum extraction over the
+# per-arena sub-series.
+SUM_GUARD_ALARM = {**GUARD_ALARM, "guard_extraction": "form3"}
+
+
+def test_guard_extraction_sum_honored():
+    """Guard sub-series sum (40 GiB) > 32 GiB with guard_extraction=form3 → fires.
+
+    Proves eval_gauge passes guard_extraction through to extract_value: the sum
+    of the two 20-GiB sub-series crosses the guard only under a sum extraction.
+    """
+    current = make_current_split_guard(frag=55)
+    states = run_two_ticks(SUM_GUARD_ALARM, current)
+    assert states == ["breach", "firing"], states
+
+
+def test_guard_extraction_default_form1_suppresses():
+    """Control: identical scrape with the default (form1) guard extraction.
+
+    form1 reads only the first 20-GiB sub-series (< 32 GiB guard) → suppressed.
+    This is the counterfactual: the difference from the test above is *solely*
+    the guard_extraction setting, so it pins that the setting is what's honored.
+    """
+    current = make_current_split_guard(frag=55)
+    states = run_two_ticks(GUARD_ALARM, current)  # no guard_extraction → form1
+    assert states == ["ok", "ok"], states
+
+
 # ── validate_catalog ──────────────────────────────────────────────────────────
 
 def _catalog(alarm_overrides):
