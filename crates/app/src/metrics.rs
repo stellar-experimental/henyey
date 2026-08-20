@@ -3124,6 +3124,46 @@ mod tests {
         }
     }
 
+    /// Issue #3842: the jemalloc allocator gauges — in particular
+    /// `henyey_jemalloc_resident_bytes`, which the #3752 `jemalloc-frag-high`
+    /// alarm uses as its firing guard — are in the gauge catalog and
+    /// pre-registered at 0. Pre-registration is what makes the guard metric
+    /// render on every `/metrics` scrape even before its first update, so the
+    /// #3752 fail-toward-silent guard can never become a permanent no-op on a
+    /// real node. This locks that invariant against a future rename/removal.
+    #[test]
+    fn test_jemalloc_gauges_in_catalog() {
+        let gauge_names: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
+        let prereg: HashSet<&str> = ALL_PREREGISTERED_GAUGE_NAMES.iter().copied().collect();
+        for name in [
+            "henyey_jemalloc_resident_bytes",
+            "henyey_jemalloc_fragmentation_pct",
+        ] {
+            assert!(
+                gauge_names.contains(name),
+                "{name} missing from gauge catalog"
+            );
+            assert!(prereg.contains(name), "{name} must be pre-registered at 0");
+        }
+    }
+
+    #[test]
+    fn test_jemalloc_gauges_rendered() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+        for name in [
+            "henyey_jemalloc_resident_bytes",
+            "henyey_jemalloc_fragmentation_pct",
+        ] {
+            assert!(
+                output.contains(name),
+                "{name} not found in rendered metrics"
+            );
+        }
+    }
+
     /// Stage E: 16 history counters and 1 histogram are present in the
     /// catalog with the exact wire names referenced from the `henyey-history`
     /// and `henyey-historywork` crates (which use string literals, not
