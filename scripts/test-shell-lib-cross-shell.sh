@@ -409,6 +409,147 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Assertion group 5.6.5: quarantine-autostamp-manual-clear-guard (#3708).
+#   quarantine_autostamp must FAIL CLOSED against two ambiguity classes so a
+#   closed+merged SIBLING issue can never stamp resolved: over a still-open real
+#   blocker: (1) an explicit MANUAL-CLEAR-ONLY marker means "never auto-stamp",
+#   and (2) a reason bundling more than one distinct #N is ambiguous ("stamp
+#   only when there is exactly one issue ref"). check_quarantine_active also
+#   honors MANUAL-CLEAR-ONLY as defense-in-depth so even a legacy/manual
+#   resolved: stamp cannot false-clear such an entry. gh is mocked (sibling →
+#   MERGED PR → 40-hex SHA) and the VE-green oracle is forced green, so on main
+#   the stamp WOULD land AND clear — each guard/honor test FAILS on origin/main.
+#
+#   Note the deliberate fail-closed choice in the multi-ref case: a legitimate
+#   single-blocker entry whose prose incidentally mentions a second #N will also
+#   be left un-stamped and governed by the per-hunk content-check + manual
+#   removal — an acceptable, recoverable over-block, not a false-clear.
+# ─────────────────────────────────────────────────────────────────────────────
+assert_manual_clear_guard() {
+  local shbin="$1" shname="$2"
+  local bad="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local fix="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+  # gh mock: any issue view → PR 707; any pr view → merged 40-hex SHA. Mirrors
+  # the roundtrip mock's --jq shapes so autostamp WOULD stamp absent the guards.
+  local gh_mock="
+    gh() {
+      case \"\$1\" in
+        issue) printf '%s\n' 707 ;;
+        pr) printf '%s\n' '$fix' ;;
+        *) return 0 ;;
+      esac
+    };
+  "
+  # git mock for the content-check: sha is an ancestor and the single hunk
+  # reverse-applies (harmful content PRESENT) → the content-check BLOCKS.
+  local git_present_mock="
+    git() {
+      case \"\$1\" in
+        merge-base) return 0 ;;
+        diff) printf 'diff --git a/f.rs b/f.rs\nindex 1111111..2222222 100644\n--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,3 @@ mod m {\n+    harmful_line\n }\n'; return 0 ;;
+        apply) return 0 ;;
+        *) return 0 ;;
+      esac
+    };
+  "
+
+  # --- Sub-test 1: MANUAL-CLEAR-ONLY + bundled #N (the live #3708 scenario).
+  local qfile1="$SCRATCH/mcguard-bundle-$shname.txt"
+  printf '%s regression: post-restart SCP stall #3582/#3702 family. MANUAL-CLEAR-ONLY\n' "$bad" > "$qfile1"
+  local code1="
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    $gh_mock
+    quarantine_autostamp '$qfile1';
+    parse_quarantine_file '$qfile1';
+    printf '%s' \"\$QUARANTINE_RESOLVED\"
+  "
+  run_in_shell "$shbin" "$code1"
+  local l1="quarantine-autostamp-manual-clear-guard[$shname]: MANUAL-CLEAR-ONLY + bundled #N never stamps"
+  if [[ "$_RC" -eq 0 && "$_STDOUT" == "-" ]]; then ok "$l1"; else
+    notok "$l1" "rc=$_RC" "expected resolved '-'" "got: '$_STDOUT'" "stderr: $_STDERR"; fi
+
+  # --- Sub-test 2: MANUAL-CLEAR-ONLY alone, single #N (isolates guard 1).
+  local qfile2="$SCRATCH/mcguard-only-$shname.txt"
+  printf '%s regression #3582 MANUAL-CLEAR-ONLY\n' "$bad" > "$qfile2"
+  local code2="
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    $gh_mock
+    quarantine_autostamp '$qfile2';
+    parse_quarantine_file '$qfile2';
+    printf '%s' \"\$QUARANTINE_RESOLVED\"
+  "
+  run_in_shell "$shbin" "$code2"
+  local l2="quarantine-autostamp-manual-only[$shname]: MANUAL-CLEAR-ONLY marker skips stamp"
+  if [[ "$_RC" -eq 0 && "$_STDOUT" == "-" ]]; then ok "$l2"; else
+    notok "$l2" "rc=$_RC" "expected resolved '-'" "got: '$_STDOUT'" "stderr: $_STDERR"; fi
+
+  # --- Sub-test 3: bundled #N, NO marker (isolates guard 2, fail-closed).
+  local qfile3="$SCRATCH/mcguard-multi-$shname.txt"
+  printf '%s regression: stall #3582/#3702 family\n' "$bad" > "$qfile3"
+  local code3="
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    $gh_mock
+    quarantine_autostamp '$qfile3';
+    parse_quarantine_file '$qfile3';
+    printf '%s' \"\$QUARANTINE_RESOLVED\"
+  "
+  run_in_shell "$shbin" "$code3"
+  local l3="quarantine-autostamp-multi-ref[$shname]: >1 distinct #N fails closed (no stamp)"
+  if [[ "$_RC" -eq 0 && "$_STDOUT" == "-" ]]; then ok "$l3"; else
+    notok "$l3" "rc=$_RC" "expected resolved '-'" "got: '$_STDOUT'" "stderr: $_STDERR"; fi
+
+  # --- Sub-test 4: triage obligation — the exact live #3708 scenario. On main
+  # autostamp stamps the merged sibling's SHA and step 2 (merge-base 0 + forced
+  # VE-green) FALSE-CLEARS → clear/rc=1. With the guards the stamp is skipped so
+  # the entry falls to the per-hunk content-check, which BLOCKS.
+  local qfile4="$SCRATCH/mcguard-active-$shname.txt"
+  printf '%s regression: post-restart SCP stall #3582/#3702 family. MANUAL-CLEAR-ONLY\n' "$bad" > "$qfile4"
+  local code4="
+    quarantine_resolved_is_ve_green() { return 0; };
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    $gh_mock
+    quarantine_autostamp '$qfile4';
+    $git_present_mock
+    rc=0; check_quarantine_active '$qfile4' || rc=\$?;
+    printf '%s/%s' \"\$rc\" \"\$QUARANTINE_STATUS\"
+  "
+  run_in_shell "$shbin" "$code4"
+  local l4="quarantine-manual-clear-blocks-active[$shname]: content-check blocks after skipped stamp"
+  if [[ "$_RC" -eq 0 && "$_STDOUT" == "0/blocked_active" ]]; then ok "$l4"; else
+    notok "$l4" "rc=$_RC" "expected 0/blocked_active" "got: '$_STDOUT'" "stderr: $_STDERR"; fi
+
+  # --- Sub-test 5: check-side defense-in-depth — a pre-stamped resolved: on a
+  # MANUAL-CLEAR-ONLY entry must NOT false-clear at step 2. Override the VE-green
+  # oracle to green BEFORE sourcing (the lib only default-defines it under a
+  # command -v guard, so the shadow must exist first); mock git ancestor +
+  # present hunk. On main step 2 clears (rc=1/clear); with the honor it blocks.
+  local qfile5="$SCRATCH/mcguard-check-$shname.txt"
+  printf '%s regression stall #3702 family. MANUAL-CLEAR-ONLY resolved:%s\n' "$bad" "$fix" > "$qfile5"
+  local code5="
+    quarantine_resolved_is_ve_green() { return 0; };
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    $git_present_mock
+    rc=0; check_quarantine_active '$qfile5' || rc=\$?;
+    printf '%s/%s' \"\$rc\" \"\$QUARANTINE_STATUS\"
+  "
+  run_in_shell "$shbin" "$code5"
+  local l5="quarantine-check-manual-clear-honored[$shname]: MANUAL-CLEAR-ONLY blocks step-2 resolved clear"
+  if [[ "$_RC" -eq 0 && "$_STDOUT" == "0/blocked_active" ]]; then ok "$l5"; else
+    notok "$l5" "rc=$_RC" "expected 0/blocked_active" "got: '$_STDOUT'" "stderr: $_STDERR"; fi
+}
+assert_manual_clear_guard bash bash
+if [[ "$HAVE_ZSH" -eq 1 ]]; then
+  assert_manual_clear_guard zsh zsh
+else
+  skip "quarantine-autostamp-manual-clear-guard[zsh]: MANUAL-CLEAR-ONLY + bundled #N never stamps" "zsh not installed"
+  skip "quarantine-autostamp-manual-only[zsh]: MANUAL-CLEAR-ONLY marker skips stamp" "zsh not installed"
+  skip "quarantine-autostamp-multi-ref[zsh]: >1 distinct #N fails closed (no stamp)" "zsh not installed"
+  skip "quarantine-manual-clear-blocks-active[zsh]: content-check blocks after skipped stamp" "zsh not installed"
+  skip "quarantine-check-manual-clear-honored[zsh]: MANUAL-CLEAR-ONLY blocks step-2 resolved clear" "zsh not installed"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Assertion group 5.7: prune-metrics-archive-roundtrip-both-shells (#3724).
 #   prune_metrics_archive orders the archive by MTIME (array-free single find),
 #   so it evicts the true-oldest snapshots even when the archive holds mixed
