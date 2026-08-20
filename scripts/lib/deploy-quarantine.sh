@@ -36,6 +36,23 @@
 #     onto a hold:until entry — the sentinel is manual-lifecycle-only (this
 #     also prevents the #3708 bundled-`#N` false-clear class on exactly the
 #     entries that must not auto-clear).
+#   - An optional `MANUAL-CLEAR-ONLY` marker (#3708) MAY appear anywhere in the
+#     reason. It is matched as a LITERAL, CASE-SENSITIVE, boundary-anchored
+#     token (operators must use the exact spelling). It pins the entry to
+#     operator-only lifecycle: quarantine_autostamp NEVER auto-stamps such an
+#     entry, and check_quarantine_active NEVER auto-clears it via the resolved
+#     token (defense-in-depth — even a legacy/manual `resolved:` stamp cannot
+#     false-clear it); the entry stays governed by the per-hunk content-check
+#     until the operator removes it. Use it when a reason must bundle sibling/
+#     family refs but the real blocker is a specific still-open issue.
+#   - AUTOSTAMP FAIL-CLOSED RULE (#3708): quarantine_autostamp stamps `resolved:`
+#     only when the reason references EXACTLY ONE distinct `#N` issue ref. A
+#     reason bundling more than one distinct `#N` (`#3582/#3702 family`) is
+#     ambiguous about which ref is the blocker, so a closed+merged sibling must
+#     never stamp over a still-open real blocker — such entries are left
+#     un-stamped and governed by the content-check + manual removal. (An entry
+#     whose prose incidentally mentions a second `#N` is likewise left
+#     un-stamped — an acceptable, recoverable over-block, never a false-clear.)
 #   - Lines starting with # (after optional whitespace) are comments
 #   - Blank/whitespace-only lines are skipped
 #   - CRLF is stripped during parsing
@@ -550,7 +567,16 @@ check_quarantine_active() {
     # hold existed to prevent. Requiring VE-green mirrors the selector's own
     # notion of "deployable", so the quarantine lifts only once a fix-containing
     # sha is actually a deploy target.
-    if [[ "$resolved" =~ ^[0-9a-f]{40}$ && "$resolved" != "$sha" ]]; then
+    # Defense-in-depth (#3708): a MANUAL-CLEAR-ONLY entry NEVER auto-clears via
+    # the resolved token — even a legacy/manual `resolved:` stamp must not
+    # false-clear it. Skip step 2 entirely and fall through to the per-hunk
+    # content-check (step 3), parallel to how a hold:until entry is honored in
+    # both quarantine_autostamp and here. This is an isolated block: it only
+    # suppresses the step-2 clear for such entries; the resolved-token logic is
+    # otherwise unchanged.
+    if _quarantine_is_manual_clear_only "$reason"; then
+      : # manual-clear-only → do not auto-clear; defer to the content-check
+    elif [[ "$resolved" =~ ^[0-9a-f]{40}$ && "$resolved" != "$sha" ]]; then
       resolved_rc=0
       git merge-base --is-ancestor "$resolved" origin/main 2>/dev/null || resolved_rc=$?
       if [[ "$resolved_rc" -eq 0 ]] && quarantine_resolved_is_ve_green "$resolved"; then
@@ -816,6 +842,44 @@ _quarantine_issue_in_reason() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _quarantine_is_manual_clear_only REASON   (issue #3708)
+#
+# Read-only, pure (no subprocess). Returns 0 iff REASON carries the literal,
+# boundary-anchored `MANUAL-CLEAR-ONLY` marker; non-zero otherwise. The match is
+# CASE-SENSITIVE and exact — operators must use the precise token so a lowercase
+# or paraphrased mention in prose never trips it. The token pins the entry to
+# operator-only lifecycle: quarantine_autostamp never stamps `resolved:` onto it
+# and check_quarantine_active never auto-clears it via the resolved token. Uses
+# the same padded-space + grep boundary idiom as the resolved:/hold: tokens so
+# the extraction is identical under bash and zsh (#3256).
+# ─────────────────────────────────────────────────────────────────────────────
+_quarantine_is_manual_clear_only() {
+  local reason="$1"
+  printf '%s' " $reason " | grep -qE '[[:space:]]MANUAL-CLEAR-ONLY[[:space:]]'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _quarantine_distinct_issue_ref_count REASON   (issue #3708)
+#
+# Read-only, pure (no subprocess beyond grep/sort/wc). Echoes the count of
+# DISTINCT `#N` issue refs in REASON, after excising any `resolved:<40-hex>`
+# token span (reusing _quarantine_issue_in_reason's excision so a fix SHA is
+# never scanned for a `#N`). quarantine_autostamp fails closed when this is >1:
+# a reason bundling sibling/family refs (`#3582/#3702 family`) is ambiguous
+# about WHICH ref is the blocker, so a closed+merged sibling must never stamp
+# `resolved:` over a still-open real blocker — stamp only when there is exactly
+# one issue ref (#3708). `|| true` keeps grep's no-match rc=1 from tripping a
+# caller's pipefail; wc counts the newline-terminated matches (0 on no match).
+# ─────────────────────────────────────────────────────────────────────────────
+_quarantine_distinct_issue_ref_count() {
+  local reason="$1"
+  reason="$(printf '%s' " $reason " | sed -E 's/[[:space:]]resolved:[0-9a-f]{40}([[:space:]])/ \1/g')"
+  printf '%s' "$reason" \
+    | { grep -oE '#[0-9]+' || true; } \
+    | sort -u | wc -l | tr -d '[:space:]'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _quarantine_fix_sha_for_issue ISSUE_NUMBER
 #
 # gh subprocess (best-effort, read-only). Resolves the merge-commit SHA of the
@@ -923,6 +987,24 @@ quarantine_autostamp() {
     # auto-clear. check_quarantine_active releases the hold only once the
     # issue is CLOSED; the operator removes the entry.
     if printf '%s' " $reason " | grep -qE 'hold:until-#[0-9]+'; then
+      continue
+    fi
+
+    # #3708 fail-closed guards against false-clearing on a merged SIBLING issue.
+    # A reason may bundle several refs (`#3582/#3702 family`) or be flagged
+    # operator-only; in either case a closed+merged sibling must NOT stamp
+    # `resolved:` over a still-open real blocker:
+    #   (1) MANUAL-CLEAR-ONLY means "never auto-stamp" — the operator lifts the
+    #       entry by hand once the real blocker is fixed.
+    #   (2) more than one DISTINCT `#N` is ambiguous about which ref is the
+    #       blocker — stamp only when there is exactly one issue ref.
+    # Both are strictly ADDITIONAL skips (never a new clear): the entry stays
+    # governed by check_quarantine_active's per-hunk content-check + manual
+    # removal, exactly like the hold:until manual-lifecycle skip above.
+    if _quarantine_is_manual_clear_only "$reason"; then
+      continue
+    fi
+    if [[ "$(_quarantine_distinct_issue_ref_count "$reason")" -gt 1 ]]; then
       continue
     fi
 
