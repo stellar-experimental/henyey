@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - '.claude/skills/shared/metric-alarms.toml'
+      - '.claude/skills/shared/**'
+      - '.agents/skills/shared/**'
+      - 'scripts/lib/**'
       - 'scripts/ci/check-alarm-versions.py'
       - 'scripts/ci/test_check_alarm_versions.py'
       - '.github/workflows/alarm-version-check.yml'
@@ -41,4 +44,4 @@ jobs:
       - name: Install dependencies
         run: pip install tomli pytest
       - name: Run tests
-        run: python3 -m pytest scripts/ci/test_check_alarm_versions.py -v
+        run: python3 -m pytest scripts/lib/ scripts/ci/ -v
