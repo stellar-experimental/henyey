@@ -2155,7 +2155,10 @@ conclusion `failure`.
 
 **(11b) Job-level** (CRITICAL — catches continue-on-error failures): For the
 latest completed run of EACH distinct workflow name (enumerate dynamically
-from 11a, do NOT hard-code names), check individual jobs:
+from 11a, do NOT hard-code names — and take the run **IDs** from THIS tick's
+11a output, never carry an ID list over from a previous tick: a workflow that
+ran again since then has a new ID, so a reused ID reports a stale conclusion,
+the same wrong-conclusion class as #3883), check individual jobs:
 `gh run view <ID> --json jobs --jq '.jobs[] | select(.conclusion == "failure") | "\(.name)|\(.conclusion)"'`.
 Workflows with continue-on-error jobs report run-level conclusion `success`
 even when jobs fail — you MUST check job-level conclusions. If any jobs have
