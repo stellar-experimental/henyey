@@ -33,6 +33,7 @@ _spec.loader.exec_module(_mod)
 
 eval_gauge = _mod.eval_gauge
 validate_catalog = _mod.validate_catalog
+parse_prom = _mod.parse_prom
 
 GIB = 1024 ** 3
 GUARD_THRESHOLD = 34359738368  # 32 GiB
@@ -273,6 +274,54 @@ def test_shipped_catalog_validates():
     catalog = _load_shipped_catalog()
     errors = validate_catalog(catalog)
     assert errors == [], errors
+
+
+# ── Shipped scrape fixtures export the guard metric (#3842) ────────────────────
+#
+# The #3752 guard fails toward silence when henyey_jemalloc_resident_bytes is
+# absent from a scrape. On a real node the metric is always present (it is a
+# pre-registered gauge that renders at 0 even before its first update, and is
+# .set() together with the primary fragmentation gauge). The residual risk is
+# drift: the offline eval fixtures must stay faithful to a real exposition, and
+# the breach fixture must actually exercise the guard's firing path — otherwise
+# a future edit could silently turn the alarm into a permanent no-op.
+
+FIXTURE_DIR = Path(__file__).resolve().parents[2] / "scripts" / "fixtures" / "eval-alarms"
+
+
+def test_fixture_scrapes_export_guard_metric():
+    """Every shipped eval-alarms scrape fixture carries the guard metric.
+
+    Fails on origin/main: the fixtures omit henyey_jemalloc_resident_bytes
+    entirely (only henyey_jemalloc_fragmentation_pct is present), so a real
+    node's always-present guard metric is not represented offline.
+    """
+    for name in ("healthy-current.prom", "healthy-prev.prom", "breach-current.prom"):
+        parsed = parse_prom(FIXTURE_DIR / name)
+        assert "henyey_jemalloc_resident_bytes" in parsed, (
+            f"{name} is missing henyey_jemalloc_resident_bytes (the #3752 "
+            f"frag-guard metric); a real scrape always exports it"
+        )
+
+
+def test_breach_fixture_fires_frag_high():
+    """The breach fixture drives the shipped jemalloc-frag-high alarm to firing.
+
+    Loads the SHIPPED catalog alarm (not the test's hardcoded GUARD_ALARM) and
+    evaluates it against the parsed breach fixture for two ticks (for_ticks=2).
+
+    Fails on origin/main: breach-current.prom has frag=55 (>50) but no
+    henyey_jemalloc_resident_bytes, so the guard is unconfirmed → fail-silent →
+    the alarm never leaves `ok`. After the fixture adds resident=36 GiB (>32
+    GiB guard) the alarm reaches `firing`, proving the end-to-end path works.
+    """
+    catalog = _load_shipped_catalog()
+    alarm = _find_alarm(catalog, "jemalloc-frag-high")
+    assert alarm is not None, "jemalloc-frag-high not found in shipped catalog"
+
+    current = parse_prom(FIXTURE_DIR / "breach-current.prom")
+    states = run_two_ticks(alarm, current)
+    assert states == ["breach", "firing"], states
 
 
 def test_agents_catalog_matches_claude():
