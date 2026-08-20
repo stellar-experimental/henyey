@@ -1327,13 +1327,13 @@ pub(super) fn update_peer_record(
 
 pub(super) fn compute_peer_backoff_secs(failures: u32) -> i64 {
     use rand::Rng;
-    const SECONDS_PER_BACKOFF: u64 = 10;
-    const MAX_BACKOFF_EXPONENT: u32 = 10;
-    let exp = failures.min(MAX_BACKOFF_EXPONENT);
-    let max = SECONDS_PER_BACKOFF.saturating_mul(1u64 << exp);
+    // The drift-prone ceiling/constants live in the shared
+    // `henyey_common::peer_backoff` module; only the (non-drift-prone) unbiased
+    // sampling stays here. The ceiling is always >= 1, so the range is never
+    // empty.
+    let ceiling = henyey_common::peer_backoff::connect_backoff_ceiling_secs(failures);
     let mut rng = rand::thread_rng();
-    let jitter = rng.gen_range(1..=max.max(1));
-    jitter as i64
+    rng.gen_range(1..=ceiling) as i64
 }
 
 pub(super) fn current_epoch_seconds() -> i64 {

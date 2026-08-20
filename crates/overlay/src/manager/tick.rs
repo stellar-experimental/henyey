@@ -53,11 +53,11 @@ pub(super) const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10)
 /// Replaces the old flat `OUTBOUND_CONNECT_RETRY_DELAY` (10s forever), which
 /// re-dialed dead preferred peers every ~20s indefinitely (#3770).
 fn compute_connect_backoff(num_failures: u32) -> Duration {
-    const SECONDS_PER_BACKOFF: u32 = 10;
-    const MAX_BACKOFF_EXPONENT: u32 = 10;
-    let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
-    let ceiling_secs = (1u32 << backoff_count) * SECONDS_PER_BACKOFF;
-    Duration::from_secs(rand::thread_rng().gen_range(1..=ceiling_secs) as u64)
+    // The drift-prone ceiling/constants live in the shared
+    // `henyey_common::peer_backoff` module; only the (non-drift-prone) unbiased
+    // sampling stays here.
+    let ceiling_secs = henyey_common::peer_backoff::connect_backoff_ceiling_secs(num_failures);
+    Duration::from_secs(rand::thread_rng().gen_range(1..=ceiling_secs))
 }
 
 /// Result of a background DNS resolution of configured peers.
@@ -1852,10 +1852,7 @@ mod tests {
     /// so the test can safely advance simulated time past any possible
     /// jittered draw, without depending on (non-seedable) RNG internals.
     fn max_connect_backoff_secs(num_failures: u32) -> u64 {
-        const SECONDS_PER_BACKOFF: u32 = 10;
-        const MAX_BACKOFF_EXPONENT: u32 = 10;
-        let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
-        ((1u32 << backoff_count) * SECONDS_PER_BACKOFF) as u64
+        henyey_common::peer_backoff::connect_backoff_ceiling_secs(num_failures)
     }
 
     /// Repeated failures against the same preferred peer must accumulate a

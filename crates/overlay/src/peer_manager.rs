@@ -45,12 +45,6 @@ pub const MAX_FAILURES: u32 = 10;
 #[cfg(test)]
 pub const REALLY_DEAD_NUM_FAILURES_CUTOFF: u32 = 120;
 
-/// Seconds per backoff unit.
-const SECONDS_PER_BACKOFF: u64 = 10;
-
-/// Maximum backoff exponent.
-const MAX_BACKOFF_EXPONENT: u32 = 10;
-
 pub use henyey_common::StoredPeerType;
 
 /// Filter for querying peers.
@@ -603,14 +597,14 @@ fn apply_type_update(record: &mut PeerRecord, update: TypeUpdate) {
 
 /// Compute backoff duration based on failure count.
 fn compute_backoff(num_failures: u32) -> Duration {
-    let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
-    let max_seconds = (1u64 << backoff_count) * SECONDS_PER_BACKOFF;
-    // Sample uniformly in [1, max_seconds] (inclusive), matching the spec's
+    // Sample uniformly in [1, ceiling] (inclusive), matching the spec's
     // random_uniform(1, max_seconds). `gen_range` is unbiased, unlike the
     // previous `rand::random() % max_seconds` which had modulo bias. See
-    // OVERLAY_SPEC §10.3 (claim OVERLAY §10.3-1). max_seconds is always >= 1
-    // since backoff_count >= 0 and SECONDS_PER_BACKOFF >= 1.
-    let random_seconds = rand::thread_rng().gen_range(1..=max_seconds);
+    // OVERLAY_SPEC §10.3 (claim OVERLAY §10.3-1). The ceiling is always >= 1,
+    // so the range is never empty. The drift-prone ceiling/constants live in
+    // the shared `henyey_common::peer_backoff` module.
+    let ceiling = henyey_common::peer_backoff::connect_backoff_ceiling_secs(num_failures);
+    let random_seconds = rand::thread_rng().gen_range(1..=ceiling);
     Duration::from_secs(random_seconds)
 }
 
