@@ -79,3 +79,113 @@ pub enum DbError {
     #[error("query exceeded computational budget")]
     QueryBudgetExceeded,
 }
+
+impl DbError {
+    /// Is this the transient, recoverable SQLite busy/locked class?
+    ///
+    /// A SQLite write transaction is atomic: a `DatabaseBusy`/`DatabaseLocked`
+    /// means the transaction NEVER committed, so on-disk state is consistent
+    /// and the operation can be retried or safely dropped-and-retried-later.
+    /// This is the recoverable, environmental class — as opposed to genuine
+    /// corruption or an integrity violation.
+    ///
+    /// The match is NARROW by design (a load-bearing consensus-safety guard):
+    /// only the two busy/locked primary [`rusqlite::ffi::ErrorCode`]s are
+    /// recoverable. Every other SQLite code (`DatabaseCorrupt`,
+    /// `SystemIoFailure`, …) and every other [`DbError`] variant (`Integrity`,
+    /// `Xdr`, `Pool`, …) is NON-transient — genuine corruption must NEVER be
+    /// reclassified recoverable. Matches on the structured `ErrorCode`, NOT on
+    /// the rendered message string.
+    ///
+    /// This is the single, canonical definition of the transient-busy
+    /// predicate; callers in other crates (e.g. `henyey-app`'s
+    /// `is_transient_db_busy`) delegate here rather than re-deriving the match.
+    pub fn is_transient_busy(&self) -> bool {
+        matches!(
+            self,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked,
+                    ..
+                },
+                _,
+            ))
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_error(
+        code: rusqlite::ffi::ErrorCode,
+        extended_code: std::os::raw::c_int,
+        msg: &str,
+    ) -> DbError {
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            Some(msg.to_string()),
+        ))
+    }
+
+    /// The two transient busy/locked SQLite codes must classify as transient.
+    #[test]
+    fn test_is_transient_busy_matches_busy_and_locked() {
+        assert!(
+            sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseBusy,
+                5,
+                "database is locked"
+            )
+            .is_transient_busy(),
+            "DatabaseBusy must be classified transient"
+        );
+        assert!(
+            sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseLocked,
+                6,
+                "database table is locked"
+            )
+            .is_transient_busy(),
+            "DatabaseLocked must be classified transient"
+        );
+    }
+
+    /// Every other SQLite code and every non-`Sqlite` variant must stay
+    /// non-transient — the narrow match is the load-bearing consensus-safety
+    /// guard (genuine corruption must NEVER be reclassified recoverable).
+    #[test]
+    fn test_is_transient_busy_rejects_non_busy() {
+        assert!(
+            !sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseCorrupt,
+                11,
+                "database disk image is malformed"
+            )
+            .is_transient_busy(),
+            "DatabaseCorrupt must NOT be classified transient"
+        );
+        assert!(
+            !sqlite_error(
+                rusqlite::ffi::ErrorCode::SystemIoFailure,
+                266,
+                "disk I/O error"
+            )
+            .is_transient_busy(),
+            "SystemIoFailure must NOT be classified transient"
+        );
+        assert!(
+            !DbError::Integrity("bucket list hash mismatch".to_string()).is_transient_busy(),
+            "Integrity error must NOT be classified transient"
+        );
+        assert!(
+            !DbError::NotFound("missing row".to_string()).is_transient_busy(),
+            "NotFound error must NOT be classified transient"
+        );
+    }
+}

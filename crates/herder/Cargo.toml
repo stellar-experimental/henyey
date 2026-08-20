@@ -52,6 +52,11 @@ test-support = ["henyey-scp/test-helpers"]
 [dev-dependencies]
 metrics-exporter-prometheus.workspace = true
 tempfile.workspace = true
+# `henyey-db` deliberately does not re-export `rusqlite`, and `DbError::Sqlite`
+# wraps a raw `rusqlite::Error`, so the transient-busy test fixture in
+# `herder.rs` (#3806) is otherwise unnameable from this crate. Precedent:
+# `crates/app` and `crates/history` both carry rusqlite as a dev-dep.
+rusqlite.workspace = true
 henyey-bucket.workspace = true
 henyey-crypto.workspace = true
 henyey-ledger = { workspace = true, features = ["test-utils"] }

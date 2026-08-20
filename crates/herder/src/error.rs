@@ -32,6 +32,15 @@ pub enum HerderError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A database error occurred on the SCP-persistence path.
+    ///
+    /// Preserves the structured [`henyey_db::DbError`] (instead of collapsing
+    /// it into an `Internal(String)`) so callers can classify it — e.g. the
+    /// tx-set GC purge distinguishes a transient `SQLITE_BUSY`/`LOCKED` from
+    /// genuine corruption via [`henyey_db::DbError::is_transient_busy`] (#3806).
+    #[error("database error: {0}")]
+    Db(#[from] henyey_db::DbError),
+
     /// An invalid SCP envelope was received or processed.
     ///
     /// This can occur during serialization, deserialization, or validation

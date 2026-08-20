@@ -294,7 +294,6 @@ macro_rules! metric_catalog {
 // Reserved (NOT yet in the vocabulary — added by the PR that wires the
 // emitter, so no misleading always-zero series exists in between):
 //   - `catchup_meta` — `crates/history/src/catchup/persist.rs` `emit_meta` (#3801)
-//   - `tx_set_gc`    — `crates/herder/src/herder.rs` tx-set GC purge (#3806)
 
 /// Ledger-close persist DB commit (`commit_with_busy_retry`, bounded retry).
 pub const SITE_LEDGER_CLOSE_PERSIST: &str = "ledger_close_persist";
@@ -311,6 +310,9 @@ pub const SITE_PUBLISH_QUEUE_EVICT: &str = "publish_queue_evict";
 pub const SITE_PEER_FAILURE_PRUNE: &str = "peer_failure_prune";
 /// Peer-record update from the overlay peer-event loop (log-and-continue).
 pub const SITE_PEER_RECORD_UPDATE: &str = "peer_record_update";
+/// Herder tx-set GC purge (log-and-continue; emitted from `crates/herder` by
+/// string literal — see `henyey_herder`'s `SITE_TX_SET_GC` / #3806).
+pub const SITE_TX_SET_GC: &str = "tx_set_gc";
 
 /// The complete, closed `site` label vocabulary for the `henyey_db_busy_*`
 /// labelled counters. Pinned by `test_db_busy_site_label_vocabulary_pinned`.
@@ -322,6 +324,7 @@ pub const DB_BUSY_SITES: &[&str] = &[
     SITE_PUBLISH_QUEUE_EVICT,
     SITE_PEER_FAILURE_PRUNE,
     SITE_PEER_RECORD_UPDATE,
+    SITE_TX_SET_GC,
 ];
 
 // ── Metric catalog ─────────────────────────────────────────────────────
@@ -1008,7 +1011,7 @@ metric_catalog! {
                 retained unchanged for #3640 continuity — do NOT sum the two",
             "site", [SITE_LEDGER_CLOSE_PERSIST, SITE_CATCHUP_PERSIST, SITE_LEDGER_CLOSE_META,
                      SITE_RETENTION_TRIM, SITE_PUBLISH_QUEUE_EVICT, SITE_PEER_FAILURE_PRUNE,
-                     SITE_PEER_RECORD_UPDATE];
+                     SITE_PEER_RECORD_UPDATE, SITE_TX_SET_GC];
         DB_BUSY_WRITE_DROPPED_TOTAL = "henyey_db_busy_write_dropped_total"
             => "DB writes ultimately NOT applied because of a transient \
                 SQLITE_BUSY/LOCKED — retry-budget exhaustion, or a \
@@ -1023,7 +1026,7 @@ metric_catalog! {
                 is not a missing increment",
             "site", [SITE_LEDGER_CLOSE_PERSIST, SITE_CATCHUP_PERSIST, SITE_LEDGER_CLOSE_META,
                      SITE_RETENTION_TRIM, SITE_PUBLISH_QUEUE_EVICT, SITE_PEER_FAILURE_PRUNE,
-                     SITE_PEER_RECORD_UPDATE];
+                     SITE_PEER_RECORD_UPDATE, SITE_TX_SET_GC];
     }
 
     histograms {
@@ -2583,19 +2586,23 @@ mod tests {
                 "publish_queue_evict",
                 "peer_failure_prune",
                 "peer_record_update",
+                "tx_set_gc",
             ],
             "the db-busy site vocabulary changed; update the catalog entries \
              and confirm the change is deliberate"
+        );
+
+        // `tx_set_gc` is emitted from `crates/herder` by string literal (its
+        // emitter lands in this same PR, #3806), so it MUST be present here.
+        assert!(
+            DB_BUSY_SITES.contains(&"tx_set_gc"),
+            "tx_set_gc landed with its emitter in #3806 and must be in the vocabulary"
         );
 
         // Reserved values must NOT be present until their emitter lands.
         assert!(
             !DB_BUSY_SITES.contains(&"catchup_meta"),
             "catchup_meta is reserved for #3801 and must land with its emitter"
-        );
-        assert!(
-            !DB_BUSY_SITES.contains(&"tx_set_gc"),
-            "tx_set_gc is reserved for #3806 and must land with its emitter"
         );
     }
 
