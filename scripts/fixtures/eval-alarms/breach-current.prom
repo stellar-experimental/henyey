@@ -5,6 +5,7 @@ stellar_peer_count 3
 stellar_overlay_inbound_authenticated 1
 stellar_herder_pending_envelopes 3000
 henyey_jemalloc_fragmentation_pct 55
+henyey_jemalloc_resident_bytes 38654705664
 henyey_scp_verify_input_backlog 200
 henyey_scp_verifier_thread_state 2
 henyey_overlay_fetch_channel_depth 600
