@@ -188,10 +188,27 @@ pub(super) fn classify_timer_event(
 ///
 /// `AtTip` / `Ahead` (with externalization) are handled downstream and never
 /// escalate here.
+/// The near-tip single-ledger stall resume is additionally gated on wall-clock
+/// time (#3748): the `attempts >= STALL` count alone is not sufficient, because
+/// a post-park `MissedTickBehavior::Burst` replay of missed 1s ticks can inflate
+/// `recovery_attempts_without_progress` past the threshold in sub-second real
+/// time (see #3756 for the event-loop park). A genuine persistent stall must be
+/// backed by REAL elapsed time, so escalation only resumes once the no-progress
+/// streak has lasted at least `RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS`
+/// seconds of wall-clock time (the recovery interval is ~1s, so the count and
+/// the elapsed-seconds threshold are the same constant by construction).
+pub(super) fn near_tip_stall_is_wall_clock_backed(
+    _attempts: u64,
+    streak_elapsed: Duration,
+) -> bool {
+    streak_elapsed >= Duration::from_secs(RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS)
+}
+
 pub(super) fn should_escalate_to_catchup(
     attempts: u64,
     relation: LedgerRelation,
     ahead_no_ext: bool,
+    streak_elapsed: Duration,
 ) -> bool {
     if attempts < RECOVERY_ESCALATION_CATCHUP {
         return false;
@@ -200,12 +217,18 @@ pub(super) fn should_escalate_to_catchup(
         return true;
     }
     match relation.behind_gap() {
-        // Multi-ledger behind gap — escalate immediately (unchanged).
+        // Multi-ledger behind gap — escalate immediately (unchanged). This is a
+        // genuine fall-behind and is deliberately NOT wall-clock-gated.
         Some(gap) if gap > RECOVERY_ESCALATION_NEAR_TIP_GAP => true,
         // Single-ledger near-tip gap — suppress only while momentary; resume
-        // escalation once it persists past the stall threshold so a genuinely
-        // wedged node keeps its archive backstop + alarm coverage.
-        Some(_) => attempts >= RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
+        // escalation once it persists past the stall threshold AND that streak
+        // is backed by real wall-clock time (#3748), so a genuinely wedged node
+        // keeps its archive backstop + alarm coverage while a post-park Burst
+        // replay that inflates `attempts` in sub-second time does not.
+        Some(_) => {
+            attempts >= RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS
+                && near_tip_stall_is_wall_clock_backed(attempts, streak_elapsed)
+        }
         None => false,
     }
 }
@@ -224,11 +247,41 @@ pub(super) fn is_near_tip_gap_suppressed(
     attempts: u64,
     relation: LedgerRelation,
     ahead_no_ext: bool,
+    streak_elapsed: Duration,
 ) -> bool {
     attempts >= RECOVERY_ESCALATION_CATCHUP
         && !ahead_no_ext
         && matches!(relation.behind_gap(), Some(gap) if gap <= RECOVERY_ESCALATION_NEAR_TIP_GAP)
-        && !should_escalate_to_catchup(attempts, relation, ahead_no_ext)
+        && !should_escalate_to_catchup(attempts, relation, ahead_no_ext, streak_elapsed)
+}
+
+/// Whether this recovery tick is suppressing catchup escalation *solely*
+/// because the near-tip stall resume is not yet wall-clock-backed (#3748).
+///
+/// True iff the attempt floor is crossed, the node is `Behind` by a near-tip
+/// gap (`<= RECOVERY_ESCALATION_NEAR_TIP_GAP`), the attempt count has already
+/// crossed the persistent-stall threshold (so the OLD attempt-only gate would
+/// have fired `forcing_catchup_behind`), but the no-progress streak is NOT yet
+/// backed by real wall-clock time — i.e. a post-park `Burst` replay inflated
+/// `attempts` in sub-second time. These ticks increment the distinct
+/// non-alarming `near_tip_park_inflated` metric instead of re-tripping the
+/// `forcing_catchup_behind` streak-3 alarm.
+///
+/// This is deliberately classified BEFORE `is_near_tip_gap_suppressed` at the
+/// call site: at `attempts >= STALL` with a non-wall-clock-backed streak, BOTH
+/// predicates are true (escalation is held back, so `is_near_tip_gap_suppressed`
+/// also returns true), so the caller must attribute the tick to
+/// `near_tip_park_inflated` first to avoid double-counting (#3748 Critic A).
+pub(super) fn is_near_tip_park_inflated(
+    attempts: u64,
+    relation: LedgerRelation,
+    ahead_no_ext: bool,
+    streak_elapsed: Duration,
+) -> bool {
+    attempts >= RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS
+        && !ahead_no_ext
+        && matches!(relation.behind_gap(), Some(gap) if gap <= RECOVERY_ESCALATION_NEAR_TIP_GAP)
+        && !near_tip_stall_is_wall_clock_backed(attempts, streak_elapsed)
 }
 
 /// Whether an `is_behind()` relation at the emit site of `trigger_recovery_catchup`
@@ -663,6 +716,26 @@ impl App {
             .recovery_attempts_without_progress
             .fetch_add(1, Ordering::SeqCst);
 
+        // Wall-clock anchor for the near-tip stall gate (#3748). Stamp the start
+        // of the current no-progress streak the first time we observe it with no
+        // active anchor (sentinel 0). Using compare_exchange from 0 (rather than
+        // only the `attempts == 0` 0→1 transition) also covers streaks kicked off
+        // by an external `escalate_recovery_to_catchup` fetch_max, which jumps the
+        // counter past 0→1 without routing through here. `max(1)` keeps a genuine
+        // streak that begins at elapsed==0ms from colliding with the 0 sentinel.
+        // The anchor is cleared on every `reset_recovery_attempts` (both Full and
+        // Partial), so a fresh streak always re-stamps. `streak_elapsed` is
+        // measured against the monotonic `start_instant` (never the system clock).
+        let now_ms = self.start_instant.elapsed().as_millis() as u64;
+        let _ = self.recovery_streak_start.compare_exchange(
+            0,
+            now_ms.max(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        let streak_start = self.recovery_streak_start.load(Ordering::SeqCst);
+        let streak_elapsed = Duration::from_millis(now_ms.saturating_sub(streak_start));
+
         tracing::debug!(
             current_ledger,
             latest_externalized,
@@ -741,7 +814,7 @@ impl App {
         // a genuinely wedged node keeps its archive backstop + alarm coverage.
         // See `should_escalate_to_catchup` and `RECOVERY_ESCALATION_NEAR_TIP_GAP`.
         let ahead_no_ext = relation.is_ahead_without_externalization(latest_externalized);
-        if should_escalate_to_catchup(attempts, relation, ahead_no_ext) {
+        if should_escalate_to_catchup(attempts, relation, ahead_no_ext, streak_elapsed) {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
                 .trigger_recovery_catchup(current_ledger, latest_externalized, relation, attempts)
@@ -755,7 +828,14 @@ impl App {
         // WITHOUT re-tripping the `forcing_catchup_behind` streak-3 alarm that
         // Check 12b keys on. A genuinely wedged node still crosses the stall
         // threshold above and re-fires `forcing_catchup_behind`.
-        if is_near_tip_gap_suppressed(attempts, relation, ahead_no_ext) {
+        //
+        // #3748: classify `near_tip_park_inflated` FIRST. At `attempts >= STALL`
+        // with a non-wall-clock-backed streak, escalation is held back, so
+        // `is_near_tip_gap_suppressed` is ALSO true on the same tick — the
+        // else-if keeps the tick counted exactly once (Critic A).
+        if is_near_tip_park_inflated(attempts, relation, ahead_no_ext, streak_elapsed) {
+            crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("near_tip_park_inflated", 1);
+        } else if is_near_tip_gap_suppressed(attempts, relation, ahead_no_ext, streak_elapsed) {
             crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("near_tip_gap1_suppressed", 1);
         }
 
@@ -2444,10 +2524,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_cannot_apply_reason, is_near_tip_gap_suppressed, is_spurious_near_tip_behind,
+        classify_cannot_apply_reason, is_near_tip_gap_suppressed, is_near_tip_park_inflated,
+        is_spurious_near_tip_behind, near_tip_stall_is_wall_clock_backed,
         should_escalate_to_catchup, CannotApplyReason, LedgerRelation,
         RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
     };
+    use std::time::Duration;
+
+    /// A `streak_elapsed` comfortably above the near-tip wall-clock threshold
+    /// (#3748), so the #3728 attempt-count assertions hold under the new gate.
+    const WALL_CLOCK_BACKED: Duration = Duration::from_secs(60);
 
     // ── is_spurious_near_tip_behind tests (#3733) ───────────────────────
 
@@ -2492,7 +2578,8 @@ mod tests {
         assert!(!should_escalate_to_catchup(
             8,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
     }
 
@@ -2501,23 +2588,28 @@ mod tests {
         // #3728 review follow-up: a gap==1 that persists past the stall
         // threshold must RESUME escalation so a genuinely-wedged node keeps its
         // peer-independent archive backstop + forcing_catchup_behind alarm.
+        // #3748: the streak must also be backed by real wall-clock time.
         let stall = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
         // Just below the threshold: still suppressed.
         assert!(!should_escalate_to_catchup(
             stall - 1,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
-        // At and above the threshold: escalation resumes.
+        // At and above the threshold, with a wall-clock-backed streak:
+        // escalation resumes.
         assert!(should_escalate_to_catchup(
             stall,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
         assert!(should_escalate_to_catchup(
             stall + 5,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
     }
 
@@ -2529,31 +2621,46 @@ mod tests {
         assert!(is_near_tip_gap_suppressed(
             8,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
         // Below the attempt floor: not a suppression tick (no escalation would
         // have fired anyway).
         assert!(!is_near_tip_gap_suppressed(
             5,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
-        // At/above the stall threshold: escalation resumes, so this is NOT a
-        // suppressed tick — forcing_catchup_behind fires instead.
+        // At/above the stall threshold WITH a wall-clock-backed streak:
+        // escalation resumes, so this is NOT a suppressed tick —
+        // forcing_catchup_behind fires instead.
         assert!(!is_near_tip_gap_suppressed(
             stall,
             LedgerRelation::Behind { gap: 1 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
         // Multi-ledger gap escalates directly — never a suppression tick.
         assert!(!is_near_tip_gap_suppressed(
             8,
             LedgerRelation::Behind { gap: 2 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
         // AtTip / ahead-no-ext are not near-tip-behind suppressions.
-        assert!(!is_near_tip_gap_suppressed(8, LedgerRelation::AtTip, false));
-        assert!(!is_near_tip_gap_suppressed(8, LedgerRelation::Ahead, true));
+        assert!(!is_near_tip_gap_suppressed(
+            8,
+            LedgerRelation::AtTip,
+            false,
+            WALL_CLOCK_BACKED,
+        ));
+        assert!(!is_near_tip_gap_suppressed(
+            8,
+            LedgerRelation::Ahead,
+            true,
+            WALL_CLOCK_BACKED,
+        ));
     }
 
     #[test]
@@ -2563,12 +2670,14 @@ mod tests {
         assert!(should_escalate_to_catchup(
             6,
             LedgerRelation::Behind { gap: 2 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
         assert!(should_escalate_to_catchup(
             8,
             LedgerRelation::Behind { gap: 12 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
     }
 
@@ -2578,17 +2687,123 @@ mod tests {
         assert!(!should_escalate_to_catchup(
             5,
             LedgerRelation::Behind { gap: 5 },
-            false
+            false,
+            WALL_CLOCK_BACKED,
         ));
     }
 
     #[test]
     fn test_should_escalate_to_catchup_preserves_ahead_no_ext() {
         // Captive-core startup path (Ahead with no externalization) must still
-        // escalate so recovery converges.
-        assert!(should_escalate_to_catchup(6, LedgerRelation::Ahead, true));
+        // escalate so recovery converges. The ahead-no-ext branch is NOT
+        // wall-clock-gated, so even a tiny streak_elapsed escalates.
+        assert!(should_escalate_to_catchup(
+            6,
+            LedgerRelation::Ahead,
+            true,
+            Duration::from_millis(1),
+        ));
         // AtTip never escalates here — it is handled downstream.
-        assert!(!should_escalate_to_catchup(6, LedgerRelation::AtTip, false));
+        assert!(!should_escalate_to_catchup(
+            6,
+            LedgerRelation::AtTip,
+            false,
+            WALL_CLOCK_BACKED,
+        ));
+    }
+
+    // ── near-tip wall-clock gate tests (#3748) ──────────────────────────
+
+    #[test]
+    fn test_near_tip_burst_park_does_not_resume_escalation() {
+        // #3748: a post-park `MissedTickBehavior::Burst` replay inflates
+        // `attempts` past the stall threshold in sub-second real time. The
+        // wall-clock gate must hold near-tip gap==1 escalation back so the
+        // spurious `forcing_catchup_behind` alarm does not fire.
+        let stall = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
+        assert!(!should_escalate_to_catchup(
+            stall,
+            LedgerRelation::Behind { gap: 1 },
+            false,
+            Duration::from_millis(500),
+        ));
+    }
+
+    #[test]
+    fn test_near_tip_genuine_stall_still_escalates() {
+        // A genuinely wedged node at gap==1 whose no-progress streak is backed
+        // by real wall-clock time (>= ~12s) must still escalate, preserving the
+        // peer-independent archive backstop + `forcing_catchup_behind` alarm
+        // (#3728 review intent).
+        let stall = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
+        assert!(should_escalate_to_catchup(
+            stall,
+            LedgerRelation::Behind { gap: 1 },
+            false,
+            Duration::from_secs(15),
+        ));
+    }
+
+    #[test]
+    fn test_multi_ledger_gap_escalates_regardless_of_park() {
+        // A multi-ledger fall-behind is a genuine catchup trigger and is NOT
+        // wall-clock-gated: it must escalate immediately even with a tiny
+        // streak_elapsed (post-park).
+        assert!(should_escalate_to_catchup(
+            6,
+            LedgerRelation::Behind { gap: 5 },
+            false,
+            Duration::from_millis(100),
+        ));
+    }
+
+    #[test]
+    fn test_near_tip_stall_wall_clock_backed_boundary() {
+        let stall_secs = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
+        // Just below the wall-clock threshold: not backed.
+        assert!(!near_tip_stall_is_wall_clock_backed(
+            stall_secs,
+            Duration::from_secs(stall_secs) - Duration::from_millis(1),
+        ));
+        // At the threshold: backed.
+        assert!(near_tip_stall_is_wall_clock_backed(
+            stall_secs,
+            Duration::from_secs(stall_secs),
+        ));
+        // Above the threshold: backed.
+        assert!(near_tip_stall_is_wall_clock_backed(
+            stall_secs,
+            Duration::from_secs(stall_secs) + Duration::from_secs(5),
+        ));
+    }
+
+    #[test]
+    fn test_near_tip_park_inflated_predicate_classifies_park_ticks() {
+        // `is_near_tip_park_inflated` is true exactly when escalation WOULD have
+        // fired on the old attempt-only gate (attempts >= STALL, gap <=
+        // NEAR_TIP_GAP) but the wall-clock gate holds it back.
+        let stall = RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS;
+        assert!(is_near_tip_park_inflated(
+            stall,
+            LedgerRelation::Behind { gap: 1 },
+            false,
+            Duration::from_millis(500),
+        ));
+        // Wall-clock-backed genuine stall → escalates, not park-inflated.
+        assert!(!is_near_tip_park_inflated(
+            stall,
+            LedgerRelation::Behind { gap: 1 },
+            false,
+            Duration::from_secs(15),
+        ));
+        // Below the stall threshold → classic momentary carve-out, not
+        // park-inflated (that tick is `near_tip_gap1_suppressed`).
+        assert!(!is_near_tip_park_inflated(
+            8,
+            LedgerRelation::Behind { gap: 1 },
+            false,
+            Duration::from_millis(100),
+        ));
     }
 
     // ── LedgerRelation tests ────────────────────────────────────────────

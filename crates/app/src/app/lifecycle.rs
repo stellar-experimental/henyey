@@ -496,6 +496,16 @@ impl App {
         // Main run loop
         let mut shutdown_rx = self.take_initial_shutdown_receiver().await;
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
+        // #3748/#3756 hardening: on resume from an event-loop park, the default
+        // `Burst` behaviour replays every missed 1s tick back-to-back. Each
+        // replayed tick that finds `sync_recovery_pending` bumps
+        // `recovery_attempts_without_progress` with no real elapsed time between
+        // increments, which is what inflated the near-tip stall counter past its
+        // threshold in sub-second time. `Skip` fires exactly one tick on resume
+        // (matching every sibling interval here), so the attempt counter tracks
+        // real recovery cadence. The near-tip wall-clock gate is the primary,
+        // scheduler-independent fix; this is defense-in-depth.
+        consensus_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tx_advert_interval = tokio::time::interval(self.flood_tx_period());
