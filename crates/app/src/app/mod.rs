@@ -10534,6 +10534,35 @@ mod tests {
     /// All `PHASE_13_*` sub-phase constants are distinct and within a
     /// sensible range. Prevents accidental constant collision during
     /// future edits.
+    /// All `PHASE_3_*` sub-phase constants are distinct and densely numbered.
+    /// Mirrors the `PHASE_6_*` / `PHASE_13_*` tests. Prevents accidental
+    /// constant collision during future edits (issue #3723).
+    #[test]
+    fn test_phase_3_constants_distinct_and_dense() {
+        use super::phase::*;
+        let all = [PHASE_3_1_OVERLAY_READ, PHASE_3_2_BROADCAST];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "phase-3 sub-phase constants must all be distinct"
+        );
+        assert_eq!(sorted.first().copied(), Some(1));
+        assert_eq!(
+            sorted.last().copied(),
+            Some(max_defined_phase_3_sub_phase())
+        );
+        for (i, v) in sorted.iter().enumerate() {
+            assert_eq!(
+                *v,
+                (i as u32) + 1,
+                "phase-3 sub-phase constants must be densely numbered 1..=N"
+            );
+        }
+    }
+
     #[test]
     fn test_phase_13_constants_distinct_and_dense() {
         use super::phase::*;

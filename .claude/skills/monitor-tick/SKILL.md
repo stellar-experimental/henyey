@@ -868,7 +868,7 @@ the residual mode left after (3c) (owns the fatal-state-wipe case) and (3b)
 (owns the UNRESPONSIVE / frozen-event-loop case). (3e) is the **mirror of (3b)**:
 (3b) fires when the admin port is dead/timed-out; (3e) requires a *live,
 answering* port — mutually exclusive by construction. It is a band-aid for root
-cause #3218 (overlay SCP broadcast backpressure); the escalate-on-streak guard
+cause #3723 (overlay SCP broadcast backpressure); the escalate-on-streak guard
 surfaces a restart loop as `urgent` rather than silently masking the defect.
 
 Evaluate (3e) **strictly last** in the alive-process path — order is
@@ -946,8 +946,8 @@ cooldown** (`NOW - last_restart < 900` → `cooldown`, no restart this tick) and
   the legitimate replay that follows the restart.
 - On `STUCK_ALIVE_SYNC=escalate`: do **NOT** restart. File a single
   `urgent`-labeled issue (reusing the (3b)-wedge filing idiom) noting the
-  restart streak and pointing at the unfixed root cause #3218 (overlay SCP
-  broadcast backpressure / near-tip-stall recovery); if #3218 is closed,
+  restart streak and pointing at the unfixed root cause #3723 (overlay SCP
+  broadcast backpressure / near-tip-stall recovery); if #3723 is closed,
   escalate to the operator. A restart loop is itself the signal that the root
   cause is unaddressed.
 - On `STUCK_ALIVE_SYNC=cooldown` or `no`: report-only, no action this tick.

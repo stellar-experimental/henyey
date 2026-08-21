@@ -16,6 +16,17 @@
 //! The `PHASE_6_*` constants below provide coarse attribution within
 //! phase 6, narrowing a stall to one of 12 sub-regions.
 //!
+//! ## Phase 3 (`broadcast`)
+//!
+//! Issue #3723 context: the coarse `phase=3 broadcast` label covers the
+//! SCP-relay arm in `App::relay_ready_scp_envelope` (lifecycle.rs) — the
+//! sole relay path for all fetched-ready SCP envelopes. The ~101 s
+//! event-loop freeze on 2026-07-12 landed in this path but was later at
+//! risk of being misattributed to `phase=0 waiting` because the relay arm
+//! carried no phase stamp. The `PHASE_3_*` constants below split the two
+//! `.await` points so the next freeze names whether the loop parked on the
+//! overlay `RwLock` read or inside `broadcast` itself.
+//!
 //! ## Phase 13 (`buffered_catchup`)
 //!
 //! Issue #1788 context: the coarse `phase=13 buffered_catchup` label
@@ -29,6 +40,25 @@
 //!
 //! Convention: constants are one-based dense integers within a coarse
 //! phase. Zero means "coarse phase entered, sub-phase not yet set".
+
+// ── Phase 3: broadcast (issue #3723) ─────────────────────────────────
+
+/// `relay_ready_scp_envelope`: about to acquire the overlay handle via
+/// `self.overlay().await` (a read on the overlay `RwLock`) before relaying.
+/// A park here points at a long-held overlay writer (startup wiring /
+/// shutdown `take()`).
+pub(crate) const PHASE_3_1_OVERLAY_READ: u32 = 1;
+
+/// `relay_ready_scp_envelope`: about to call `overlay.broadcast(...).await`
+/// for the ready SCP envelope. A park here points inside `broadcast`
+/// (flood-gate accounting / `DashMap` contention), not the overlay read.
+pub(crate) const PHASE_3_2_BROADCAST: u32 = 2;
+
+/// Test helper: return the highest phase-3 sub-phase constant.
+#[cfg(test)]
+pub(crate) const fn max_defined_phase_3_sub_phase() -> u32 {
+    PHASE_3_2_BROADCAST
+}
 
 // ── Phase 6: pending_close (issue #1921) ─────────────────────────────
 
