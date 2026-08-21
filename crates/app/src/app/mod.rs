@@ -1083,6 +1083,18 @@ pub struct App {
     /// The ledger sequence at which recovery_attempts_without_progress was
     /// last reset.  Used to detect progress.
     recovery_baseline_ledger: AtomicU64,
+    /// Monotonic wall-clock anchor (milliseconds since `start_instant`) for the
+    /// START of the current no-progress recovery streak. Sentinel `0` means "no
+    /// active streak". Stamped the first time a streak is observed without an
+    /// anchor and cleared on every `reset_recovery_attempts` (#3748).
+    ///
+    /// The near-tip single-ledger stall resume (#3728) is gated on this so a
+    /// post-park `MissedTickBehavior::Burst` replay that inflates
+    /// `recovery_attempts_without_progress` past the stall threshold in
+    /// sub-second real time cannot spuriously resume `forcing_catchup_behind`
+    /// escalation — a genuine stall must be backed by real elapsed wall-clock
+    /// time. Uses `start_instant`, never the system clock, to avoid skew.
+    recovery_streak_start: AtomicU64,
     /// Snapshot of `scp_messages_received` at the last recovery-state reset.
     /// The fast-track gate compares the current counter against this snapshot
     /// to determine if SCP messages arrived *since the last recovery reset/re-arm*
@@ -1767,6 +1779,7 @@ impl App {
             sync_recovery_pending: AtomicBool::new(false),
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
+            recovery_streak_start: AtomicU64::new(0),
             recovery_baseline_scp_received: AtomicU64::new(0),
             recovery_episode_latch: RecoveryEpisodeLatch::new(),
             last_hard_reset_offset: AtomicU64::new(0),
@@ -2780,6 +2793,16 @@ impl App {
             self.scp_messages_received.load(Ordering::Relaxed),
             Ordering::SeqCst,
         );
+
+        // Clear the near-tip stall wall-clock anchor on EVERY reset (#3748),
+        // both Full and Partial. A reset means the current no-progress streak
+        // ended (the node made progress or was force-caught-up), so the next
+        // streak must re-stamp a fresh anchor. Clearing on Partial is correct
+        // even though the attempt counter is reseeded high: after Partial the
+        // node is significantly behind verified peers, so the relation is a
+        // multi-ledger gap that escalates immediately without consulting the
+        // wall-clock gate.
+        self.recovery_streak_start.store(0, Ordering::SeqCst);
 
         match mode {
             RecoveryResetMode::Full => {
@@ -11216,6 +11239,140 @@ mod tests {
                 .load(Ordering::SeqCst),
             2,
             "counter must not change when guard does not fire (some tx_sets present)"
+        );
+    }
+
+    /// #3748: a park-inflated near-tip stall — `attempts` past the persistent
+    /// stall threshold but the no-progress streak NOT backed by real wall-clock
+    /// time (a post-park `MissedTickBehavior::Burst` replay) — must NOT resume
+    /// escalation / fire `forcing_catchup_behind`. Instead it increments the
+    /// distinct non-alarming `near_tip_park_inflated` counter. Reaching that
+    /// counter increment PROVES `should_escalate_to_catchup` returned false on
+    /// this tick (escalation returns early, before the increment).
+    #[tokio::test]
+    async fn test_near_tip_park_inflated_suppresses_forcing_catchup() {
+        fn parse_reason_count(rendered: &str, reason: &str) -> u64 {
+            let needle = format!(
+                "henyey_recovery_stalled_tick_total{{reason=\"{}\"}}",
+                reason
+            );
+            for line in rendered.lines() {
+                if let Some(rest) = line.strip_prefix(&needle) {
+                    return rest
+                        .split_whitespace()
+                        .last()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+            0
+        }
+
+        let handle = crate::metrics::ensure_test_recorder();
+        crate::metrics::describe_metrics();
+        crate::metrics::register_label_series();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let current_ledger = 100u32;
+        // Drive the herder so latest_externalized == current_ledger + 1 →
+        // LedgerRelation::Behind { gap: 1 } (near-tip single-ledger gap).
+        {
+            let driver = app.herder.scp_driver();
+            let xdr = mk_stellar_value_xdr([0x11; 32]);
+            driver.record_externalized(current_ledger as u64 + 1, mk_value(xdr), None);
+            driver.publish_externalized(current_ledger as u64 + 1);
+        }
+        assert_eq!(
+            app.herder.latest_externalized_slot().unwrap_or(0),
+            current_ledger as u64 + 1,
+            "precondition: gap == 1"
+        );
+
+        // No progress reset: baseline == current_ledger.
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        // After fetch_add, the local `attempts` == the persistent stall
+        // threshold — the old attempt-only gate would have escalated here.
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_ESCALATION_NEAR_TIP_GAP_STALL_ATTEMPTS,
+            Ordering::SeqCst,
+        );
+        // Streak anchored to ~now → streak_elapsed is well under the ~12s
+        // wall-clock threshold, modelling a sub-second Burst replay.
+        let now_ms = app.start_instant.elapsed().as_millis() as u64;
+        app.recovery_streak_start
+            .store(now_ms.max(1), Ordering::SeqCst);
+
+        let before_forcing = parse_reason_count(&handle.render(), "forcing_catchup_behind");
+        let before_park = parse_reason_count(&handle.render(), "near_tip_park_inflated");
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+        assert!(result.is_none());
+
+        let after_forcing = parse_reason_count(&handle.render(), "forcing_catchup_behind");
+        let after_park = parse_reason_count(&handle.render(), "near_tip_park_inflated");
+
+        assert_eq!(
+            after_park - before_park,
+            1,
+            "park-inflated near-tip stall must increment near_tip_park_inflated exactly once"
+        );
+        assert_eq!(
+            after_forcing - before_forcing,
+            0,
+            "park-inflated near-tip stall must NOT fire forcing_catchup_behind"
+        );
+    }
+
+    /// #3748: the near-tip stall wall-clock anchor (`recovery_streak_start`) is
+    /// stamped on the first no-progress recovery tick and cleared by every
+    /// `reset_recovery_attempts` (both Full and Partial).
+    #[tokio::test]
+    async fn test_recovery_streak_start_stamped_and_cleared() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Fresh app: no active streak.
+        assert_eq!(
+            app.recovery_streak_start.load(Ordering::SeqCst),
+            0,
+            "fresh app must have no streak anchor"
+        );
+
+        // A no-progress recovery tick stamps the anchor.
+        app.recovery_baseline_ledger.store(0, Ordering::SeqCst);
+        let _ = app.out_of_sync_recovery(0).await;
+        assert_ne!(
+            app.recovery_streak_start.load(Ordering::SeqCst),
+            0,
+            "streak anchor must be stamped on the first no-progress tick"
+        );
+
+        // Full reset clears the anchor.
+        app.reset_recovery_attempts(RecoveryResetMode::Full);
+        assert_eq!(
+            app.recovery_streak_start.load(Ordering::SeqCst),
+            0,
+            "Full reset must clear the streak anchor"
+        );
+
+        // Partial reset also clears the anchor (even though it reseeds attempts).
+        app.recovery_streak_start.store(1234, Ordering::SeqCst);
+        app.reset_recovery_attempts(RecoveryResetMode::Partial { seed: 5 });
+        assert_eq!(
+            app.recovery_streak_start.load(Ordering::SeqCst),
+            0,
+            "Partial reset must clear the streak anchor"
         );
     }
 

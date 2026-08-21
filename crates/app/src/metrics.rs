@@ -995,7 +995,8 @@ metric_catalog! {
             "reason", ["backoff_active", "forcing_catchup_not_behind", "forcing_catchup_behind",
                        "at_tip_no_scp_hard_reset", "archive_behind_peer_ahead_hard_reset",
                        "hard_reset_suppressed_archive_behind", "near_tip_peer_scp_recovery",
-                       "near_tip_peer_scp_widen", "near_tip_gap1_suppressed"];
+                       "near_tip_peer_scp_widen", "near_tip_gap1_suppressed",
+                       "near_tip_park_inflated"];
 
         // DB busy telemetry (#3802). Two single-label counters rather than one
         // two-label counter: `LabeledCounterMetric` carries exactly one label
@@ -2765,6 +2766,7 @@ mod tests {
             "forcing_catchup_behind",
             "hard_reset_suppressed_archive_behind",
             "near_tip_gap1_suppressed",
+            "near_tip_park_inflated",
         ] {
             let label = format!(
                 "henyey_recovery_stalled_tick_total{{reason=\"{}\"}}",
