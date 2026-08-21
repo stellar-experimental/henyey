@@ -3605,6 +3605,48 @@ mod scp_dedup_pipeline_tests {
         assert_eq!(app.scp_scheduled.dedup_count(), 0, "no dedup rejections");
     }
 
+    /// Regression (#3723): relaying a ready SCP envelope must stamp the event
+    /// loop phase as 3 ("broadcast") with a non-zero phase-3 sub-phase.
+    ///
+    /// The 07-12 mainnet freeze (~101 s) happened in the relay-broadcast path,
+    /// but the deployed build's `phase=3 broadcast` stamp was later lost: the
+    /// generic SCP-relay arm broadcasts without any `set_phase` call, and the
+    /// loop top stamps `set_phase(0)` before every `select!`, so a freeze in
+    /// the relay path would be misattributed to `phase=0 "waiting"`. This test
+    /// pins the invariant "relaying a ready SCP envelope marks the loop phase=3
+    /// (broadcast)". It FAILS on `origin/main` (no `relay_ready_scp_envelope`,
+    /// phase stays 0).
+    ///
+    /// `set_phase(3)` and `set_phase_sub(PHASE_3_1_OVERLAY_READ)` are stamped
+    /// before the `if let Some(overlay)` guard, so the invariant holds even on
+    /// a fresh App whose overlay is unset (`None`).
+    #[tokio::test]
+    async fn test_relay_ready_scp_envelope_stamps_broadcast_phase() {
+        use henyey_herder::{ReadyPath, ScpRelayEnvelope};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-relay-phase.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Fresh App has no overlay wired, so relay_ready_scp_envelope returns
+        // early after stamping phase 3 + a phase-3 sub-phase.
+        assert!(app.overlay().await.is_none(), "fresh app has no overlay");
+
+        let relay_env = ScpRelayEnvelope {
+            envelope: make_test_envelope(100, 2_000_000_000),
+            received_at: None,
+            ready_path: ReadyPath::Immediate,
+        };
+        app.relay_ready_scp_envelope(relay_env).await;
+
+        let (phase, sub) = app.phase_snapshot_for_test();
+        assert_eq!(phase, 3, "relay path must stamp phase=3 (broadcast)");
+        assert_ne!(sub, 0, "relay path must stamp a non-zero phase-3 sub-phase");
+    }
+
     /// #3625 (app-side consumer touch): when the SCP consumer drains a
     /// token-bearing `OverlayMessage` via `pump_scp_intake`, the attached
     /// `FlowControlRelease` fires `end_message_processing`. Draining a full
