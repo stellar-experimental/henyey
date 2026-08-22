@@ -510,7 +510,7 @@ test_live_tail_offset_matches_consumed_lines() {
     "$SCRIPT" --emit-new-lines-only "$log" 0 >"$out" 2>&1 || exit_code=$?
 
     local emitted
-    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c .)
+    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c . || true)
     if [[ "$emitted" -eq 2 ]] \
         && grep -q 'WATCHDOG' "$out" && grep -q 'db_write_ctx' "$out"; then
         tap_ok "live_tail_emits_exactly_the_matching_lines"
@@ -542,7 +542,7 @@ test_live_tail_no_reprint_on_second_call() {
     "$SCRIPT" --emit-new-lines-only "$log" 5 >"$out" 2>&1 || exit_code=$?
 
     local emitted
-    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c .)
+    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c . || true)
     if [[ "$emitted" -eq 0 ]]; then
         tap_ok "live_tail_no_reprint_of_seen_lines"
     else
@@ -584,7 +584,7 @@ test_live_tail_incremental_append() {
     "$SCRIPT" --emit-new-lines-only "$log" 5 >"$out" 2>&1 || exit_code=$?
 
     local emitted
-    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c .)
+    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c . || true)
     if [[ "$emitted" -eq 1 ]] && grep -q 'straggler timeout' "$out"; then
         tap_ok "live_tail_emits_only_new_matching_line"
     else
