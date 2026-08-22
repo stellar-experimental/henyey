@@ -336,6 +336,8 @@ pub struct AppInfo {
     pub scp_verify: ScpVerifyMetrics,
     /// Overlay fetch-channel depth metrics (issue #1741).
     pub overlay_fetch_channel: OverlayFetchChannelMetrics,
+    /// Overlay flood broadcast-channel depth metrics (issue #3778).
+    pub overlay_broadcast_channel: OverlayBroadcastChannelMetrics,
     /// Total post-catchup hard resets performed (issue #1822).
     pub post_catchup_hard_reset_total: u64,
     /// Highest verified SCP slot from peers (issue #2349).
@@ -354,6 +356,7 @@ pub struct AppMetricsSnapshot {
     pub meta_stream_writes_total: u64,
     pub scp_verify: ScpVerifyMetrics,
     pub overlay_fetch_channel: OverlayFetchChannelMetrics,
+    pub overlay_broadcast_channel: OverlayBroadcastChannelMetrics,
     pub post_catchup_hard_reset_total: u64,
     /// Highest verified SCP slot from peers (issue #2349).
     pub max_verified_scp_slot: u64,
@@ -408,6 +411,25 @@ pub struct AppMetricsSnapshot {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OverlayFetchChannelMetrics {
     /// Current depth of the overlay fetch-response channel (event-loop sampled).
+    pub depth: i64,
+    /// Monotonic maximum depth observed since process start.
+    pub depth_max: i64,
+}
+
+/// Metrics for the overlay flood broadcast channel (issue #3778).
+///
+/// The broadcast channel is bounded (`BROADCAST_CHANNEL_SIZE`), so a slow or
+/// parked consumer can overflow it and silently discard inbound flood
+/// transactions (surfaced via `stellar_overlay_broadcast_lagged_dropped_total`).
+/// These gauges expose the channel occupancy the issue previously had to derive
+/// from transaction volume, making park-induced backlog directly observable.
+///
+/// `depth` is sampled by the flood consumer on each `recv`, so a fully-parked
+/// consumer that never recvs will not update it until it resumes — the first
+/// recv after a backlog captures the high-water mark into `depth_max`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OverlayBroadcastChannelMetrics {
+    /// Current depth of the overlay flood broadcast channel (consumer sampled).
     pub depth: i64,
     /// Monotonic maximum depth observed since process start.
     pub depth_max: i64,
@@ -541,6 +563,7 @@ impl AppInfo {
             meta_stream_writes_total: 0,
             scp_verify: ScpVerifyMetrics::default(),
             overlay_fetch_channel: OverlayFetchChannelMetrics::default(),
+            overlay_broadcast_channel: OverlayBroadcastChannelMetrics::default(),
             post_catchup_hard_reset_total: 0,
             max_verified_scp_slot: 0,
         }

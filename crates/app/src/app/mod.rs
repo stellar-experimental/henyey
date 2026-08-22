@@ -579,9 +579,9 @@ pub(crate) use tx_flooding::{
 use types::*;
 pub use types::{
     AppInfo, AppMetricsSnapshot, AppState, CatchupResult, CatchupTarget, FallbackCatchup,
-    LedgerInfo, LedgerSummary, OverlayFetchChannelMetrics, RestoreResult, ScpSlotDebugStats,
-    ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult, SimulationDebugStats, SurveyPeerReport,
-    SurveyReport,
+    LedgerInfo, LedgerSummary, OverlayBroadcastChannelMetrics, OverlayFetchChannelMetrics,
+    RestoreResult, ScpSlotDebugStats, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
+    SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
 
 /// The main application struct coordinating all Stellar Core subsystems.
@@ -840,6 +840,18 @@ pub struct App {
     /// channel since process start. Exposed via `/metrics`
     /// (`henyey_overlay_fetch_channel_depth_max`).
     pub(crate) fetch_channel_depth_max: Arc<AtomicI64>,
+    /// Sampled depth of the overlay flood broadcast channel (`rx.len()`).
+    /// Updated by `run_flood_consumer` on each `recv`. Exposed via `/metrics`
+    /// (`henyey_overlay_broadcast_depth`). Because it is consumer-sampled, a
+    /// fully-parked consumer that never recvs will not update it until it
+    /// resumes; the first recv after a backlog captures the high-water mark
+    /// into [`broadcast_channel_depth_max`](Self::broadcast_channel_depth_max)
+    /// (issue #3778).
+    pub(crate) broadcast_channel_depth: Arc<AtomicI64>,
+    /// Monotonic maximum depth observed on the overlay flood broadcast
+    /// channel since process start. Exposed via `/metrics`
+    /// (`henyey_overlay_broadcast_depth_max`).
+    pub(crate) broadcast_channel_depth_max: Arc<AtomicI64>,
     /// Number of attempts to trigger the next consensus round.
     consensus_trigger_attempts: AtomicU64,
     /// Number of successful trigger_next_ledger calls.
@@ -1709,6 +1721,8 @@ impl App {
             scp_verify_output_backlog: AtomicU64::new(0),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            broadcast_channel_depth: Arc::new(AtomicI64::new(0)),
+            broadcast_channel_depth_max: Arc::new(AtomicI64::new(0)),
             consensus_trigger_attempts: AtomicU64::new(0),
             consensus_trigger_successes: AtomicU64::new(0),
             consensus_trigger_failures: AtomicU64::new(0),
@@ -3565,6 +3579,10 @@ impl App {
                 depth: self.fetch_channel_depth.load(Ordering::Relaxed),
                 depth_max: self.fetch_channel_depth_max.load(Ordering::Relaxed),
             },
+            overlay_broadcast_channel: OverlayBroadcastChannelMetrics {
+                depth: self.broadcast_channel_depth.load(Ordering::Relaxed),
+                depth_max: self.broadcast_channel_depth_max.load(Ordering::Relaxed),
+            },
             post_catchup_hard_reset_total: self
                 .post_catchup_hard_reset_total
                 .load(Ordering::Relaxed),
@@ -3607,6 +3625,10 @@ impl App {
             overlay_fetch_channel: OverlayFetchChannelMetrics {
                 depth: self.fetch_channel_depth.load(Ordering::Relaxed),
                 depth_max: self.fetch_channel_depth_max.load(Ordering::Relaxed),
+            },
+            overlay_broadcast_channel: OverlayBroadcastChannelMetrics {
+                depth: self.broadcast_channel_depth.load(Ordering::Relaxed),
+                depth_max: self.broadcast_channel_depth_max.load(Ordering::Relaxed),
             },
             post_catchup_hard_reset_total: self
                 .post_catchup_hard_reset_total
@@ -4103,6 +4125,20 @@ impl App {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some((v - 1).max(0))
             });
+    }
+
+    /// Sample the overlay flood broadcast-channel depth (issue #3778).
+    ///
+    /// Called by `run_flood_consumer` with `rx.len()` on each `recv`. Stores
+    /// the current depth and advances the monotonic high-water mark. See
+    /// [`record_depth`] for the atomic protocol.
+    #[inline]
+    pub(crate) fn update_broadcast_depth(&self, depth: usize) {
+        record_depth(
+            depth as i64,
+            &self.broadcast_channel_depth,
+            &self.broadcast_channel_depth_max,
+        );
     }
 
     /// Record a new event loop tick (for watchdog freshness tracking).
@@ -5004,6 +5040,19 @@ pub(crate) fn format_watchdog_diagnostic_hint(pid: u32) -> String {
     )
 }
 
+/// Record a sampled channel depth into a current/monotonic-max gauge pair
+/// (issue #3778).
+///
+/// Stores `depth` as the current value and advances `max` to `depth` iff it is
+/// higher, via `fetch_max` (matching the `fetch_channel_depth_max` send-side
+/// protocol — never a load-then-store, which would race). Relaxed ordering is
+/// sufficient: these are independent gauges, not a synchronization mechanism.
+#[inline]
+pub(crate) fn record_depth(depth: i64, cur: &AtomicI64, max: &AtomicI64) {
+    cur.store(depth, Ordering::Relaxed);
+    max.fetch_max(depth, Ordering::Relaxed);
+}
+
 /// Two-way synchronization gate for the `process_externalized_slots`
 /// split-writer regression test. The iteration loop signals `entered`
 /// on the first non-stale slot (before `check_ledger_close`), then
@@ -5022,6 +5071,58 @@ mod tests {
     use super::*;
     use stellar_xdr::StellarValueExt;
     use tempfile;
+
+    /// #3778: `record_depth` stores the current sampled depth and advances the
+    /// monotonic high-water mark only upward — a later, smaller sample must not
+    /// lower `max`. This is the property that makes `henyey_overlay_broadcast_depth_max`
+    /// a true high-water mark for park-induced backlog.
+    #[test]
+    fn test_record_depth_tracks_monotonic_max() {
+        let cur = AtomicI64::new(0);
+        let max = AtomicI64::new(0);
+
+        record_depth(10, &cur, &max);
+        assert_eq!(cur.load(Ordering::Relaxed), 10);
+        assert_eq!(max.load(Ordering::Relaxed), 10);
+
+        record_depth(3, &cur, &max);
+        assert_eq!(
+            cur.load(Ordering::Relaxed),
+            3,
+            "current tracks latest sample"
+        );
+        assert_eq!(
+            max.load(Ordering::Relaxed),
+            10,
+            "max is monotonic — a smaller sample must not lower it"
+        );
+    }
+
+    /// #3778: the two new broadcast-depth gauges must render in a Prometheus
+    /// scrape once set. A described-but-never-set gauge may not render, so we
+    /// set both (via the snapshot-set path `refresh_gauges` uses) and assert
+    /// the lines appear with the expected values.
+    #[test]
+    fn test_broadcast_depth_gauges_render() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            ::metrics::gauge!("henyey_overlay_broadcast_depth").set(7.0);
+            ::metrics::gauge!("henyey_overlay_broadcast_depth_max").set(42.0);
+
+            let out = handle.render();
+            assert!(
+                out.contains("henyey_overlay_broadcast_depth 7"),
+                "broadcast depth gauge must render; got:\n{out}"
+            );
+            assert!(
+                out.contains("henyey_overlay_broadcast_depth_max 42"),
+                "broadcast depth_max gauge must render; got:\n{out}"
+            );
+        });
+    }
 
     /// #3812: the startup cleanup seam must truncate ahead-of-LCL history rows
     /// left by an interrupted catchup (Window 1), so the whole startup path and
