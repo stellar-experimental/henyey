@@ -195,4 +195,20 @@ pub mod state_keys {
     /// checkpoint closes. Always set-or-deleted by the catchup persist path
     /// so a prior-run marker can never leak into a new catchup terminus.
     pub const PUBLISH_SKIP_FIRST_CHECKPOINT: &str = "publishskipfirstcheckpoint";
+
+    /// #3905: one-shot latch requesting an archive-authoritative state rebuild
+    /// on the next (startup) catchup, because the committed last-closed ledger
+    /// is proven divergent from the network (a pre-close / knit-to-LCL header
+    /// mismatch that cannot self-heal via `ReplayOnly`).
+    ///
+    /// Stored as `"<seq>:<hex-header-hash>"` — the divergent LCL sequence and
+    /// our header hash at detection time. On restart the node compares this to
+    /// the on-disk LCL: if it still matches (state unchanged), it forces an
+    /// archive bucket-apply that bypasses the bad LCL; if the LCL has advanced
+    /// (already healed) the latch is stale and cleared. Living in `storestate`
+    /// (inside `mainnet.db`) means a manual DB wipe clears it for free, and it
+    /// survives the forced process exit so the FIRST automatic restart can
+    /// self-heal instead of requiring a manual wipe. One-shot: cleared on a
+    /// successful catchup, on staleness, and on a terminal repeat-divergence.
+    pub const FORCE_ARCHIVE_REBUILD: &str = "forcearchiverebuild";
 }

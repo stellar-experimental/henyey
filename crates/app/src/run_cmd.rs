@@ -476,6 +476,15 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             // spawned (see line below). See #1749.
             let catchup_mode = app.config().catchup.to_mode();
             tracing::info!(?catchup_mode, "Starting catchup with configured mode");
+
+            // #3905: honor a persisted archive-rebuild latch before catchup runs.
+            // If the previous run detected a proven-divergent committed LCL (an
+            // online pre-close / knit-to-LCL mismatch) and the on-disk LCL is
+            // still that divergent state, arm `catchup_needs_full_reset` so this
+            // startup catchup routes to an archive-authoritative bucket-apply
+            // (Half A) that bypasses the bad LCL — self-healing without a manual
+            // wipe. A stale latch (LCL already advanced) is cleared here.
+            app.prepare_archive_rebuild_from_latch();
             let finalize = crate::app::CatchupFinalizer::inline(
                 app.database().clone(),
                 app.ledger_manager().clone(),
@@ -499,7 +508,13 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             {
                 Ok(_result) => {}
                 Err(e) => {
-                    app.signal_startup_catchup_failure(&e);
+                    // #3905: distinguish a terminal archive-rebuild divergence
+                    // (fatal → clear the one-shot latch + signal a wipe) from a
+                    // transient failure (archive not ahead yet / download →
+                    // retain the latch for the next restart, no wipe). Delegates
+                    // to `signal_startup_catchup_failure` for the actual wipe
+                    // signal; a no-op with respect to the latch when none is set.
+                    app.handle_startup_catchup_failure_with_latch(&e);
                     return Err(e);
                 }
             }
