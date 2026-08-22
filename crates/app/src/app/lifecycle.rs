@@ -82,6 +82,28 @@ pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
     henyey_overlay::query_policy::query_rate_limit_window(close_duration)
 }
 
+/// Record a broadcast-channel lag (unrecoverable inbound flood discard, #3778).
+///
+/// Increments the existing `stellar_overlay_broadcast_lagged_dropped_total`
+/// counter by `n` (the messages the receiver skipped) and emits a `warn!` so
+/// the discard is visible at the production `RUST_LOG=info`. It is emitted at
+/// `warn!` — not `debug!` — because losing already-received inbound
+/// transactions the node will never see is *more* severe than the recoverable
+/// `queue_full` admission reject (itself `warn!`), which merely defers a tx
+/// that stays in the sender's flood set and is re-advertised.
+///
+/// Extracted as a free helper so it can be unit-tested against a local
+/// metrics recorder without driving the whole flood consumer.
+pub(crate) fn record_broadcast_lag(n: u64) {
+    metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total").increment(n);
+    tracing::warn!(
+        dropped = n,
+        "Overlay broadcast receiver lagged — inbound flood messages (TX) \
+         discarded unrecoverably; the flood consumer fell behind the bounded \
+         broadcast channel (see henyey_overlay_broadcast_depth)"
+    );
+}
+
 /// Offload one periodic tx-set GC purge onto the blocking thread pool, keeping
 /// purges strictly serial via a loop-local in-flight handle (#3532).
 ///
@@ -2239,6 +2261,14 @@ impl App {
         loop {
             match rx.recv().await {
                 Ok(overlay_msg) => {
+                    let Some(app) = weak.upgrade() else {
+                        tracing::info!("Flood consumer exiting: app dropped");
+                        return;
+                    };
+                    // Sample the broadcast-channel occupancy on every successful
+                    // recv so `henyey_overlay_broadcast_depth[_max]` reflects the
+                    // park-induced backlog the channel accumulates (#3778).
+                    app.update_broadcast_depth(rx.len());
                     // Skip SCP messages — handled via the dedicated SCP channel.
                     if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
                         continue;
@@ -2257,10 +2287,6 @@ impl App {
                     ) {
                         continue;
                     }
-                    let Some(app) = weak.upgrade() else {
-                        tracing::info!("Flood consumer exiting: app dropped");
-                        return;
-                    };
                     let delivery_latency = overlay_msg.received_at.elapsed();
                     tracing::debug!(
                         latency_ms = delivery_latency.as_millis(),
@@ -2269,19 +2295,20 @@ impl App {
                     app.handle_overlay_message(overlay_msg).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // Only non-critical messages (TX floods) flow through the
-                    // broadcast channel now, so lag is expected under load.
-                    // [maxtps_diag] Count dropped flood messages — under load
-                    // these are demanded txs the node never receives, forcing
-                    // re-demands (stellar_overlay_demand_timeout_total) and
-                    // leaving the agreed set short. Core never drops flooded
-                    // txs (flow-controlled per-peer queues).
-                    metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total")
-                        .increment(n);
-                    tracing::debug!(
-                        skipped = n,
-                        "Overlay broadcast receiver lagged (non-critical messages only)"
-                    );
+                    // An unrecoverable discard: the flood consumer fell behind
+                    // the bounded broadcast channel and these inbound flood
+                    // messages (TX) are gone. Under load these are demanded txs
+                    // the node never receives, forcing re-demands
+                    // (stellar_overlay_demand_timeout_total) and leaving the
+                    // agreed set short. Core never drops flooded txs
+                    // (flow-controlled per-peer queues). Emitted at warn! —
+                    // this is more severe than the recoverable `queue_full`
+                    // admission reject (also warn!), not less (#3778).
+                    record_broadcast_lag(n);
+                    // Sample the residual backlog after the lag event.
+                    if let Some(app) = weak.upgrade() {
+                        app.update_broadcast_depth(rx.len());
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!("Overlay broadcast channel closed; flood consumer exiting");
@@ -5032,5 +5059,32 @@ mod tx_set_gc_offload_tests {
         if let Some(h) = slot.take() {
             let _ = tokio::time::timeout(Duration::from_secs(35), h).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_lag_tests {
+    use super::record_broadcast_lag;
+
+    /// #3778: a broadcast lag must increment the existing
+    /// `stellar_overlay_broadcast_lagged_dropped_total` counter by the number
+    /// of skipped messages, on a pristine local recorder so the assertion is
+    /// deterministic. The `warn!` promotion is exercised implicitly (the
+    /// helper emits it); the counter is the load-bearing, testable signal.
+    #[test]
+    fn test_record_broadcast_lag_increments_counter() {
+        let (recorder, handle) = crate::metrics::fresh_local_recorder();
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::metrics::describe_metrics();
+            crate::metrics::register_label_series();
+
+            record_broadcast_lag(5);
+
+            let out = handle.render();
+            assert!(
+                out.contains("stellar_overlay_broadcast_lagged_dropped_total 5"),
+                "lagged discard must be counted; got:\n{out}"
+            );
+        });
     }
 }

@@ -380,6 +380,11 @@ metric_catalog! {
             => "Current depth of the overlay fetch-response channel (event-loop sampled)";
         OVERLAY_FETCH_CHANNEL_DEPTH_MAX = "henyey_overlay_fetch_channel_depth_max"
             => "Monotonic maximum depth of the overlay fetch-response channel since process start";
+        // Overlay flood broadcast channel (#3778).
+        OVERLAY_BROADCAST_CHANNEL_DEPTH = "henyey_overlay_broadcast_depth"
+            => "Current depth of the overlay flood broadcast channel (flood-consumer sampled)";
+        OVERLAY_BROADCAST_CHANNEL_DEPTH_MAX = "henyey_overlay_broadcast_depth_max"
+            => "Monotonic maximum depth of the overlay flood broadcast channel since process start";
 
         // SCP/herder gauges.
         HERDER_STATE = "stellar_herder_state"
@@ -1310,6 +1315,8 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     // Overlay fetch channel.
     OVERLAY_FETCH_CHANNEL_DEPTH.set(snap.overlay_fetch_channel.depth as f64);
     OVERLAY_FETCH_CHANNEL_DEPTH_MAX.set(snap.overlay_fetch_channel.depth_max as f64);
+    OVERLAY_BROADCAST_CHANNEL_DEPTH.set(snap.overlay_broadcast_channel.depth as f64);
+    OVERLAY_BROADCAST_CHANNEL_DEPTH_MAX.set(snap.overlay_broadcast_channel.depth_max as f64);
 
     // Catchup.
     POST_CATCHUP_HARD_RESET_TOTAL.absolute(snap.post_catchup_hard_reset_total);
