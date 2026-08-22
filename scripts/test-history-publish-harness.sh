@@ -457,8 +457,151 @@ test_diagnostic_grep_pins_known_signal_names() {
     fi
 }
 
+# ============================================================
+# Tests 10-12: the live-tail diagnostic echo advances its line offset by
+# exactly the number of lines it actually read (#3745).
+#
+# Root cause the tests pin: the old inline live-tail block read validator.log
+# twice — a `wc -l` line count then a separate `tail -n +N`. If the log grew
+# between the two reads, the recorded offset (from the earlier, smaller count)
+# lagged what tail emitted, so the next poll re-tailed from the same offset and
+# reprinted already-seen diagnostic lines. The fix collapses this to a single
+# read whose new offset is derived from exactly the emitted slice, driven
+# offline via the --emit-new-lines-only <log_file> <last_line> seam.
+#
+# FAIL on origin/main: --emit-new-lines-only does not exist (the script hits
+# the `*) echo "Unknown arg: $1"; exit 1 ;;` branch — exit 1, no NEW_LAST_LINE:
+# marker, matching lines never emitted). Same seam-absent precedent as the
+# stall-detector tests 7/8.
+# ============================================================
+
+# Build a 5-line synthetic validator.log with exactly 2 diagnostic-matching
+# lines (WATCHDOG and db_write_ctx families).
+make_tail_fixture() {
+    local name="$1"
+    local data_dir="$TMPDIR_BASE/tail-fixture-$name"
+    local log="$data_dir/validator.log"
+
+    mkdir -p "$data_dir"
+    {
+        echo "closing ledger 1"
+        echo "WATCHDOG: scp verify falling behind under load"
+        echo "closing ledger 2"
+        echo 'db_write_ctx = "peer-record-update" slow write'
+        echo "closing ledger 3"
+    } > "$log"
+
+    echo "$log"
+}
+
+# ------------------------------------------------------------
+# Test 10: reported offset equals the number of lines actually read/emitted.
+# A fresh 5-line log (2 matching) tailed from offset 0 must emit exactly those
+# 2 diagnostic lines and report NEW_LAST_LINE: 5 — the invariant the TOCTOU
+# broke (old code advanced by an independent `wc -l` that could differ from
+# what tail read).
+# ------------------------------------------------------------
+test_live_tail_offset_matches_consumed_lines() {
+    local log
+    log=$(make_tail_fixture "offset")
+
+    local out="$TMPDIR_BASE/out-tail-offset.txt"
+    local exit_code=0
+    "$SCRIPT" --emit-new-lines-only "$log" 0 >"$out" 2>&1 || exit_code=$?
+
+    local emitted
+    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c .)
+    if [[ "$emitted" -eq 2 ]] \
+        && grep -q 'WATCHDOG' "$out" && grep -q 'db_write_ctx' "$out"; then
+        tap_ok "live_tail_emits_exactly_the_matching_lines"
+    else
+        tap_not_ok "live_tail_emits_exactly_the_matching_lines" \
+            "expected 2 diagnostic lines (WATCHDOG + db_write_ctx), got $emitted: $(cat "$out")"
+    fi
+
+    if grep -q '^NEW_LAST_LINE: 5$' "$out"; then
+        tap_ok "live_tail_offset_equals_lines_read"
+    else
+        tap_not_ok "live_tail_offset_equals_lines_read" \
+            "expected NEW_LAST_LINE: 5, got: $(cat "$out")"
+    fi
+}
+
+# ------------------------------------------------------------
+# Test 11: idempotent no-reprint on an unchanged file — the direct
+# anti-duplicate assertion for the reported symptom. After consuming the 5-line
+# log (offset 5), re-tailing the unchanged file from offset 5 must emit no
+# diagnostic line, report NEW_LAST_LINE: 5, and exit 0.
+# ------------------------------------------------------------
+test_live_tail_no_reprint_on_second_call() {
+    local log
+    log=$(make_tail_fixture "noreprint")
+
+    local out="$TMPDIR_BASE/out-tail-noreprint.txt"
+    local exit_code=0
+    "$SCRIPT" --emit-new-lines-only "$log" 5 >"$out" 2>&1 || exit_code=$?
+
+    local emitted
+    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c .)
+    if [[ "$emitted" -eq 0 ]]; then
+        tap_ok "live_tail_no_reprint_of_seen_lines"
+    else
+        tap_not_ok "live_tail_no_reprint_of_seen_lines" \
+            "expected no diagnostic lines re-emitted, got $emitted: $(cat "$out")"
+    fi
+
+    if grep -q '^NEW_LAST_LINE: 5$' "$out"; then
+        tap_ok "live_tail_offset_unchanged_on_no_growth"
+    else
+        tap_not_ok "live_tail_offset_unchanged_on_no_growth" \
+            "expected NEW_LAST_LINE: 5, got: $(cat "$out")"
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "live_tail_no_reprint_exits_zero"
+    else
+        tap_not_ok "live_tail_no_reprint_exits_zero" "exit=$exit_code (expected 0)"
+    fi
+}
+
+# ------------------------------------------------------------
+# Test 12: correct incremental progress across an append. After consuming the
+# 5-line log (offset 5), append 3 lines (1 matching); tailing from offset 5
+# must emit exactly the 1 new matching line and report NEW_LAST_LINE: 8.
+# ------------------------------------------------------------
+test_live_tail_incremental_append() {
+    local log
+    log=$(make_tail_fixture "append")
+
+    {
+        echo "closing ledger 4"
+        echo "straggler timeout waiting on peer"
+        echo "closing ledger 5"
+    } >> "$log"
+
+    local out="$TMPDIR_BASE/out-tail-append.txt"
+    local exit_code=0
+    "$SCRIPT" --emit-new-lines-only "$log" 5 >"$out" 2>&1 || exit_code=$?
+
+    local emitted
+    emitted=$(grep -v '^NEW_LAST_LINE:' "$out" | grep -c .)
+    if [[ "$emitted" -eq 1 ]] && grep -q 'straggler timeout' "$out"; then
+        tap_ok "live_tail_emits_only_new_matching_line"
+    else
+        tap_not_ok "live_tail_emits_only_new_matching_line" \
+            "expected 1 new diagnostic line (straggler timeout), got $emitted: $(cat "$out")"
+    fi
+
+    if grep -q '^NEW_LAST_LINE: 8$' "$out"; then
+        tap_ok "live_tail_offset_advances_across_append"
+    else
+        tap_not_ok "live_tail_offset_advances_across_append" \
+            "expected NEW_LAST_LINE: 8, got: $(cat "$out")"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 21
+tap_plan 28
 
 test_never_synced_soft_skip
 test_synced_no_publish_hard_red
@@ -469,6 +612,9 @@ test_workflow_wires_soft_flag
 test_stall_detector_flags_stale_log
 test_stall_detector_ignores_fresh_log
 test_diagnostic_grep_pins_known_signal_names
+test_live_tail_offset_matches_consumed_lines
+test_live_tail_no_reprint_on_second_call
+test_live_tail_incremental_append
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
