@@ -3900,4 +3900,101 @@ mod tests {
              (timer-driven, not immediate)"
         );
     }
+
+    // ── checkpoint-phase onset diagnostics (#3902) ──────────────────────
+    //
+    // These cover the two pure helpers that feed the "Recovery stall onset —
+    // diagnostic snapshot" INFO line so the checkpoint-boundary phase-lock and
+    // the long/short duration split become queryable from live fields instead
+    // of a 306 h offline log reconstruction.
+
+    #[test]
+    fn test_ledgers_past_checkpoint_boundary_and_window() {
+        use super::ledgers_past_checkpoint;
+        // Real mainnet-shaped values from #3902: boundary 64066751, and the
+        // 340 s freeze at 64066755 sits at boundary+4. A checkpoint boundary
+        // ledger reports phase 0; each subsequent ledger increments by 1.
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_751),
+            0,
+            "checkpoint boundary ledger must report phase 0"
+        );
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_752),
+            1,
+            "boundary+1 must report phase 1"
+        );
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_755),
+            4,
+            "the 340 s freeze ledger sits at boundary+4 (issue's own value)"
+        );
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_758),
+            7,
+            "boundary+7 is the far edge of the phase-lock band (0..=7)"
+        );
+    }
+
+    #[test]
+    fn test_ledgers_past_checkpoint_period_tracks_frequency() {
+        use super::ledgers_past_checkpoint;
+        use henyey_history::checkpoint::checkpoint_frequency;
+        // The phase must reset to 0 exactly every `checkpoint_frequency()`
+        // ledgers — proving the helper is coupled to the configured checkpoint
+        // cadence rather than a hardcoded `% 64`. Expressed symbolically in
+        // terms of the live frequency (mutating the process-global OnceLock
+        // from a unit test is unsafe — see deviation note).
+        let f = checkpoint_frequency();
+        assert_eq!(ledgers_past_checkpoint(f - 1), 0, "boundary ledger → 0");
+        assert_eq!(ledgers_past_checkpoint(f), 1, "boundary+1 → 1");
+        assert_eq!(
+            ledgers_past_checkpoint(2 * f - 1),
+            0,
+            "next boundary → 0 (period == checkpoint_frequency())"
+        );
+        assert_eq!(ledgers_past_checkpoint(2 * f), 1, "next boundary+1 → 1");
+    }
+
+    #[test]
+    fn test_ledgers_past_checkpoint_before_first_checkpoint() {
+        use super::ledgers_past_checkpoint;
+        use henyey_history::checkpoint::checkpoint_frequency;
+        // Before the first checkpoint boundary (seq < freq-1) there is no
+        // prior boundary; the helper returns the ledger itself with no panic
+        // or underflow.
+        let f = checkpoint_frequency();
+        assert_eq!(ledgers_past_checkpoint(0), 0, "genesis must not underflow");
+        assert_eq!(
+            ledgers_past_checkpoint(f - 2),
+            f - 2,
+            "one ledger before the first boundary reports the raw ledger"
+        );
+    }
+
+    #[test]
+    fn test_archive_checkpoint_lag_known_and_cold() {
+        use super::archive_checkpoint_lag;
+        // Archive one checkpoint behind the next boundary (the #3902 window:
+        // archive_latest=64066687 is exactly one checkpoint back from
+        // next_checkpoint=64066751) → positive lag.
+        assert_eq!(
+            archive_checkpoint_lag(64_066_751, Some(64_066_687)),
+            64,
+            "archive one checkpoint behind → +64"
+        );
+        // Archive ahead of the next boundary → negative lag (no wraparound).
+        assert_eq!(
+            archive_checkpoint_lag(64_066_751, Some(64_066_815)),
+            -64,
+            "archive ahead of next checkpoint → negative"
+        );
+        // Cache cold: archive latest unknown this tick → -1 sentinel, not a
+        // misleading 0.
+        assert_eq!(
+            archive_checkpoint_lag(64_066_751, None),
+            -1,
+            "cold cache → -1 sentinel"
+        );
+    }
 }
