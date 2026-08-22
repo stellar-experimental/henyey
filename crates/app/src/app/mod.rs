@@ -4222,6 +4222,10 @@ impl App {
                         .as_nanos() as u64;
                     (nanos ^ ((pid as u64) << 32)) | 1
                 };
+                // Latch for the once-per-episode pre-abort near-miss warning
+                // (#3767): set on the rising edge of `should_warn_pre_abort`,
+                // reset when the stall clears.
+                let mut pre_abort_warned = false;
                 loop {
                     // Sleep via condvar so we can be woken promptly on
                     // shutdown. The delay is drawn fresh each iteration in
@@ -4344,6 +4348,15 @@ impl App {
                         WatchdogTier::None => {}
                     }
 
+                    // Pre-abort near-miss (#3767): a warn-only signal at
+                    // 0.75× the abort threshold, fired once per stall episode.
+                    // Emitted after the tier match but BEFORE the
+                    // `should_abort()` block, which calls `abort()` and never
+                    // returns.
+                    if pre_abort_edge(&mut pre_abort_warned, snap.should_warn_pre_abort()) {
+                        snap.emit_pre_abort_warn();
+                    }
+
                     // Auto-abort: independent of the tier check so that
                     // any configured threshold (even < 30s) is respected.
                     // Checked after the tier match so diagnostics are
@@ -4401,7 +4414,7 @@ impl App {
             })
             .expect("Failed to spawn watchdog thread");
 
-        tracing::info!("Event loop watchdog started");
+        emit_watchdog_started_line(abort_threshold_secs);
 
         WatchdogGuard {
             shutdown,
@@ -4850,6 +4863,49 @@ impl WatchdogSnapshot {
         self.abort_threshold_secs > 0 && self.stale_secs >= self.abort_threshold_secs
     }
 
+    /// The pre-abort near-miss threshold in seconds: 0.75× the armed abort
+    /// threshold, floored at 1s.
+    ///
+    /// Returns `0` when auto-abort is disabled (`abort_threshold_secs == 0`).
+    /// The `.max(1)` floor prevents a degenerate trip at `stale_secs == 0` for
+    /// tiny abort thresholds (1–3), where integer `* 3 / 4` would round to 0
+    /// (#3767).
+    pub(crate) fn pre_abort_threshold_secs(&self) -> u64 {
+        if self.abort_threshold_secs > 0 {
+            (self.abort_threshold_secs * 3 / 4).max(1)
+        } else {
+            0
+        }
+    }
+
+    /// Whether the event loop has been stale long enough to warrant a
+    /// warn-only "approaching auto-abort" near-miss signal.
+    ///
+    /// Enabled only when auto-abort is armed. Independent of the abort itself —
+    /// this is a distinct, earlier signal (#3767).
+    pub(crate) fn should_warn_pre_abort(&self) -> bool {
+        self.abort_threshold_secs > 0 && self.stale_secs >= self.pre_abort_threshold_secs()
+    }
+
+    /// Emit the warn-only pre-abort near-miss event.
+    ///
+    /// This is deliberately a **distinct** signal from both the sampler
+    /// `emit_error()` and the loop-side stall event: it carries neither the
+    /// `watchdog_freeze` field, the `"Event loop appears frozen"` text, nor the
+    /// loop-side `"exact accounting"` message, so it cannot match any
+    /// monitor-tick auto-restart grep in `scripts/lib/monitor-decisions.sh`
+    /// (#3767).
+    pub(crate) fn emit_pre_abort_warn(&self) {
+        tracing::warn!(
+            stale_secs = self.stale_secs,
+            phase = self.phase,
+            phase_sub = self.phase_sub,
+            abort_threshold_secs = self.abort_threshold_secs,
+            pre_abort_threshold_secs = self.pre_abort_threshold_secs(),
+            "WATCHDOG: Event loop approaching auto-abort threshold"
+        );
+    }
+
     /// Emit the ≥15s warning-tier WATCHDOG event.
     ///
     /// `pid` is intentionally omitted (matches the existing schema —
@@ -4881,6 +4937,52 @@ impl WatchdogSnapshot {
             WATCHDOG_PHASE_LEGEND,
         );
     }
+}
+
+/// Pure once-per-episode edge helper for the pre-abort near-miss warning.
+///
+/// Returns `true` (and latches `*warned = true`) only on a *rising* edge — the
+/// first sample of a stall episode where `should_warn` becomes true. While the
+/// stall persists (`should_warn` stays true) it returns `false`, so the warning
+/// fires exactly once per episode rather than on every sample. When the stall
+/// clears (`should_warn == false`) it resets the latch so the next episode can
+/// fire again (#3767).
+pub(crate) fn pre_abort_edge(warned: &mut bool, should_warn: bool) -> bool {
+    if should_warn {
+        if !*warned {
+            *warned = true;
+            return true;
+        }
+        false
+    } else {
+        *warned = false;
+        false
+    }
+}
+
+/// Emit the boot-time INFO line recording every armed watchdog threshold.
+///
+/// Extracted as a free fn (called from `start_event_loop_watchdog`) so the
+/// rendered line is unit-testable via the capturing-subscriber pattern. All
+/// values are read from the watchdog's constants — `pre_abort_threshold_secs`
+/// is derived the same way as [`WatchdogSnapshot::pre_abort_threshold_secs`]
+/// (0.75× floored at 1, or 0 when abort is disabled) so the boot line and the
+/// runtime tier cannot drift (#3767).
+pub(crate) fn emit_watchdog_started_line(abort_threshold_secs: u64) {
+    let pre_abort_threshold_secs = if abort_threshold_secs > 0 {
+        (abort_threshold_secs * 3 / 4).max(1)
+    } else {
+        0
+    };
+    tracing::info!(
+        abort_threshold_secs,
+        warn_threshold_secs = EVENT_LOOP_STALL_WARN_SECS,
+        error_threshold_secs = EVENT_LOOP_STALL_ERROR_SECS,
+        sample_period_base_ms = WATCHDOG_SAMPLE_PERIOD_BASE_MS,
+        sample_jitter_max_ms = WATCHDOG_SAMPLE_JITTER_MAX_MS,
+        pre_abort_threshold_secs,
+        "Event loop watchdog started"
+    );
 }
 
 /// Tiers:
@@ -8913,6 +9015,195 @@ mod tests {
         snap.stale_secs = 10;
         assert_eq!(snap.tier(), super::WatchdogTier::None);
         assert!(snap.should_abort(), "abort must fire even below Warn tier");
+    }
+
+    /// Pre-abort near-miss threshold + `should_warn_pre_abort` boundary
+    /// routing (#3767).
+    #[test]
+    fn watchdog_pre_abort_threshold_routing() {
+        // Default mainnet abort threshold: 120 → pre-abort 90.
+        let mut snap = test_snapshot(0);
+        snap.abort_threshold_secs = 120;
+        assert_eq!(snap.pre_abort_threshold_secs(), 90);
+
+        snap.stale_secs = 89;
+        assert!(
+            !snap.should_warn_pre_abort(),
+            "89s < 90s pre-abort must not trip"
+        );
+        snap.stale_secs = 90;
+        assert!(
+            snap.should_warn_pre_abort(),
+            "exactly at 90s pre-abort must trip"
+        );
+        snap.stale_secs = 119;
+        assert!(
+            snap.should_warn_pre_abort(),
+            "still below the 120s abort but past pre-abort must trip"
+        );
+
+        // Disabled auto-abort: pre-abort is 0 and never trips.
+        snap.abort_threshold_secs = 0;
+        assert_eq!(snap.pre_abort_threshold_secs(), 0);
+        snap.stale_secs = 999;
+        assert!(
+            !snap.should_warn_pre_abort(),
+            "pre-abort must never trip when auto-abort is disabled"
+        );
+
+        // Tiny abort threshold: `* 3 / 4` rounds to 0, floored at 1 by `.max(1)`.
+        snap.abort_threshold_secs = 2;
+        assert_eq!(
+            snap.pre_abort_threshold_secs(),
+            1,
+            "tiny threshold floors pre-abort at 1, not 0"
+        );
+        snap.stale_secs = 0;
+        assert!(
+            !snap.should_warn_pre_abort(),
+            "stale=0 must not trip even the floored pre-abort"
+        );
+        snap.stale_secs = 1;
+        assert!(
+            snap.should_warn_pre_abort(),
+            "stale=1 at floored pre-abort=1 must trip"
+        );
+    }
+
+    /// The pure `pre_abort_edge` helper fires exactly once per stall episode
+    /// (rising edge only) and re-arms after the stall clears (#3767).
+    #[test]
+    fn watchdog_pre_abort_edge_fires_once_per_episode() {
+        let inputs = [false, true, true, true, false, true];
+        let mut warned = false;
+        let fired: Vec<bool> = inputs
+            .iter()
+            .map(|&should_warn| super::pre_abort_edge(&mut warned, should_warn))
+            .collect();
+        // Rising edges are at index 1 (first true) and index 5 (true after the
+        // false reset at index 4); the sustained trues at 2,3 must not re-fire.
+        assert_eq!(
+            fired,
+            vec![false, true, false, false, false, true],
+            "pre_abort_edge must fire only on rising edges"
+        );
+    }
+
+    /// `emit_pre_abort_warn()` is a WARN with a distinct message that carries
+    /// none of monitor-tick's auto-restart grep patterns (#3767).
+    #[test]
+    fn watchdog_pre_abort_warn_does_not_trip_restart_grep() {
+        let sub = WatchdogCapturingSubscriber::default();
+        let events = sub.events.clone();
+        let mut snap = test_snapshot(90);
+        snap.abort_threshold_secs = 120;
+        tracing::subscriber::with_default(sub, || {
+            snap.emit_pre_abort_warn();
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one event expected");
+        let ev = &events[0];
+
+        assert_eq!(ev.level, tracing::Level::WARN, "must be WARN level");
+
+        // Distinct message + fields present.
+        assert!(
+            ev.fields
+                .contains("WATCHDOG: Event loop approaching auto-abort threshold"),
+            "distinct message: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("stale_secs=90"),
+            "stale_secs: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("abort_threshold_secs=120"),
+            "abort_threshold_secs: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("pre_abort_threshold_secs=90"),
+            "pre_abort_threshold_secs: {}",
+            ev.fields
+        );
+
+        // Must carry NONE of monitor-tick's auto-restart grep patterns.
+        assert!(
+            !ev.fields.contains("watchdog_freeze"),
+            "must not carry watchdog_freeze: {}",
+            ev.fields
+        );
+        assert!(
+            !ev.fields.contains("WATCHDOG: Event loop appears frozen"),
+            "must not carry the frozen sentinel text: {}",
+            ev.fields
+        );
+        assert!(
+            !ev.fields.contains("loop-side exact accounting"),
+            "must not carry the loop-side exact-accounting text: {}",
+            ev.fields
+        );
+    }
+
+    /// The boot-time INFO line records every armed threshold (#3767).
+    ///
+    /// Uses the level-agnostic `WatchdogCapturingSubscriber` (its `enabled()`
+    /// returns true for all levels), so the INFO line is captured — the
+    /// existing `render()` helper's hard-coded `error` filter would drop it.
+    #[test]
+    fn watchdog_boot_line_records_all_thresholds() {
+        // Armed: abort=120 → pre_abort=90, with all constants.
+        let sub = WatchdogCapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            super::emit_watchdog_started_line(120);
+        });
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 1, "exactly one event expected");
+            let ev = &events[0];
+            assert_eq!(ev.level, tracing::Level::INFO, "must be INFO level");
+            assert!(
+                ev.fields.contains("Event loop watchdog started"),
+                "message: {}",
+                ev.fields
+            );
+            for expected in [
+                "abort_threshold_secs=120",
+                "warn_threshold_secs=15",
+                "error_threshold_secs=30",
+                "sample_period_base_ms=7000",
+                "sample_jitter_max_ms=3000",
+                "pre_abort_threshold_secs=90",
+            ] {
+                assert!(
+                    ev.fields.contains(expected),
+                    "boot line must carry {expected}: {}",
+                    ev.fields
+                );
+            }
+        }
+
+        // Disabled: abort=0 → pre_abort=0.
+        let sub = WatchdogCapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            super::emit_watchdog_started_line(0);
+        });
+        let events = events.lock().unwrap();
+        let ev = &events[0];
+        assert!(
+            ev.fields.contains("abort_threshold_secs=0"),
+            "disabled abort: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("pre_abort_threshold_secs=0"),
+            "disabled pre-abort: {}",
+            ev.fields
+        );
     }
 
     // ------------------------------------------------------------------
