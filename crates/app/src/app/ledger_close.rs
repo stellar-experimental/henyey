@@ -2144,6 +2144,18 @@ impl App {
             );
 
             self.ledger_manager.log_bucket_list_debug(next_seq);
+
+            // #3905: our committed LCL (next_seq - 1, hash `our_header_hash`) is
+            // proven divergent from the network — the network's authoritative
+            // L(next_seq).previousLedgerHash disagrees with it. Persist a
+            // one-shot archive-rebuild latch keyed to that LCL BEFORE the fatal
+            // exit, so the FIRST automatic restart self-heals via an
+            // archive-authoritative bucket-apply (bypassing the bad LCL) instead
+            // of requiring a manual state wipe. `next_seq - 1` is our LCL:
+            // `our_header_hash` is `header_snapshot().hash`, the current (LCL)
+            // header hash.
+            self.write_archive_rebuild_latch(next_seq - 1, &our_header_hash);
+
             self.trigger_fatal_shutdown(&format!(
                 "pre-close hash mismatch at ledger {next_seq}: \
                  our header hash {} does not match network's previous \

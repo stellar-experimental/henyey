@@ -527,6 +527,39 @@ mod tests {
         );
     }
 
+    /// #3905: the mechanism behind the divergent-LCL self-heal. For a COMMITTED
+    /// LCL (> genesis), Case 1 pins the range to `ReplayOnly`, which knits onto
+    /// the (divergent) LCL and fails. Feeding the *effective* lcl as genesis (the
+    /// #3905 bypass, gated on a proven-divergent latch in `henyey-app`) flips the
+    /// same target to an archive-authoritative bucket-apply that ignores the bad
+    /// local state.
+    #[test]
+    fn test_committed_lcl_bypass_flips_replay_only_to_bucket_apply() {
+        let divergent_lcl = 64_069_503u32; // 63 mod 64 (a checkpoint boundary)
+        let target = 64_069_567u32; // the next checkpoint
+        assert!(is_checkpoint_ledger(target), "target must be a checkpoint");
+
+        // Without the bypass: committed LCL > genesis → ReplayOnly (knits onto
+        // the divergent LCL — the crash-loop the incident demonstrated).
+        let replay = CatchupRange::calculate(divergent_lcl, target, CatchupMode::Minimal).unwrap();
+        assert!(
+            matches!(replay, CatchupRange::ReplayOnly { .. }),
+            "a committed LCL must map to ReplayOnly, got {replay:?}"
+        );
+
+        // With the #3905 bypass (effective lcl = genesis): archive-authoritative
+        // bucket-apply, which downloads the archive HAS and ignores local state.
+        let rebuilt =
+            CatchupRange::calculate(GENESIS_LEDGER_SEQ, target, CatchupMode::Minimal).unwrap();
+        assert!(
+            matches!(
+                rebuilt,
+                CatchupRange::BucketsOnly { .. } | CatchupRange::BucketApplyAndReplay { .. }
+            ),
+            "the genesis bypass must yield a bucket-apply, got {rebuilt:?}"
+        );
+    }
+
     #[test]
     fn test_minimal_lcl_past_genesis_small_gap_replays() {
         // Minimal mode with persisted LCL and a SMALL gap (< threshold) — must replay,

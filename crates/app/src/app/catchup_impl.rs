@@ -45,6 +45,81 @@ pub(crate) fn genesis_recovery_catchup_plan(
     }
 }
 
+/// #3905 (Half A): given the on-disk `current` LCL, the mode already resolved by
+/// [`genesis_recovery_catchup_plan`], and whether a full archive rebuild is
+/// forced (`force_full` / a proven-divergent latch), compute the recovery
+/// routing that actually bypasses a committed divergent LCL.
+///
+/// Returns `(override_lcl, effective_mode, force_archive_rebuild)`:
+/// - When `force_full` is set for a **committed** divergent LCL
+///   (`current > GENESIS_LEDGER_SEQ`), the divergent LCL is bypassed by feeding
+///   the *effective* lcl as [`GENESIS_LEDGER_SEQ`] and forcing
+///   [`CatchupMode::Minimal`], so `CatchupRange::calculate` yields a
+///   `BucketsOnly` / `BucketApplyAndReplay` range — an archive-authoritative
+///   bucket-apply that ignores the bad local state (mirrors stellar-core
+///   `CatchupWork::downloadApplyBuckets`). This is the gap the incident hit:
+///   `force_full` alone clears `existing_state`/`override_lcl` but leaves the
+///   effective lcl at the divergent on-disk value, which Case 1 pins to
+///   `ReplayOnly` — knitting straight back onto the divergent LCL.
+/// - Otherwise nothing changes: `override_lcl = None`, the configured mode is
+///   preserved, and `force_archive_rebuild = false`. A healthy (non-`force_full`)
+///   catchup is byte-for-byte unchanged, so INV-C15 and the #3282/#3288/#3410
+///   semantics are preserved — the bypass is gated strictly on a proven-divergent
+///   `force_full`, never a normal catchup.
+///
+/// Genesis (`current == GENESIS_LEDGER_SEQ`) needs no committed-LCL bypass: it is
+/// already archive-authoritative via `genesis_recovery_catchup_plan`.
+pub(crate) fn archive_rebuild_recovery_plan(
+    current: u32,
+    mode_after_genesis_plan: CatchupMode,
+    force_full: bool,
+) -> (Option<u32>, CatchupMode, bool) {
+    if force_full && current > GENESIS_LEDGER_SEQ {
+        (Some(GENESIS_LEDGER_SEQ), CatchupMode::Minimal, true)
+    } else {
+        (None, mode_after_genesis_plan, false)
+    }
+}
+
+/// #3905 (Half B): whether a persisted archive-rebuild latch still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LatchDecision {
+    /// No latch is present.
+    Absent,
+    /// The latch matches the on-disk LCL (still divergent) — force an archive
+    /// rebuild on the next catchup.
+    Rebuild,
+    /// The latch no longer matches the on-disk LCL (already healed / state
+    /// replaced / no LCL) — clear it.
+    Stale,
+}
+
+/// #3905 (Half B): parse the `"<seq>:<hex-header-hash>"` latch encoding.
+/// Returns `None` for any malformed value (treated as "no latch").
+pub(crate) fn parse_archive_rebuild_latch(raw: &str) -> Option<(u32, Hash256)> {
+    let (seq_str, hash_str) = raw.split_once(':')?;
+    let seq = seq_str.parse::<u32>().ok()?;
+    let hash = Hash256::from_hex(hash_str).ok()?;
+    Some((seq, hash))
+}
+
+/// #3905 (Half B): decide whether a persisted latch still applies to the current
+/// on-disk LCL. Rebuild only when the latch matches the LCL seq **and** hash
+/// (state still divergent); any mismatch (LCL advanced, hash replaced, or no LCL
+/// on disk) is stale and must be cleared so the latch cannot re-fire once healed.
+pub(crate) fn evaluate_archive_rebuild_latch(
+    latch: Option<(u32, Hash256)>,
+    on_disk_lcl: Option<(u32, Hash256)>,
+) -> LatchDecision {
+    match (latch, on_disk_lcl) {
+        (None, _) => LatchDecision::Absent,
+        (Some((lseq, lhash)), Some((dseq, dhash))) if lseq == dseq && lhash == dhash => {
+            LatchDecision::Rebuild
+        }
+        (Some(_), _) => LatchDecision::Stale,
+    }
+}
+
 impl App {
     pub(crate) fn should_skip_externalized_catchup_cooldown(
         target_checkpoint: u32,
@@ -263,6 +338,25 @@ impl App {
             );
         }
 
+        // #3905 (Half A): a `force_full` recovery on a COMMITTED divergent LCL
+        // (current > genesis) must bypass the divergent LCL entirely so the
+        // range becomes an archive-authoritative bucket-apply, not a ReplayOnly
+        // that knits back onto the bad LCL. `rebuild_override_lcl` (Some(genesis)
+        // when active) is threaded into the else-branch of the seeding block
+        // below; `mode` is forced to Minimal so `CatchupRange::calculate` yields
+        // a bucket-apply. Non-`force_full` catchups are unchanged.
+        let (rebuild_override_lcl, mode, force_archive_rebuild) =
+            archive_rebuild_recovery_plan(current, mode, force_full);
+        if force_archive_rebuild {
+            tracing::warn!(
+                current_lcl = current,
+                target_ledger,
+                "Committed LCL is proven divergent — routing force_full recovery to an \
+                 archive-authoritative bucket-apply that bypasses the divergent LCL \
+                 (effective lcl = genesis, Minimal depth), ignoring local state (#3905)"
+            );
+        }
+
         // #3282: track whether this catchup is seeded from CLONED LOCAL state.
         // Only the near-tip fast path below (initialized ledger manager, no
         // force_full) clones the live LCL header and sets `override_lcl`,
@@ -333,6 +427,12 @@ impl App {
                     }
                 }
             }
+        } else if force_archive_rebuild {
+            // #3905: archive-authoritative rebuild bypassing the divergent
+            // committed LCL. `existing_state = None` (no local clone) +
+            // `override_lcl = Some(genesis)` drives `run_catchup_work`'s effective
+            // lcl to genesis, so `CatchupRange::calculate` selects a bucket-apply.
+            (None, rebuild_override_lcl)
         } else {
             (None, None)
         };
@@ -726,6 +826,11 @@ impl App {
         // propagated via `?` above, the flag remains set so the next attempt
         // retries with a full bucket-apply (AUDIT-241).
         self.catchup_needs_full_reset.store(false, Ordering::SeqCst);
+
+        // #3905 (Half B): a successful catchup means state is now
+        // archive-authoritative, so the one-shot divergent-LCL rebuild latch has
+        // served its purpose — clear it (idempotent no-op if never set).
+        self.clear_archive_rebuild_latch();
 
         Ok(catchup_result)
     }
@@ -3118,6 +3223,132 @@ impl App {
                 "startup catchup verification/integrity failure: {err}"
             ));
         }
+    }
+
+    /// #3905 (Half B): persist the one-shot archive-rebuild latch keyed to the
+    /// proven-divergent LCL `seq` and its header `hash`. The next restart reads
+    /// this and self-heals via an archive bucket-apply instead of crash-looping
+    /// on `ReplayOnly` knit failures. Stored in `storestate` (inside
+    /// `mainnet.db`), so it survives the forced process exit and a manual wipe
+    /// clears it for free. Best-effort: a persist failure is logged (the node is
+    /// already exiting fatally) but not propagated.
+    pub(crate) fn write_archive_rebuild_latch(&self, seq: u32, hash: &Hash256) {
+        use henyey_db::queries::StateQueries;
+        let value = format!("{seq}:{}", hash.to_hex());
+        match self
+            .db
+            .with_connection(|conn| conn.set_state(state_keys::FORCE_ARCHIVE_REBUILD, &value))
+        {
+            Ok(()) => tracing::warn!(
+                divergent_seq = seq,
+                divergent_hash = %hash.to_hex(),
+                "Persisted archive-rebuild latch — the next restart will self-heal from \
+                 the archive rather than requiring a manual state wipe (#3905)"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "Failed to persist archive-rebuild latch (#3905) — the next restart may \
+                 require a manual wipe"
+            ),
+        }
+    }
+
+    /// #3905 (Half B): read the persisted archive-rebuild latch, if any.
+    pub(crate) fn read_archive_rebuild_latch(&self) -> Option<(u32, Hash256)> {
+        use henyey_db::queries::StateQueries;
+        let raw = self
+            .db
+            .with_connection(|conn| conn.get_state(state_keys::FORCE_ARCHIVE_REBUILD))
+            .ok()??;
+        parse_archive_rebuild_latch(&raw)
+    }
+
+    /// #3905 (Half B): clear the one-shot archive-rebuild latch (idempotent).
+    pub(crate) fn clear_archive_rebuild_latch(&self) {
+        use henyey_db::queries::StateQueries;
+        if let Err(e) = self
+            .db
+            .with_connection(|conn| conn.delete_state(state_keys::FORCE_ARCHIVE_REBUILD))
+        {
+            tracing::error!(error = %e, "Failed to clear archive-rebuild latch (#3905)");
+        }
+    }
+
+    /// #3905 (Half B): at startup, honor a persisted archive-rebuild latch.
+    ///
+    /// Reads the latch and compares it to the on-disk LCL (seq + header hash).
+    /// If they still match (the state is unchanged, i.e. still divergent), sets
+    /// `catchup_needs_full_reset` so the upcoming startup catchup routes to an
+    /// archive-authoritative bucket-apply (Half A). If the LCL has advanced or
+    /// the hash differs (already healed / state replaced), the latch is stale and
+    /// is cleared. Reads persisted DB state directly, so it is valid before the
+    /// ledger manager is initialized.
+    ///
+    /// Returns `true` iff a rebuild was armed.
+    pub(crate) fn prepare_archive_rebuild_from_latch(&self) -> bool {
+        use henyey_db::queries::{LedgerQueries, StateQueries};
+        let latch = self.read_archive_rebuild_latch();
+        let on_disk = self
+            .db
+            .with_connection(|conn| {
+                let seq = conn.get_last_closed_ledger()?;
+                let hash = match seq {
+                    Some(s) => conn.get_ledger_hash(s)?,
+                    None => None,
+                };
+                Ok::<_, henyey_db::DbError>(seq.zip(hash))
+            })
+            .unwrap_or(None);
+
+        match evaluate_archive_rebuild_latch(latch, on_disk) {
+            LatchDecision::Absent => false,
+            LatchDecision::Rebuild => {
+                let (seq, hash) = latch.expect("Rebuild implies a latch");
+                tracing::warn!(
+                    divergent_seq = seq,
+                    divergent_hash = %hash.to_hex(),
+                    "Archive-rebuild latch matches the on-disk LCL (still divergent) — \
+                     forcing an archive-authoritative bucket-apply on startup catchup (#3905)"
+                );
+                self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
+                true
+            }
+            LatchDecision::Stale => {
+                tracing::info!(
+                    ?latch,
+                    ?on_disk,
+                    "Archive-rebuild latch is stale (LCL advanced / state replaced) — \
+                     clearing it (#3905)"
+                );
+                self.clear_archive_rebuild_latch();
+                false
+            }
+        }
+    }
+
+    /// #3905 (Half B — transient vs terminal, Critic A): handle a startup-catchup
+    /// failure with respect to the archive-rebuild latch.
+    ///
+    /// - **Terminal** (`startup_catchup_failure_requires_wipe` — a fatal
+    ///   verification/integrity/knit failure): the archive rebuild itself
+    ///   diverged, so clear the one-shot latch (to prevent an infinite heal loop)
+    ///   and signal a wipe.
+    /// - **Transient** (archive not ahead yet — the #3779 "checkpoint not ahead
+    ///   of min_ledger" condition — or download/ENOSPC): keep the latch for the
+    ///   next restart and do **not** signal a wipe.
+    ///
+    /// Returns `true` iff a wipe was signalled (terminal).
+    pub(crate) fn handle_startup_catchup_failure_with_latch(&self, err: &anyhow::Error) -> bool {
+        let terminal = self.startup_catchup_failure_requires_wipe(err);
+        if terminal {
+            // The archive-authoritative rebuild disagreed with the network — a
+            // genuine corruption/parity failure, not a stale local LCL. Clear the
+            // latch so a restart cannot loop heal→re-diverge→heal, then fall
+            // through to the standard wipe signal.
+            self.clear_archive_rebuild_latch();
+        }
+        self.signal_startup_catchup_failure(err);
+        terminal
     }
 
     pub(super) async fn maybe_start_externalized_catchup(
@@ -6263,6 +6494,254 @@ mod tests {
         assert!(
             app.catchup_needs_full_reset.load(Ordering::SeqCst),
             "no-op catchup must not clear catchup_needs_full_reset"
+        );
+    }
+
+    /// #3905: divergent header-hash constant reused across the latch tests.
+    #[cfg(test)]
+    fn divergent_hash() -> Hash256 {
+        Hash256::from_hex("2df7e506dfa9061e5239e7d10cc73e64a951265536c6b1089b6b4a8ec49b57b9")
+            .unwrap()
+    }
+
+    /// #3905: network's (authoritative) hash — distinct from ours.
+    #[cfg(test)]
+    fn network_hash() -> Hash256 {
+        Hash256::from_hex("d30d99aa6db1c6812368a01b91e80478d1d41e4a7b2ba855378bd4949cf1062f")
+            .unwrap()
+    }
+
+    /// #3905 (Half A): with `force_full` set for a COMMITTED divergent LCL
+    /// (LCL > genesis), the recovery plan must bypass the divergent LCL by
+    /// treating it as genesis + Minimal, so `CatchupRange::calculate` yields an
+    /// archive-authoritative bucket-apply instead of `ReplayOnly` knitting onto
+    /// the bad LCL. On `origin/main` no such routing exists — `force_full` alone
+    /// leaves the effective `lcl` at the divergent on-disk value (> genesis),
+    /// which Case 1 pins to `ReplayOnly`.
+    #[test]
+    fn test_divergent_committed_lcl_routes_to_archive_bucket_apply() {
+        use henyey_history::{CatchupMode, GENESIS_LEDGER_SEQ};
+
+        // force_full + committed divergent LCL: bypass to genesis + Minimal.
+        let (override_lcl, mode, rebuild) =
+            archive_rebuild_recovery_plan(64_069_503, CatchupMode::Complete, true);
+        assert!(
+            rebuild,
+            "a committed divergent LCL under force_full must trigger an archive rebuild"
+        );
+        assert_eq!(
+            override_lcl,
+            Some(GENESIS_LEDGER_SEQ),
+            "the divergent committed LCL must be bypassed to genesis"
+        );
+        assert_eq!(
+            mode,
+            CatchupMode::Minimal,
+            "Minimal depth forces CatchupRange into a bucket-apply range"
+        );
+
+        // Without force_full: unchanged — no bypass, configured mode preserved.
+        let (override_lcl, mode, rebuild) =
+            archive_rebuild_recovery_plan(64_069_503, CatchupMode::Complete, false);
+        assert!(!rebuild, "no rebuild without force_full");
+        assert_eq!(override_lcl, None);
+        assert_eq!(mode, CatchupMode::Complete);
+
+        // force_full at genesis: already genesis, so no bypass is needed here
+        // (the genesis recovery plan handles the stateless-fresh case).
+        let (override_lcl, _mode, rebuild) =
+            archive_rebuild_recovery_plan(GENESIS_LEDGER_SEQ, CatchupMode::Minimal, true);
+        assert!(!rebuild, "genesis needs no committed-LCL bypass");
+        assert_eq!(override_lcl, None);
+    }
+
+    /// #3905 (Half B): the persistent latch value round-trips through the
+    /// `<seq>:<hex>` encoding, and malformed values parse to `None`.
+    #[test]
+    fn test_archive_rebuild_latch_parse_round_trip() {
+        let hash = divergent_hash();
+        let raw = format!("{}:{}", 64_069_503u32, hash.to_hex());
+        assert_eq!(
+            parse_archive_rebuild_latch(&raw),
+            Some((64_069_503u32, hash))
+        );
+        assert!(parse_archive_rebuild_latch("garbage").is_none());
+        assert!(parse_archive_rebuild_latch("123").is_none());
+        assert!(parse_archive_rebuild_latch("notanum:deadbeef").is_none());
+        assert!(parse_archive_rebuild_latch("100:nothex").is_none());
+    }
+
+    /// #3905 (Half B): the staleness decision. Rebuild only when the latch
+    /// matches the on-disk LCL seq AND hash (still divergent); otherwise the
+    /// latch is stale (LCL advanced / state replaced) and must be cleared.
+    #[test]
+    fn test_evaluate_archive_rebuild_latch() {
+        let h = divergent_hash();
+        let other = network_hash();
+        assert!(matches!(
+            evaluate_archive_rebuild_latch(None, Some((100, h))),
+            LatchDecision::Absent
+        ));
+        assert!(matches!(
+            evaluate_archive_rebuild_latch(Some((100, h)), Some((100, h))),
+            LatchDecision::Rebuild
+        ));
+        // LCL advanced past the divergent seq → healed → stale.
+        assert!(matches!(
+            evaluate_archive_rebuild_latch(Some((100, h)), Some((101, other))),
+            LatchDecision::Stale
+        ));
+        // Same seq, different hash → state was replaced → stale.
+        assert!(matches!(
+            evaluate_archive_rebuild_latch(Some((100, h)), Some((100, other))),
+            LatchDecision::Stale
+        ));
+        // No on-disk LCL → nothing to rebuild onto → stale.
+        assert!(matches!(
+            evaluate_archive_rebuild_latch(Some((100, h)), None),
+            LatchDecision::Stale
+        ));
+    }
+
+    /// #3905 (Half B): the latch persists across a process restart (it lives in
+    /// `storestate` inside `mainnet.db`), so the FIRST automatic restart after
+    /// the online pre-close fatal can self-heal. On `origin/main` no such key or
+    /// helpers exist.
+    #[tokio::test]
+    async fn test_divergent_lcl_latch_persists_across_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let hash = divergent_hash();
+        {
+            let config = crate::config::ConfigBuilder::new()
+                .database_path(db_path.clone())
+                .build();
+            let app = App::new(config).await.unwrap();
+            assert!(app.read_archive_rebuild_latch().is_none());
+            app.write_archive_rebuild_latch(64_069_503, &hash);
+            assert_eq!(app.read_archive_rebuild_latch(), Some((64_069_503, hash)));
+        }
+        // Re-open the same on-disk DB (simulate restart).
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app2 = App::new(config).await.unwrap();
+        assert_eq!(
+            app2.read_archive_rebuild_latch(),
+            Some((64_069_503, hash)),
+            "archive-rebuild latch must survive a restart"
+        );
+        app2.clear_archive_rebuild_latch();
+        assert!(
+            app2.read_archive_rebuild_latch().is_none(),
+            "clear must remove the latch"
+        );
+    }
+
+    /// #3905 (transient vs terminal — Critic A): a fatal failure on the archive
+    /// rebuild ITSELF (the archive disagrees with our applied state) is terminal
+    /// — it clears the one-shot latch (so we cannot infinite-loop) and signals a
+    /// wipe. On `origin/main` no latch-aware terminal path exists.
+    #[tokio::test]
+    async fn test_repeat_divergence_after_archive_rebuild_is_terminal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let hash = divergent_hash();
+        app.write_archive_rebuild_latch(1000, &hash);
+
+        let mut shutdown_rx = app.subscribe_shutdown();
+        // A fatal verification failure stands in for the archive rebuild diverging
+        // at verification (bucket-list hash disagreement against the archive).
+        let err: anyhow::Error =
+            henyey_history::HistoryError::VerificationFailed("bucket list hash mismatch".into())
+                .into();
+        let terminal = app.handle_startup_catchup_failure_with_latch(&err);
+
+        assert!(terminal, "a fatal rebuild divergence must be terminal");
+        assert!(
+            app.read_archive_rebuild_latch().is_none(),
+            "the terminal path must clear the one-shot latch"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "the terminal path must trigger a fatal shutdown"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "shutdown must be signalled on the terminal path"
+        );
+    }
+
+    /// #3905 (transient vs terminal — Critic A): when the archive has no target
+    /// ahead yet (the #3779 "checkpoint not ahead of min_ledger" condition), the
+    /// failure is transient — the latch is RETAINED for the next restart and NO
+    /// wipe is signalled. Misclassifying this as terminal would wipe a node that
+    /// only needs to wait for the next checkpoint publish.
+    #[tokio::test]
+    async fn test_archive_not_ahead_keeps_latch_and_does_not_wipe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let hash = divergent_hash();
+        app.write_archive_rebuild_latch(1000, &hash);
+
+        // "not ahead" is a plain anyhow error (not a fatal HistoryError).
+        let err = anyhow::anyhow!(
+            "Archive checkpoint 1000 is not ahead of min_ledger 1000 — no catchup target available"
+        );
+        let terminal = app.handle_startup_catchup_failure_with_latch(&err);
+
+        assert!(!terminal, "archive-not-ahead is transient, not terminal");
+        assert_eq!(
+            app.read_archive_rebuild_latch(),
+            Some((1000, hash)),
+            "a transient failure must retain the latch for the next restart"
+        );
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "a transient failure must not signal a wipe"
+        );
+    }
+
+    /// #3905 (Half B): the composed startup-honoring path. With no latch the
+    /// method is a no-op (Absent); with a latch but no matching on-disk LCL the
+    /// latch is stale and is cleared without arming a rebuild. (The Rebuild
+    /// branch — latch matches the on-disk LCL — is covered by
+    /// `test_evaluate_archive_rebuild_latch`, which does not need a fabricated
+    /// on-disk header.)
+    #[tokio::test]
+    async fn test_prepare_archive_rebuild_from_latch_stale_and_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // No latch → Absent → does not arm a rebuild.
+        assert!(!app.prepare_archive_rebuild_from_latch());
+        assert!(!app.catchup_needs_full_reset.load(Ordering::SeqCst));
+
+        // Latch present, but the fresh DB has no matching on-disk LCL → Stale.
+        app.write_archive_rebuild_latch(64_069_503, &divergent_hash());
+        assert!(
+            !app.prepare_archive_rebuild_from_latch(),
+            "no matching on-disk LCL must be treated as a stale latch"
+        );
+        assert!(
+            !app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "a stale latch must not arm the rebuild"
+        );
+        assert!(
+            app.read_archive_rebuild_latch().is_none(),
+            "a stale latch must be cleared"
         );
     }
 
