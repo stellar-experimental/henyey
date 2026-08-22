@@ -10531,9 +10531,6 @@ mod tests {
         );
     }
 
-    /// All `PHASE_13_*` sub-phase constants are distinct and within a
-    /// sensible range. Prevents accidental constant collision during
-    /// future edits.
     /// All `PHASE_3_*` sub-phase constants are distinct and densely numbered.
     /// Mirrors the `PHASE_6_*` / `PHASE_13_*` tests. Prevents accidental
     /// constant collision during future edits (issue #3723).
@@ -10563,6 +10560,9 @@ mod tests {
         }
     }
 
+    /// All `PHASE_13_*` sub-phase constants are distinct and within a
+    /// sensible range. Prevents accidental constant collision during
+    /// future edits.
     #[test]
     fn test_phase_13_constants_distinct_and_dense() {
         use super::phase::*;
