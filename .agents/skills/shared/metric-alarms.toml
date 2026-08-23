@@ -748,6 +748,14 @@ labels = [{ key = "reason", value = "forcing_catchup_behind" }]
 delta_threshold = 1
 streak_threshold = 3
 burst_threshold = 10
+# Design tick cadence the streak_threshold was calibrated against (#3790). The
+# streak dwell is time-denominated: recovery-stalled fires only once the streak
+# count is met AND now - first_breach_ts >= streak_threshold *
+# expected_interval_seconds (3 * 1200 = 3600s). Set to the DESIGN cadence
+# (below the real ~44 min tick cadence) so the healthy sustained case still
+# fires on the same tick as before; only a compressed/duplicate cadence that
+# would advance the streak at 2x wall-clock speed is held.
+expected_interval_seconds = 1200
 # Post-restart absolute-value fire (#3198). On a PID/start_ticks change (restart)
 # or a counter reset the streak baseline is re-collected and the cross-tick delta
 # machine is blind to a stall that accrued during startup/warmup. If the first
@@ -756,8 +764,8 @@ burst_threshold = 10
 # episode accrued 213; a clean restart reaching real-time sync promptly accrues
 # only a handful. 0/absent disables the check.
 post_restart_absolute_threshold = 50
-baseline_version = 3  # bumped in #3222: de-double snapshot_file (metrics/ prefix removed → bare filename)
-semantic_change_date = "2026-06-07T00:00:00Z"
+baseline_version = 4  # bumped in #3790: streak dwell now time-denominated (expected_interval_seconds added; fires on wall-clock dwell, not tick count) — invalidates prior acks
+semantic_change_date = "2026-08-23T00:00:00Z"  # time-denominated streak dwell per #3790
 severity = "WARN"
 gates = ["validator-only"]
 snapshot_file = "counter_streak_snapshot"
