@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=477
+TAP_PLAN=478
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -6144,6 +6144,32 @@ METAEOF
   else
     tap_not_ok "archive: validate_metadata rejects wrong ARCHIVE_VERSION" \
       "validate_metadata returned 0"
+  fi
+
+  # ── Test: validate_metadata accepts the bumped ARCHIVE_VERSION=2 (#3791) ──
+  # The monitor now writes ARCHIVE_VERSION=2 (see monitor-tick-artifacts.py).
+  # The replay reader must accept the known-good set {1,2}, not fail-close on
+  # anything but 1 — otherwise every post-#3791 archive is rejected as corrupt.
+  local t_v2="$archive_root/t-v2"
+  local v2_arc="$t_v2/data/v2-session/metrics/archive"
+  mkdir -p "$v2_arc/2025-05-10T10:00:00.000000000Z"
+  cat > "$v2_arc/2025-05-10T10:00:00.000000000Z/metadata.env" << 'METAEOF'
+ARCHIVE_VERSION=2
+TICK_SKIPPED=false
+PREV_PROM_INVALID=false
+WARMUP_TICKS_REMAINING=0
+FRESH_START=no
+CRASH_RECOVERY=no
+UPTIME_SECONDS=60
+MONITOR_MODE=validator
+PID=12345
+START_TICKS=987654
+METAEOF
+  if validate_metadata "$v2_arc/2025-05-10T10:00:00.000000000Z" 2>/dev/null; then
+    tap_ok "archive: validate_metadata accepts ARCHIVE_VERSION=2 (#3791)"
+  else
+    tap_not_ok "archive: validate_metadata accepts ARCHIVE_VERSION=2 (#3791)" \
+      "validate_metadata rejected a valid v2 archive"
   fi
 
   # ── Test: Missing required key in metadata.env ──────────────────────────

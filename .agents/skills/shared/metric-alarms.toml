@@ -21,6 +21,37 @@
 # Schema version — evaluator rejects unknown versions.
 schema_version = 1
 
+# ── WARNING VOCABULARY ───────────────────────────────────────────────────────
+#
+# Closed vocabulary for the `warnings` / `actions` lists in tick-history.jsonl
+# rows (see scripts/lib/monitor-tick-artifacts.py, issue #3791). The full
+# accepted warnings set is the union of every alarm `name` below and the
+# `non_alarm` list here, plus the `other` fallback. This exists because the
+# free-text `warnings` field had fragmented into 571 spellings for ~17 real
+# conditions (#3757 census); constraining it on write is the fix.
+#
+# This table is INERT to the alarm evaluator: eval-alarms.py reads only
+# `catalog.get("alarm", [])` and `schema_version`, never `warning_vocabulary`.
+#
+# `non_alarm`: warning conditions the tick surfaces that are NOT metric-alarms
+# alarms — disk / memory / skill-health / DB / session-wipe signals. Add a
+# token here (not free text in the writer) when a new non-alarm condition needs
+# to be recordable. `other` is the required fallback for any unmapped token.
+[warning_vocabulary]
+non_alarm = [
+  "low-disk",
+  "high-memory",
+  "skill-stale",
+  "db-locked",
+  "pruning-gap",
+  "ci-fail",
+  "quarantine",
+  "log-rotated",
+  "wipe=session-dir",
+  "wipe=mainnet-data",
+  "other",
+]
+
 # ── COUNTERS ─────────────────────────────────────────────────────────────────
 
 [[alarm]]
