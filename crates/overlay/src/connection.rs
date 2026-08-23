@@ -19,7 +19,7 @@ use crate::{
     codec::{MessageCodec, MessageFrame},
     OverlayError, Result,
 };
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -369,95 +369,6 @@ impl Connection {
             self.closed = true;
             debug!("Closed connection to {}", self.remote_addr);
         }
-    }
-
-    /// Splits the connection into separate send and receive halves.
-    ///
-    /// This allows concurrent sending and receiving on the same connection.
-    pub fn split(self) -> (ConnectionSender, ConnectionReceiver) {
-        let (sink, stream) = self.framed.split();
-        (
-            ConnectionSender {
-                sink,
-                remote_addr: self.remote_addr,
-            },
-            ConnectionReceiver {
-                stream,
-                remote_addr: self.remote_addr,
-            },
-        )
-    }
-}
-
-/// Send half of a split connection.
-///
-/// Created by [`Connection::split`]. Allows sending messages without
-/// holding a lock on the full connection.
-pub struct ConnectionSender {
-    sink: futures::stream::SplitSink<Framed<BoxedIo, MessageCodec>, AuthenticatedMessage>,
-    remote_addr: SocketAddr,
-}
-
-impl ConnectionSender {
-    /// Sends a message to the peer.
-    ///
-    /// Includes a timeout to prevent blocking indefinitely on TCP backpressure,
-    /// matching the timeout behavior of [`Connection::send`].
-    pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<()> {
-        trace!("Sending message to {}", self.remote_addr);
-        const SEND_TIMEOUT_SECS: u64 = 10;
-        match timeout(
-            Duration::from_secs(SEND_TIMEOUT_SECS),
-            self.sink.send(message),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(OverlayError::ConnectionTimeout(format!(
-                "send timeout after {}s to {}",
-                SEND_TIMEOUT_SECS, self.remote_addr
-            ))),
-        }
-    }
-
-    /// Returns the remote peer's socket address.
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
-    }
-}
-
-/// Receive half of a split connection.
-///
-/// Created by [`Connection::split`]. Allows receiving messages without
-/// holding a lock on the full connection.
-pub struct ConnectionReceiver {
-    stream: futures::stream::SplitStream<Framed<BoxedIo, MessageCodec>>,
-    remote_addr: SocketAddr,
-}
-
-impl ConnectionReceiver {
-    /// Receives the next message from the peer.
-    ///
-    /// Returns `Ok(None)` if the connection was closed.
-    pub async fn recv(&mut self) -> Result<Option<MessageFrame>> {
-        match self.stream.next().await {
-            Some(Ok(frame)) => {
-                trace!(
-                    "Received message from {} ({} bytes)",
-                    self.remote_addr,
-                    frame.raw_len
-                );
-                Ok(Some(frame))
-            }
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
-        }
-    }
-
-    /// Returns the remote peer's socket address.
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
     }
 }
 
