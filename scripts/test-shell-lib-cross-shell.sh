@@ -52,6 +52,7 @@ SOURCED_LIBS=(
   dedup-filing.sh
   deploy-quarantine.sh
   monitor-decisions.sh
+  monitor-watchdog-decisions.sh
   review-pr-merge.sh
   review-pr-verdicts.sh
   pipeline-anomaly-log.sh
@@ -73,6 +74,8 @@ expected_funcs_for() {
       echo "parse_quarantine_file check_quarantine_active check_quarantine_ancestry quarantine_append quarantine_remove quarantine_resolve quarantine_autostamp quarantine_resolved_is_ve_green" ;;
     monitor-decisions.sh)
       echo "check_session_wiped check_long_stale_session detect_crash_state cleanup_guard prune_rotated_logs prune_metrics_archive" ;;
+    monitor-watchdog-decisions.sh)
+      echo "watchdog_last_epoch watchdog_should_fire" ;;
     review-pr-merge.sh)
       echo "attempt_merge classify_linked_pr_state is_auto_merge_armed has_armed_waiting_comment check_armed_pr_health" ;;
     review-pr-verdicts.sh)
