@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=465
+TAP_PLAN=477
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2558,102 +2558,207 @@ PYEOF
       "check (9) not wired to the streak escalator"
   fi
 
-  # ── Test 64: Tick history capture uses quoted heredoc + datetime.now ────────
-  # Structural assertion scoped to the fenced code block in "Tick history capture".
+  # ── Test 64: Tick history capture invokes the single-writer helper ──────────
+  # #3791: the hand-rolled `<<'PY'` / json.dumps heredoc is replaced by a call
+  # to scripts/lib/monitor-tick-artifacts.py emit-row so there is exactly one
+  # writer (→ one schema). Structural assertion scoped to the fenced code block.
   local tick_hist_block
   tick_hist_block=$(sed -n '/^### Tick history capture/,/^##/{/^```bash/,/^```/p}' \
     "$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md")
   local t64_pass=true
-  if ! echo "$tick_hist_block" | grep -q "<<'PY'"; then
+  if ! echo "$tick_hist_block" | grep -q 'monitor-tick-artifacts.py emit-row'; then
     t64_pass=false
   fi
-  if echo "$tick_hist_block" | grep -q '$(date'; then
+  if echo "$tick_hist_block" | grep -q "<<'PY'"; then
     t64_pass=false
   fi
-  if ! echo "$tick_hist_block" | grep -q 'datetime.now(timezone.utc)'; then
+  if echo "$tick_hist_block" | grep -q 'json.dumps'; then
     t64_pass=false
   fi
   if [[ "$t64_pass" == true ]]; then
-    tap_ok "tick-history: quoted heredoc, no inline \$(date), uses datetime.now"
+    tap_ok "tick-history: invokes monitor-tick-artifacts.py emit-row, no raw heredoc (#3791)"
   else
-    tap_not_ok "tick-history: quoted heredoc, no inline \$(date), uses datetime.now" \
-      "Tick history capture block must use <<'PY', no \$(date, and datetime.now(timezone.utc)"
+    tap_not_ok "tick-history: invokes monitor-tick-artifacts.py emit-row, no raw heredoc (#3791)" \
+      "Tick history capture block must call the helper and drop the <<'PY'/json.dumps heredoc"
   fi
 
-  # ── Test 65: Tick history ts behavioral check ──────────────────────────────
-  # Execute the actual SKILL.md tick-history code block with substituted
-  # placeholders and verify ts is valid JSON, ISO 8601 UTC, within 60s.
-
-  # Reuse tick_hist_block from Test 64 (already extracted above).
-  # Guard: ensure extraction succeeded and contains expected markers.
-  local t65_snippet_ok=true
-  if [[ -z "$tick_hist_block" ]]; then
-    t65_snippet_ok=false
-  elif ! printf '%s' "$tick_hist_block" | grep -q "<<'PY'"; then
-    t65_snippet_ok=false
-  elif ! printf '%s' "$tick_hist_block" | grep -q 'datetime.now(timezone.utc)'; then
-    t65_snippet_ok=false
-  elif ! printf '%s' "$tick_hist_block" | grep -q 'json.dumps'; then
-    t65_snippet_ok=false
-  fi
-
-  if [[ "$t65_snippet_ok" != true ]]; then
-    tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
-      "Code block extraction failed or missing expected markers"
+  # ── Test 65: Tick history row via helper — valid JSON, ISO 8601 UTC, <=60s ──
+  # #3791: execute the single-writer helper's emit-row and verify the emitted
+  # row's ts is valid JSON, ISO 8601 UTC, and within the 60s skew contract.
+  local t65_helper="$REPO_ROOT/scripts/lib/monitor-tick-artifacts.py"
+  local t65_result t65_exit
+  t65_result=$(python3 "$t65_helper" emit-row \
+    --status OK --ledger 12345 --build abc1234 --deploys 0 --self-reflect clean 2>&1) \
+    && t65_exit=0 || t65_exit=$?
+  if [[ $t65_exit -ne 0 ]]; then
+    tap_not_ok "tick-history-ts: helper emit-row → valid JSON, ISO 8601 UTC, <=60s skew (#3791)" \
+      "emit-row failed (exit $t65_exit): $t65_result"
   else
-    # Strip fence lines, comment line, HIST= line, and >> "$HIST" redirect
-    local t65_exec
-    t65_exec=$(printf '%s' "$tick_hist_block" \
-      | sed '/^```/d' \
-      | sed '/^# ts is computed/d' \
-      | sed '/^HIST=/d' \
-      | sed 's/ >> "\$HIST"//')
-
-    # Substitute placeholders with exact literal values from SKILL.md
-    t65_exec=$(printf '%s' "$t65_exec" \
-      | sed 's/"<OK|WARNING|ACTION|OFFLINE>"/"OK"/' \
-      | sed 's/<current-ledger-int>/12345/' \
-      | sed 's/"<short-sha>"/"abc1234"/' \
-      | sed 's/<0 or 1>/0/' \
-      | sed 's/\[<list of metric names that breached>\]/[]/' \
-      | sed 's/\[<list of action keywords: restart, deploy, filed-#N, session-wiped-recovery, session-wiped-process-alive, session-wiped-rebuild-failed, mainnet-data-wiped>\]/[]/' \
-      | sed 's/"<clean | fixed-inline | filed-#N>"/"clean"/' \
-      | sed 's/\["<key>=<value>", \.\.\.\]/[]/')
-
-    # Execute via bash on stdin — capture exit code gracefully
-    local t65_result t65_exit
-    t65_result=$(printf '%s' "$t65_exec" | bash 2>&1) && t65_exit=0 || t65_exit=$?
-
-    if [[ $t65_exit -ne 0 ]]; then
-      tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
-        "Snippet execution failed (exit $t65_exit): $t65_result"
-    else
-      # Validate via Python — pass result through env var to avoid quoting issues
-      local t65_ok
-      t65_ok=$(T65_RESULT="$t65_result" python3 -c "
-import json, os, sys
+    local t65_ok
+    t65_ok=$(T65_RESULT="$t65_result" python3 -c "
+import json, os
 from datetime import datetime, timezone
 try:
-    raw = os.environ['T65_RESULT']
-    obj = json.loads(raw)
+    obj = json.loads(os.environ['T65_RESULT'])
     assert 'ts' in obj, 'missing ts field'
     ts = datetime.strptime(obj['ts'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    skew = abs((now - ts).total_seconds())
+    skew = abs((datetime.now(timezone.utc) - ts).total_seconds())
     assert obj['ts'].endswith('Z'), 'ts must end with Z'
     assert skew <= 60, f'ts skew {skew}s exceeds 60s'
     print('ok')
 except Exception as e:
     print(f'fail: {e}')
 " 2>&1)
-
-      if [[ "$t65_ok" == "ok" ]]; then
-        tap_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew"
-      else
-        tap_not_ok "tick-history-ts: behavioral check — valid JSON, ISO 8601 UTC, <=60s skew" \
-          "$t65_ok"
-      fi
+    if [[ "$t65_ok" == "ok" ]]; then
+      tap_ok "tick-history-ts: helper emit-row → valid JSON, ISO 8601 UTC, <=60s skew (#3791)"
+    else
+      tap_not_ok "tick-history-ts: helper emit-row → valid JSON, ISO 8601 UTC, <=60s skew (#3791)" \
+        "$t65_ok"
     fi
+  fi
+
+  # ── #3791: single-writer helper schema self-check + closed vocabulary ───────
+  local mta="$REPO_ROOT/scripts/lib/monitor-tick-artifacts.py"
+
+  # validate-row type-guards a null ts BEFORE the regex: non-zero exit, and no
+  # Python traceback (the check is `isinstance(ts,str) and TS_RE.match(ts)`).
+  # Exit code 1 == a clean validation rejection (argparse/usage errors and a
+  # missing-helper are exit 2), so this distinguishes a real reject from breakage.
+  local nullts_out nullts_exit
+  nullts_out=$(python3 "$mta" validate-row \
+    --row '{"ts":null,"status":"OK","ledger":1,"build":"a","deploys":0,"warnings":[],"actions":[],"self_reflect":"clean","watch":[]}' 2>&1) \
+    && nullts_exit=0 || nullts_exit=$?
+  if [[ $nullts_exit -eq 1 ]] \
+     && echo "$nullts_out" | grep -q 'validate-row failed' \
+     && ! echo "$nullts_out" | grep -q 'Traceback'; then
+    tap_ok "tick-row validate: null ts → clean reject (exit 1), no traceback (#3791)"
+  else
+    tap_not_ok "tick-row validate: null ts → clean reject (exit 1), no traceback (#3791)" \
+      "exit=$nullts_exit out=$nullts_out"
+  fi
+
+  # validate-row accepts a diagnostic SUPERSET (required-subset, not set-equality).
+  if python3 "$mta" validate-row \
+      --row '{"ts":"2026-08-23T12:00:00Z","status":"OK","ledger":1,"build":"a","deploys":0,"warnings":[],"actions":[],"self_reflect":"clean","watch":[],"evaluator":"x","uptime_s":99}' >/dev/null 2>&1; then
+    tap_ok "tick-row validate: diagnostic superset accepted (#3791)"
+  else
+    tap_not_ok "tick-row validate: diagnostic superset accepted (#3791)" \
+      "required-subset contract must accept extra keys"
+  fi
+
+  # emit-row builds the canonical 9-key row with an ISO ts and list warnings/actions.
+  local emit_row emit_ok
+  emit_row=$(python3 "$mta" emit-row --status OK --ledger 42 --build abc1234 --deploys 0 --self-reflect clean 2>&1) || true
+  emit_ok=$(EMIT_ROW="$emit_row" python3 -c "
+import json, os, re
+try:
+    o = json.loads(os.environ['EMIT_ROW'])
+    req = {'ts','status','ledger','build','deploys','warnings','actions','self_reflect','watch'}
+    assert set(o) == req, f'keys {sorted(o)}'
+    assert re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\$', o['ts']), 'ts shape'
+    assert isinstance(o['warnings'], list) and isinstance(o['actions'], list), 'lists'
+    assert o['warnings'] == [] and o['actions'] == [], 'empty lists'
+    print('ok')
+except Exception as e:
+    print(f'fail: {e}')
+" 2>&1)
+  if [[ "$emit_ok" == "ok" ]]; then
+    tap_ok "tick-row emit: canonical 9 keys, ISO ts, list warnings/actions (#3791)"
+  else
+    tap_not_ok "tick-row emit: canonical 9 keys, ISO ts, list warnings/actions (#3791)" "$emit_ok"
+  fi
+
+  # warnings vocabulary: unknown token rejected; catalog name + 'other' accepted.
+  local unk_exit
+  python3 "$mta" validate-row \
+      --row '{"ts":"2026-08-23T12:00:00Z","status":"OK","ledger":1,"build":"a","deploys":0,"warnings":["recovery_stalled_forcing_catchup_behind"],"actions":[],"self_reflect":"clean","watch":[]}' \
+      >/dev/null 2>&1 && unk_exit=0 || unk_exit=$?
+  if [[ $unk_exit -eq 1 ]]; then
+    tap_ok "tick-row validate: unknown warning token rejected (#3791)"
+  else
+    tap_not_ok "tick-row validate: unknown warning token rejected (#3791)" "expected clean reject (exit 1), got $unk_exit"
+  fi
+  if python3 "$mta" validate-row \
+      --row '{"ts":"2026-08-23T12:00:00Z","status":"OK","ledger":1,"build":"a","deploys":0,"warnings":["recovery-stalled"],"actions":[],"self_reflect":"clean","watch":[]}' >/dev/null 2>&1; then
+    tap_ok "tick-row validate: catalog-name warning accepted (#3791)"
+  else
+    tap_not_ok "tick-row validate: catalog-name warning accepted (#3791)" "recovery-stalled is a catalog name"
+  fi
+  if python3 "$mta" validate-row \
+      --row '{"ts":"2026-08-23T12:00:00Z","status":"OK","ledger":1,"build":"a","deploys":0,"warnings":["other"],"actions":[],"self_reflect":"clean","watch":[]}' >/dev/null 2>&1; then
+    tap_ok "tick-row validate: 'other' fallback warning accepted (#3791)"
+  else
+    tap_not_ok "tick-row validate: 'other' fallback warning accepted (#3791)" "other must be in vocab"
+  fi
+
+  # emit-row promotes an embedded measurement into a typed sibling key.
+  local promo_row promo_ok
+  promo_row=$(python3 "$mta" emit-row --status WARNING --ledger 1 --build a --deploys 0 --self-reflect clean --warnings 'low-disk 90%' 2>&1) || true
+  promo_ok=$(PROMO="$promo_row" python3 -c "
+import json, os
+try:
+    o = json.loads(os.environ['PROMO'])
+    assert o['warnings'] == ['low-disk'], o['warnings']
+    assert o.get('disk_free_pct') == 90, o.get('disk_free_pct')
+    print('ok')
+except Exception as e:
+    print(f'fail: {e}')
+" 2>&1)
+  if [[ "$promo_ok" == "ok" ]]; then
+    tap_ok "tick-row emit: embedded measurement promoted to sibling key (#3791)"
+  else
+    tap_not_ok "tick-row emit: embedded measurement promoted to sibling key (#3791)" "$promo_ok"
+  fi
+
+  # metadata.env carries a MEANINGFUL, bumped ARCHIVE_VERSION (was inert =1).
+  local meta_out
+  meta_out=$(python3 "$mta" write-metadata 2>&1) || true
+  if echo "$meta_out" | grep -qx 'ARCHIVE_VERSION=2'; then
+    tap_ok "archive metadata: ARCHIVE_VERSION=2 (meaningful, not inert 1) (#3791)"
+  else
+    tap_not_ok "archive metadata: ARCHIVE_VERSION=2 (meaningful, not inert 1) (#3791)" \
+      "got: $(echo "$meta_out" | grep ARCHIVE_VERSION)"
+  fi
+
+  # scrape_identity written by the helper carries version + pid + start_ticks + ts.
+  local id_out
+  id_out=$(python3 "$mta" write-scrape-identity --pid 4242 --start-ticks 777 2>&1) || true
+  if echo "$id_out" | grep -qx 'version=1' \
+     && echo "$id_out" | grep -qx 'pid=4242' \
+     && echo "$id_out" | grep -qx 'start_ticks=777' \
+     && echo "$id_out" | grep -q '^timestamp='; then
+    tap_ok "scrape-identity: helper emits version/pid/start_ticks/timestamp (#3791)"
+  else
+    tap_not_ok "scrape-identity: helper emits version/pid/start_ticks/timestamp (#3791)" "$id_out"
+  fi
+
+  # counter_streak_snapshot written by the helper carries all required fields.
+  local cs_out
+  cs_out=$(python3 "$mta" write-counter-streak --pid 4242 --start-ticks 777 --counter-value 5 --breach-streak 2 2>&1) || true
+  if echo "$cs_out" | grep -qx 'version=1' \
+     && echo "$cs_out" | grep -qx 'counter_value=5' \
+     && echo "$cs_out" | grep -qx 'breach_streak=2'; then
+    tap_ok "counter-streak: helper emits version/counter_value/breach_streak (#3791)"
+  else
+    tap_not_ok "counter-streak: helper emits version/counter_value/breach_streak (#3791)" "$cs_out"
+  fi
+
+  # Archive .prom copy preserves mtimes (cp -p), so archived mtimes describe the
+  # archived bytes; metadata.env is emitted by the single-writer helper (#3791).
+  local archive_block
+  archive_block=$(sed -n '/^7\. \*\*Archive snapshot\*\*/,/^8\. /p' \
+    "$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md")
+  if echo "$archive_block" | grep -q 'cp -p '; then
+    tap_ok "archive step: copies .prom with cp -p (mtime-preserving) (#3791)"
+  else
+    tap_not_ok "archive step: copies .prom with cp -p (mtime-preserving) (#3791)" \
+      "archive snapshot must copy prom files with cp -p"
+  fi
+  if echo "$archive_block" | grep -q 'monitor-tick-artifacts.py write-metadata'; then
+    tap_ok "archive metadata: written via helper write-metadata (#3791)"
+  else
+    tap_not_ok "archive metadata: written via helper write-metadata (#3791)" \
+      "metadata.env must be emitted by the single-writer helper"
   fi
 
   # ── Deploy Quarantine Tests ──────────────────────────────────────────────────
