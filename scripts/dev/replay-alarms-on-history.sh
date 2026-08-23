@@ -134,10 +134,17 @@ validate_metadata() {
     return 1
   fi
 
-  if [[ "${ARCHIVE_VERSION:-}" != "1" ]]; then
-    echo "ERROR: Corrupt archive at $dir: ARCHIVE_VERSION=${ARCHIVE_VERSION:-missing} (expected 1)" >&2
-    return 1
-  fi
+  # Accept the known-good set of schema versions. v1 was the original inert
+  # constant; v2 (#3791) is the current canonical single-writer schema. Readers
+  # must branch on the version rather than fail-close on anything but 1, or
+  # every archive the monitor writes after #3791 is rejected as corrupt.
+  case "${ARCHIVE_VERSION:-}" in
+    1|2) ;;
+    *)
+      echo "ERROR: Corrupt archive at $dir: ARCHIVE_VERSION=${ARCHIVE_VERSION:-missing} (expected 1 or 2)" >&2
+      return 1
+      ;;
+  esac
 
   # Validate required keys are present (not unset)
   local required_keys="TICK_SKIPPED PREV_PROM_INVALID WARMUP_TICKS_REMAINING FRESH_START CRASH_RECOVERY UPTIME_SECONDS MONITOR_MODE"

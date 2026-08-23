@@ -1278,10 +1278,11 @@ tracks node health, and this signal is not one.
        export PREV_SCRAPE_AGE_SECONDS=-1
      fi
      ```
-   - Write fresh identity file:
+   - Write fresh identity file via the single-writer helper (#3791) — it stamps
+     the timestamp (UTC, ISO-8601) itself, so do NOT shell-expand `date`:
      ```bash
-     printf "version=1\npid=%s\nstart_ticks=%s\ntimestamp=%s\n" \
-       "$PID" "$START_TICKS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     MTA="$(git rev-parse --show-toplevel)/scripts/lib/monitor-tick-artifacts.py"
+     python3 "$MTA" write-scrape-identity --pid "$PID" --start-ticks "$START_TICKS" \
        > /home/tomer/data/$MONITOR_SESSION_ID/metrics/scrape_identity
      ```
 
@@ -1345,24 +1346,29 @@ tracks node health, and this signal is not one.
    SNAP_FINAL="$ARCHIVE_DIR/${TIMESTAMP}"
    mkdir -p "$SNAP_TMP"
 
-   # Copy prom files (may be empty/missing — expected for skipped ticks)
-   cp "$HOME/data/$MONITOR_SESSION_ID/metrics/current.prom" "$SNAP_TMP/current.prom" 2>/dev/null || true
-   cp "$HOME/data/$MONITOR_SESSION_ID/metrics/prev.prom"    "$SNAP_TMP/prev.prom"    2>/dev/null || true
+   # Copy prom files with -p so the archived copies' mtimes describe the archived
+   # BYTES (not the copy time) — the prune step orders by mtime (#3724, #3791).
+   # (may be empty/missing — expected for skipped ticks)
+   cp -p "$HOME/data/$MONITOR_SESSION_ID/metrics/current.prom" "$SNAP_TMP/current.prom" 2>/dev/null || true
+   cp -p "$HOME/data/$MONITOR_SESSION_ID/metrics/prev.prom"    "$SNAP_TMP/prev.prom"    2>/dev/null || true
 
-   # Write metadata sidecar (marks directory as complete)
-   cat > "$SNAP_TMP/metadata.env" << METAEOF
-   ARCHIVE_VERSION=1
-   TICK_SKIPPED=${TICK_SKIPPED:-false}
-   PREV_PROM_INVALID=${PREV_PROM_INVALID:-false}
-   PREV_SCRAPE_AGE_SECONDS=${PREV_SCRAPE_AGE_SECONDS:--1}
-   WARMUP_TICKS_REMAINING=${WARMUP_TICKS_REMAINING:-0}
-   FRESH_START=${FRESH_START:-no}
-   CRASH_RECOVERY=${CRASH_RECOVERY:-no}
-   UPTIME_SECONDS=${UPTIME_SECONDS:-0}
-   MONITOR_MODE=${MONITOR_MODE:-validator}
-   PID=${PID:-}
-   START_TICKS=${START_TICKS:-}
-   METAEOF
+   # Write metadata sidecar (marks directory as complete) via the single-writer
+   # helper (#3791) — it owns the ARCHIVE_VERSION constant (now a MEANINGFUL,
+   # bumped artifact-schema version, not the inert `1` it used to be). Bump
+   # ARCHIVE_VERSION in the helper whenever the metadata/row schema changes.
+   MTA="$(git rev-parse --show-toplevel)/scripts/lib/monitor-tick-artifacts.py"
+   python3 "$MTA" write-metadata \
+     --tick-skipped "${TICK_SKIPPED:-false}" \
+     --prev-prom-invalid "${PREV_PROM_INVALID:-false}" \
+     --prev-scrape-age-seconds "${PREV_SCRAPE_AGE_SECONDS:--1}" \
+     --warmup-ticks-remaining "${WARMUP_TICKS_REMAINING:-0}" \
+     --fresh-start "${FRESH_START:-no}" \
+     --crash-recovery "${CRASH_RECOVERY:-no}" \
+     --uptime-seconds "${UPTIME_SECONDS:-0}" \
+     --monitor-mode "${MONITOR_MODE:-validator}" \
+     --pid "${PID:-}" \
+     --start-ticks "${START_TICKS:-}" \
+     > "$SNAP_TMP/metadata.env"
 
    # Atomic rename
    mv "$SNAP_TMP" "$SNAP_FINAL"
@@ -1583,7 +1589,17 @@ and omit the `recovery_stalled:` line from the status report.
 
 **Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/counter_streak_snapshot`
 
-Format:
+Write it with the single-writer helper (#3791) — the sole constructor of this
+artifact — so the format stays canonical:
+```bash
+MTA="$(git rev-parse --show-toplevel)/scripts/lib/monitor-tick-artifacts.py"
+python3 "$MTA" write-counter-streak \
+  --pid "$PID" --start-ticks "$START_TICKS" \
+  --counter-value "$COUNTER_VALUE" --breach-streak "$BREACH_STREAK" \
+  > /home/tomer/data/$MONITOR_SESSION_ID/metrics/counter_streak_snapshot
+```
+
+Format (as emitted by the helper):
 ```
 version=1
 pid=<PID>
@@ -2503,24 +2519,42 @@ After emitting the status report (and before self-reflection), append a
 single JSON line to `/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl`
 so `/daily-summary` can aggregate the last 24h of ticks:
 
+The row is built by the single-writer helper
+(`scripts/lib/monitor-tick-artifacts.py`, issue #3791) — it is the SOLE
+constructor of the row, so every appended row shares one schema. Do NOT
+hand-roll the JSON. The helper computes `ts` (UTC, ISO-8601), enforces the
+canonical field set, constrains `warnings`/`actions` to the closed vocabulary in
+`../shared/metric-alarms.toml` (unknown tokens map to `other`), and promotes any
+embedded measurement into a typed sibling key (`low-disk 90%` →
+`warnings:["low-disk"], disk_free_pct:90`). Pass typed values as flags;
+`warnings`/`actions`/`watch` are **comma-separated strings** (array-free for the
+zsh the monitor runs under; empty string → `[]`):
+
 ```bash
-# ts is computed inside the Python block — do NOT use shell expansion for timestamps.
 HIST=/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl
-python3 - <<'PY' >> "$HIST"
-import json
-from datetime import datetime, timezone
-print(json.dumps({
-  "ts":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-  "status":       "<OK|WARNING|ACTION|OFFLINE>",
-  "ledger":       <current-ledger-int>,
-  "build":        "<short-sha>",
-  "deploys":      <0 or 1>,
-  "warnings":     [<list of metric names that breached>],
-  "actions":      [<list of action keywords: restart, deploy, filed-#N, session-wiped-recovery, session-wiped-process-alive, session-wiped-rebuild-failed, mainnet-data-wiped>],
-  "self_reflect": "<clean | fixed-inline | filed-#N>",
-  "watch":        ["<key>=<value>", ...]
-}))
-PY
+MTA="$(git rev-parse --show-toplevel)/scripts/lib/monitor-tick-artifacts.py"
+# Happy path: the helper prints the canonical row on stdout (exit 0) and we
+# append it. `--ts` is omitted so the helper stamps UTC now (do NOT shell-expand
+# timestamps). If the self-check fails the helper prints nothing on stdout
+# (nothing is appended to $HIST), writes the offending row to stderr, and exits
+# non-zero — fail-loud-but-NON-FATAL so a helper bug can never wedge the monitor.
+# stdout (the row) is appended to $HIST; stderr is captured in $ROW_ERR without
+# a temp file (`2>&1 1>>"$HIST"`: fd2 → capture, fd1 → file).
+if ! ROW_ERR=$(python3 "$MTA" emit-row \
+    --status "<OK|WARNING|ACTION|OFFLINE>" \
+    --ledger <current-ledger-int> \
+    --build "<short-sha>" \
+    --deploys <0 or 1> \
+    --self-reflect "<clean | fixed-inline | filed-#N>" \
+    --warnings "<comma-separated breached metric/condition names, or empty>" \
+    --actions "<comma-separated action keywords: restart, deploy, filed-#N, session-wiped-recovery, session-wiped-process-alive, session-wiped-rebuild-failed, mainnet-data-wiped>" \
+    --watch "<comma-separated key=value items, or empty>" \
+    2>&1 1>>"$HIST"); then
+  # Route the rejected row (the '{'-prefixed line on stderr) to a sidecar and
+  # continue the tick.
+  printf '%s\n' "$ROW_ERR" | grep '^{' >> "${HIST%.jsonl}.rejected.jsonl" 2>/dev/null || true
+  echo "WARN: tick-history row failed self-check; wrote tick-history.rejected.jsonl" >&2
+fi
 ```
 
 > **`ts` contract:** The `ts` field records the wall-clock UTC time captured
