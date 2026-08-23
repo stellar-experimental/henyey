@@ -140,7 +140,8 @@ assert_eq "new row under the duration floor classifies suspect-fast" \
 
 # ── E2E: monitor-watchdog.sh does NOT burn cooldown on a spend-limit no-op ────
 run_monitor_e2e() {
-  local kind="$1" fx="$TMPROOT/mon-$kind"
+  local kind="$1"
+  local fx="$TMPROOT/mon-$kind"
   local data="$fx/data" sess="$fx/data/sess" repo="$fx/repo" bin="$fx/claude"
   mkdir -p "$sess" "$repo"
   local hist="$sess/tick-history.jsonl"
