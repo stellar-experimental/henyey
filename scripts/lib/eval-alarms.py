@@ -1482,11 +1482,24 @@ def eval_counter_streak(
     start_ticks: str,
     gap_stale: bool = False,
     too_fresh: bool = False,
+    now: int | None = None,
 ) -> dict:
     """Evaluate a counter-streak alarm.
 
     Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
+
+    The streak dwell is TIME-denominated, not tick-denominated (#3790): the
+    streak-opening tick records `first_breach_ts`, and the alarm fires only once
+    `streak >= streak_threshold` AND `now - first_breach_ts` has reached
+    `streak_threshold * expected_interval_seconds`. This makes the confirmation
+    gate independent of tick cadence — a natural interval split into two
+    sub-window halves (each above the #3757 too-fresh floor, so that guard
+    misses them) can no longer advance the streak to its firing threshold at 2x
+    wall-clock speed. `now` defaults to int(time.time()); it is a parameter for
+    deterministic tests.
     """
+    if now is None:
+        now = int(time.time())
     ev_default = default_extra_values(alarm, "counter-streak")
 
     # Missing process identity guard (#3279): an abbreviated tick that skips
@@ -1622,10 +1635,40 @@ def eval_counter_streak(
     delta_threshold = alarm.get("delta_threshold", 1)
     streak_threshold = alarm.get("streak_threshold", 3)
     burst_threshold = alarm.get("burst_threshold", 10)
+    # The DESIGN cadence the streak_threshold was calibrated against (#3790):
+    # streak_threshold * expected_interval_seconds is the wall-clock dwell a
+    # sustained breach must survive before firing. Deliberately the *design*
+    # cadence (below the real ~44 min tick cadence), so the healthy sustained
+    # case still fires on the same tick as before; only a compressed/duplicate
+    # cadence that would advance the count at 2x wall-clock speed is held.
+    expected_interval_seconds = alarm.get("expected_interval_seconds", 1200)
+
+    # first_breach_ts anchors the streak to wall-clock time. It is set on the
+    # streak-opening (0->1) tick and preserved verbatim as the streak advances.
+    # A legacy snapshot carrying breach_streak>=1 but no first_breach_ts (written
+    # before #3790) re-anchors to `now` here — a one-time conservative delay,
+    # never a spurious fire off a stale unanchored streak. Every reset branch
+    # above rewrites the snapshot WITHOUT this key, which clears it.
+    prev_first_breach_ts_str = snapshot.get("first_breach_ts")
+
+    def _anchor(prev_streak: int) -> int:
+        """Resolve first_breach_ts for a breaching tick.
+
+        Anchor to `now` when the streak is opening (prev_streak == 0) or when a
+        legacy snapshot advanced a streak with no persisted anchor; otherwise
+        preserve the existing anchor.
+        """
+        if prev_streak == 0 or prev_first_breach_ts_str is None:
+            return now
+        try:
+            return int(prev_first_breach_ts_str)
+        except ValueError:
+            return now
 
     ev = {"streak": streak, "streak_threshold": streak_threshold}
 
     if delta >= burst_threshold:
+        first_breach_ts = _anchor(streak)
         streak += 1
         new_snapshot = {
             "version": "1",
@@ -1633,14 +1676,17 @@ def eval_counter_streak(
             "start_ticks": start_ticks,
             "counter_value": str(int(cur_val)),
             "breach_streak": str(streak),
+            "first_breach_ts": str(first_breach_ts),
         }
         write_snapshot(snapshot_path, new_snapshot)
+        # Acute burst is a single-tick spike — fire immediately, ungated by dwell.
         return make_result(
             alarm, "firing", value=delta, threshold=burst_threshold,
             for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
         )
 
     if delta >= delta_threshold:
+        first_breach_ts = _anchor(streak)
         streak += 1
         new_snapshot = {
             "version": "1",
@@ -1648,20 +1694,34 @@ def eval_counter_streak(
             "start_ticks": start_ticks,
             "counter_value": str(int(cur_val)),
             "breach_streak": str(streak),
+            "first_breach_ts": str(first_breach_ts),
         }
         write_snapshot(snapshot_path, new_snapshot)
 
-        if streak >= streak_threshold:
+        dwell_required = streak_threshold * expected_interval_seconds
+        dwell_elapsed = now - first_breach_ts
+        ev_streak = {
+            "streak": streak,
+            "streak_threshold": streak_threshold,
+            "dwell_elapsed": dwell_elapsed,
+            "dwell_required": dwell_required,
+        }
+        # Fire only when BOTH the count AND the wall-clock dwell are satisfied.
+        # If the count is met but the dwell is not, keep dwelling (breach): the
+        # snapshot (with first_breach_ts) is preserved because a "breach" return
+        # never triggers maybe_reset_counter_snapshot (which only acts on
+        # "skipped").
+        if streak >= streak_threshold and dwell_elapsed >= dwell_required:
             return make_result(
                 alarm, "firing", value=delta, threshold=delta_threshold,
-                for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
+                for_ticks_elapsed=streak, extra_values=ev_streak,
             )
         return make_result(
             alarm, "breach", value=delta, threshold=delta_threshold,
-            for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
+            for_ticks_elapsed=streak, extra_values=ev_streak,
         )
 
-    # delta == 0
+    # delta == 0 — reset the streak and clear the wall-clock anchor.
     new_snapshot = {
         "version": "1",
         "pid": pid,
@@ -2049,6 +2109,12 @@ def main() -> int:
     alarms = catalog.get("alarm", [])
     results: list[dict] = []
 
+    # Single wall-clock reference for the whole tick: the counter-streak
+    # time-dwell gate (#3790) and the cooldown-window math below share it, so
+    # both see the same `now`. `--now` overrides int(time.time()) for
+    # deterministic tests. Nothing between here and either consumer mutates it.
+    now = args.now if args.now is not None else int(time.time())
+
     for alarm in alarms:
         name = alarm["name"]
         kind = alarm["kind"]
@@ -2089,7 +2155,7 @@ def main() -> int:
                 )
             elif kind == "counter-streak":
                 result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val,
-                                             gap_stale, too_fresh)
+                                             gap_stale, too_fresh, now=now)
             else:
                 result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 
@@ -2119,7 +2185,6 @@ def main() -> int:
     # owns read/suppress/write so the manual JSON edit can be deleted. Absent
     # --cooldown-file, this is a no-op and behavior is byte-for-byte legacy.
     if args.cooldown_file:
-        now = args.now if args.now is not None else int(time.time())
         cooldown_path = Path(args.cooldown_file)
         cooldown_data = read_cooldown_file(cooldown_path)
         apply_cooldowns(results, cooldown_data, now)
