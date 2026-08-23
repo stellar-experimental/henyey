@@ -2566,7 +2566,10 @@ PYEOF
   tick_hist_block=$(sed -n '/^### Tick history capture/,/^##/{/^```bash/,/^```/p}' \
     "$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md")
   local t64_pass=true
-  if ! echo "$tick_hist_block" | grep -q 'monitor-tick-artifacts.py emit-row'; then
+  if ! echo "$tick_hist_block" | grep -q 'monitor-tick-artifacts.py'; then
+    t64_pass=false
+  fi
+  if ! echo "$tick_hist_block" | grep -q 'emit-row'; then
     t64_pass=false
   fi
   if echo "$tick_hist_block" | grep -q "<<'PY'"; then
@@ -2754,7 +2757,8 @@ except Exception as e:
     tap_not_ok "archive step: copies .prom with cp -p (mtime-preserving) (#3791)" \
       "archive snapshot must copy prom files with cp -p"
   fi
-  if echo "$archive_block" | grep -q 'monitor-tick-artifacts.py write-metadata'; then
+  if echo "$archive_block" | grep -q 'write-metadata' \
+     && echo "$archive_block" | grep -q 'monitor-tick-artifacts.py'; then
     tap_ok "archive metadata: written via helper write-metadata (#3791)"
   else
     tap_not_ok "archive metadata: written via helper write-metadata (#3791)" \
