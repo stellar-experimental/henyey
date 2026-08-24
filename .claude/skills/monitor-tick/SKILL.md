@@ -1700,6 +1700,7 @@ to overall tick severity — the tick is considered unhealthy when any alert fir
 - `recovery_stalled: WARNING absolute=N (post-restart) — investigating` — post-restart absolute fire (absolute ≥ 50 on a baseline-reset tick, #3198)
 - `recovery_stalled: skipped (<reason>)` — metric missing or fetch failed
 - `recovery_stalled: collecting baseline` — first tick after restart/invalidation (absolute value below the post-restart threshold)
+- `recovery_stalled: collecting baseline (cold-catchup exemption)` — a baseline-reset tick whose absolute value ≥ 50 was suppressed because this incarnation completed a from-scratch (HAS-restore) catchup, i.e. a healthy post-wipe recovery, not a stall (`stellar_history_bucket_apply_success_total` > 0, or `FRESH_START=yes`); the warm-restart post-restart fire (#3198) still triggers because a warm restart does no bucket apply (#3816)
 
 **Rendering precedence** (determines the `metrics_ratio:` line format):
 
