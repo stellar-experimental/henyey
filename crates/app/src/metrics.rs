@@ -2787,6 +2787,42 @@ mod tests {
         }
     }
 
+    /// Regression for #3792: the overlay broadcast fan-out drop series and the
+    /// blackout counter must be in the catalog and pre-registered at zero, so
+    /// the drops are visible on `/metrics` before the first drop. On
+    /// origin/main both series are absent from the catalog, so no HELP renders
+    /// and this test FAILS.
+    #[test]
+    fn test_overlay_broadcast_drop_metrics_bridged() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+
+        assert!(
+            output.contains("# HELP henyey_overlay_broadcast_fanout_drop_total"),
+            "missing HELP for henyey_overlay_broadcast_fanout_drop_total"
+        );
+        assert!(
+            output.contains("# HELP henyey_overlay_broadcast_blackout_total"),
+            "missing HELP for henyey_overlay_broadcast_blackout_total"
+        );
+        // Per-type label pre-registered at zero. Label value is the lowercase
+        // `OverlayMessageKind::label()` (`scp_message`), NOT the uppercase wire
+        // name used in the WARN text.
+        assert!(
+            output.contains("henyey_overlay_broadcast_fanout_drop_total{type=\"scp_message\"} 0"),
+            "scp_message fan-out drop series should be pre-registered at 0; got:\n{output}"
+        );
+        // Unlabeled blackout counter pre-registered at zero.
+        assert!(
+            output.contains("henyey_overlay_broadcast_blackout_total 0"),
+            "blackout counter should be pre-registered at 0"
+        );
+    }
+
     #[test]
     fn test_recorder_install_is_idempotent() {
         let h1 = ensure_test_recorder();

@@ -5023,6 +5023,139 @@ pub(crate) mod tests {
         );
     }
 
+    /// Build a minimal flood-tracked `StellarMessage::ScpMessage` for
+    /// broadcast tests (exercises the per-`msg_type` drop-counting path).
+    fn make_scp_stellar_msg() -> StellarMessage {
+        use stellar_xdr::*;
+        StellarMessage::ScpMessage(ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: vec![].try_into().unwrap(),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: Hash([0; 32]),
+                }),
+            },
+            signature: vec![].try_into().unwrap(),
+        })
+    }
+
+    /// #3792: a broadcast Full-drop must bump the dedicated per-`msg_type`
+    /// `broadcast_fanout_drop_by_type` counter (SCP here), while the aggregate
+    /// `messages_dropped` stays incremented for cross-site continuity (#3623).
+    #[tokio::test]
+    async fn test_broadcast_fanout_drop_by_type_counter() {
+        use crate::metrics::OverlayMessageKind;
+
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer_id, 1);
+
+        let msg = make_scp_stellar_msg();
+        // First broadcast fills the single-slot channel.
+        let sent = manager.broadcast(msg.clone()).await.unwrap();
+        assert_eq!(sent, 1);
+        // Second broadcast Full-drops.
+        let sent = manager.broadcast(msg.clone()).await.unwrap();
+        assert_eq!(sent, 0);
+
+        let snap = manager.metrics.snapshot();
+        assert_eq!(
+            snap.broadcast_fanout_drop_by_type[OverlayMessageKind::ScpMessage as usize], 1,
+            "per-type broadcast fan-out drop counter should be 1 for SCP_MESSAGE"
+        );
+        // Aggregate continuity (#3623): messages_dropped still incremented.
+        assert_eq!(
+            snap.messages_dropped, 1,
+            "aggregate messages_dropped must stay incremented alongside the dedicated series"
+        );
+    }
+
+    /// #3792: `broadcast_blackout` increments exactly when a broadcast reaches
+    /// ZERO peers (`dropped > 0 && sent == 0`); it must NOT increment when at
+    /// least one targeted peer accepted, even if another peer dropped.
+    #[tokio::test]
+    async fn test_broadcast_blackout_on_zero_sent() {
+        use crate::metrics::OverlayMessageKind;
+
+        // Positive: single peer, cap 1 → second broadcast sent==0, dropped==1.
+        {
+            let manager = OverlayManager::new(
+                OverlayConfig::default(),
+                LocalNode::new_testnet(SecretKey::generate()),
+            )
+            .unwrap();
+            manager.running.store(true, Ordering::SeqCst);
+            let _rx = insert_peer_with_capacity(&manager, PeerId::from_bytes([1u8; 32]), 1);
+
+            let msg = make_scp_stellar_msg();
+            assert_eq!(manager.broadcast(msg.clone()).await.unwrap(), 1);
+            assert_eq!(manager.broadcast(msg.clone()).await.unwrap(), 0);
+
+            let snap = manager.metrics.snapshot();
+            assert_eq!(
+                snap.broadcast_blackout, 1,
+                "blackout must increment when every targeted peer rejects"
+            );
+        }
+
+        // Negative: peer A cap 2, peer B cap 1 → a broadcast with sent>0 &&
+        // dropped>0 leaves blackout at 0 (but still counts the one drop).
+        {
+            let manager = OverlayManager::new(
+                OverlayConfig::default(),
+                LocalNode::new_testnet(SecretKey::generate()),
+            )
+            .unwrap();
+            manager.running.store(true, Ordering::SeqCst);
+            let _rx_a = insert_peer_with_capacity(&manager, PeerId::from_bytes([1u8; 32]), 2);
+            let _rx_b = insert_peer_with_capacity(&manager, PeerId::from_bytes([2u8; 32]), 1);
+
+            let msg = make_scp_stellar_msg();
+            // First broadcast: A queues 1/2, B queues 1/1 → sent=2.
+            assert_eq!(manager.broadcast(msg.clone()).await.unwrap(), 2);
+            // Second broadcast: A queues 2/2 (ok), B full (drop) → sent=1.
+            let sent = manager.broadcast(msg.clone()).await.unwrap();
+            assert_eq!(sent, 1, "peer A (cap 2) still accepts; peer B (cap 1) drops");
+
+            let snap = manager.metrics.snapshot();
+            assert_eq!(
+                snap.broadcast_blackout, 0,
+                "blackout must NOT increment when at least one peer accepted"
+            );
+            assert_eq!(
+                snap.broadcast_fanout_drop_by_type[OverlayMessageKind::ScpMessage as usize], 1,
+                "the single dropped peer must still be counted per-type"
+            );
+        }
+    }
+
+    /// #3792: the pure interval gate for the backpressure WARN — emits on the
+    /// first call, throttles within the interval, and re-emits once the window
+    /// has elapsed.
+    #[test]
+    fn test_should_emit_now_rate_limit() {
+        let last = AtomicU64::new(0);
+        let interval = 500u64;
+        // First call in a window → true.
+        assert!(should_emit_now(&last, 1_000, interval));
+        // Second call within the interval → false.
+        assert!(!should_emit_now(&last, 1_200, interval));
+        // After the window elapses → true again.
+        assert!(should_emit_now(&last, 1_600, interval));
+        // And immediately after, throttled again.
+        assert!(!should_emit_now(&last, 1_700, interval));
+    }
+
     fn make_flood_tx_msg() -> StellarMessage {
         use stellar_xdr::TransactionEnvelope;
         StellarMessage::Transaction(TransactionEnvelope::Tx(
