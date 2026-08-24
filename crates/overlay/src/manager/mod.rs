@@ -172,6 +172,37 @@ const MAX_PEERS_PER_MESSAGE: usize = 50;
 /// Matches stellar-core `Config::POSSIBLY_PREFERRED_EXTRA`.
 const POSSIBLY_PREFERRED_EXTRA: usize = 2;
 
+/// Minimum spacing between broadcast-backpressure WARN log lines (#3792).
+///
+/// During an event-loop park, `broadcast()` can be called thousands of times in
+/// a single second with every peer channel full (observed max ~24k lines/s ≈
+/// 3.6 MB of synchronous log I/O emitted *while the loop is already parked*).
+/// The per-message-type drop and blackout counters are the source of truth, so
+/// the WARN is throttled to at most one line per this interval without losing
+/// any measurement volume.
+const BROADCAST_BACKPRESSURE_WARN_INTERVAL_MS: u64 = 1_000;
+
+/// Pure interval gate for a rate-limited log line, backed by a single
+/// `AtomicU64` holding the last-emit epoch-ms (0 = never emitted).
+///
+/// Returns `true` (and atomically claims `now_ms` as the new last-emit time) at
+/// most once per `interval_ms`; concurrent callers race via CAS so exactly one
+/// wins each window. Clock regressions are treated as "throttled" (fail-closed)
+/// via saturating subtraction.
+fn should_emit_now(last_emit_ms: &AtomicU64, now_ms: u64, interval_ms: u64) -> bool {
+    let mut last = last_emit_ms.load(Ordering::Relaxed);
+    loop {
+        if now_ms.saturating_sub(last) < interval_ms {
+            return false;
+        }
+        match last_emit_ms.compare_exchange_weak(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return true,
+            Err(observed) => last = observed,
+        }
+    }
+}
+
 /// Immutable snapshot of preferred peer state.
 ///
 /// Holds both the original config entries (hostnames) and DNS-resolved
@@ -1321,6 +1352,13 @@ pub struct OverlayManager {
     /// Monotonically-increasing counter for `PeerHandle::generation`.
     /// Shared with all `SharedPeerState` snapshots via `Arc`.
     pub(super) next_peer_generation: Arc<AtomicU64>,
+    /// Epoch-ms of the last emitted broadcast-backpressure WARN (0 = never).
+    /// Gates the per-call `warn!` in [`Self::broadcast`] to at most one line per
+    /// [`BROADCAST_BACKPRESSURE_WARN_INTERVAL_MS`], preventing the up-to-24k
+    /// lines/second log-amplification hazard observed in #3792 while the event
+    /// loop is already parked. The two dedicated drop counters remain the source
+    /// of truth, so throttling loses no volume.
+    broadcast_backpressure_warn_last_ms: AtomicU64,
 }
 
 impl OverlayManager {
@@ -1433,6 +1471,7 @@ impl OverlayManager {
             listen_addr: None,
             dial_cooldowns: Arc::new(DashMap::new()),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
+            broadcast_backpressure_warn_last_ms: AtomicU64::new(0),
         })
     }
 
@@ -1566,6 +1605,9 @@ impl OverlayManager {
 
         let msg_type = helpers::message_type_name(&message);
         let is_flood = helpers::is_flood_message(&message);
+        // Classify before `message` is moved into the fan-out loop, so a Full
+        // drop can be attributed to a dedicated per-type series (#3792).
+        let kind = crate::metrics::OverlayMessageKind::from_stellar_message(&message);
 
         // Record in flood gate and get filtered peer list.
         // Only FloodGate-tracked messages (tx, SCP) are recorded for dedup.
@@ -1640,13 +1682,35 @@ impl OverlayManager {
         }
 
         if dropped > 0 {
+            // Dedicated per-message-type series (#3792): the fan-out drops —
+            // dominated by our own SCP envelopes — are bridged to `/metrics`,
+            // unlike the aggregate `messages_dropped`, which is fed alongside for
+            // cross-site continuity but never exported.
+            self.metrics.broadcast_fanout_drop_by_type[kind as usize].add(dropped as u64);
             self.metrics.messages_dropped.add(dropped as u64);
-            warn!(
-                dropped,
-                sent,
-                msg_type,
-                "Broadcast backpressure: messages dropped due to full peer channels"
-            );
+            // Blackout: this call reached ZERO peers — every targeted peer's
+            // channel was full. Worth alerting on separately from partial loss.
+            if sent == 0 {
+                self.metrics.broadcast_blackout.inc();
+            }
+            // Throttle the WARN to at most one line per interval; the counters
+            // above capture every drop regardless of the log gate (#3792 §5).
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if should_emit_now(
+                &self.broadcast_backpressure_warn_last_ms,
+                now_ms,
+                BROADCAST_BACKPRESSURE_WARN_INTERVAL_MS,
+            ) {
+                warn!(
+                    dropped,
+                    sent,
+                    msg_type,
+                    "Broadcast backpressure: messages dropped due to full peer channels"
+                );
+            }
         }
 
         debug!("Broadcast {} to {} peers", msg_type, sent);
@@ -5070,7 +5134,8 @@ pub(crate) mod tests {
 
         let snap = manager.metrics.snapshot();
         assert_eq!(
-            snap.broadcast_fanout_drop_by_type[OverlayMessageKind::ScpMessage as usize], 1,
+            snap.broadcast_fanout_drop_by_type[OverlayMessageKind::ScpMessage as usize],
+            1,
             "per-type broadcast fan-out drop counter should be 1 for SCP_MESSAGE"
         );
         // Aggregate continuity (#3623): messages_dropped still incremented.
@@ -5125,7 +5190,10 @@ pub(crate) mod tests {
             assert_eq!(manager.broadcast(msg.clone()).await.unwrap(), 2);
             // Second broadcast: A queues 2/2 (ok), B full (drop) → sent=1.
             let sent = manager.broadcast(msg.clone()).await.unwrap();
-            assert_eq!(sent, 1, "peer A (cap 2) still accepts; peer B (cap 1) drops");
+            assert_eq!(
+                sent, 1,
+                "peer A (cap 2) still accepts; peer B (cap 1) drops"
+            );
 
             let snap = manager.metrics.snapshot();
             assert_eq!(
@@ -5133,7 +5201,8 @@ pub(crate) mod tests {
                 "blackout must NOT increment when at least one peer accepted"
             );
             assert_eq!(
-                snap.broadcast_fanout_drop_by_type[OverlayMessageKind::ScpMessage as usize], 1,
+                snap.broadcast_fanout_drop_by_type[OverlayMessageKind::ScpMessage as usize],
+                1,
                 "the single dropped peer must still be counted per-type"
             );
         }
