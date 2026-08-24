@@ -123,6 +123,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
 | `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
+| `metrics/catchup_stalled_state` | (3g) catchup-stalled frozen-lcl dwell state (`frozen_lcl`, `frozen_since_epoch`); sole reader/writer `classify_catchup_stalled` (#3799) | check 3g |
 | `metrics/archive/` | Per-tick snapshot dirs (current.prom + prev.prom + metadata.env), rolling 500, atomic write | check 12 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
 | `cargo-target/` | cached build tree | cargo |
@@ -418,6 +419,24 @@ ticks so STUCK can be detected by a single invocation:
   FAILURE only when lcl stops advancing AND uptime exceeds 60m.
 - **Fresh-start carveout (`FRESH_START=yes`, uptime < 20m)**: a large gap is
   expected during initial bucket apply — report CATCHING UP, not SYNC FAILURE.
+- **Never-started corollary (issue #3799, shortens the 60m blind window)**: the
+  60m crash-recovery deadline exists to accommodate a legitimate *long replay* —
+  a pipeline that has not started is not a long replay. So when `CRASH_RECOVERY=yes`
+  but the download-verify-replay pipeline has provably done nothing, report SYNC
+  FAILURE at the **15m** mark instead of waiting 60m. All must hold:
+  `apply_ledger_chain_success_total == 0` **AND** `apply_ledger_chain_failure_total == 0`
+  (read from the `/metrics` scrape `current.prom` — a legitimate replay increments
+  one within seconds), lcl has not advanced vs. the previous tick's `last_ledger`
+  (read the prior value **before** the overwrite above), and uptime `>= 15m`. This
+  is the check-(2) companion to the (3g) report-only detector. A node actively
+  replaying (either counter non-zero, or lcl advancing) keeps the full 60m window
+  via the Progress carveout above.
+
+  ```bash
+  PROM=/home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom
+  APPLY_CHAIN_OK=$(awk '/^stellar_history_apply_ledger_chain_success_total /{printf "%d",$2}' "$PROM" 2>/dev/null)
+  APPLY_CHAIN_FAIL=$(awk '/^stellar_history_apply_ledger_chain_failure_total /{printf "%d",$2}' "$PROM" 2>/dev/null)
+  ```
 
 **(3) Process alive** — find by `/proc/exe` path matching via `_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID"` (from `scripts/lib/monitor-decisions.sh`, sourced at skill init). This validates that the process binary is exactly `$HOME/data/$MONITOR_SESSION_ID/cargo-target/release/henyey` (including `(deleted)` suffix after rebuilds), scoping detection to the current session. Historical note: the original `pgrep -f 'henyey.*run'` form was abandoned because it false-matched parallel `Codex --print` agent processes; the intermediate `comm`-only replacement was abandoned because it false-matched any `henyey` process regardless of session (cross-session false positive, see #2467). If not running: Rotate-log with suffix `crashed`, then before Relaunch evaluate the **(3a) Repeated-FATAL state-wipe trigger** below.
 
@@ -878,6 +897,58 @@ This trigger fires ONLY on the genuine stuck-but-alive signature and never
 during legitimate transient sync/catch-up — a false restart on a consensus
 validator is harmful. The 600s frozen-lcl dwell + six-way AND-gate + 900s
 cooldown + max-3/2h guard enforce that conservatism.
+
+**(3g) Catchup-stalled REPORT-ONLY detector** — the deterministic catchup wedge
+(issue #3799; live reproducer #3702/#3797) that every other gate correctly
+declines to fire on. A live, `/info`-answering node sits in `Catching Up` after
+its startup catchup await never returns: `app.run()` (watchdog + main loop) is
+never spawned, so the download-verify-replay pipeline never iterates. The node
+freezes its `lcl` and does zero work while check (2) waits its full 60m
+crash-recovery deadline. (3b) wedge needs a never-spawned watchdog + dead
+`/info` (here /info answers); (3c) needs `fatal_wipe_required` (never emitted on
+this path); (3e) excludes `Catching Up` **by design** and its exclusion is
+load-bearing — a restart on a legitimately-replaying validator is harmful.
+
+(3g) is the **mirror-sibling of (3e)**, mutually exclusive by construction: (3e)
+requires `valid|synced|track`, (3g) requires `Catching Up`. It is **REPORT-ONLY**
+— **no Stop/Rotate/Relaunch.** A restart would destroy the reproducer; the value
+is in *noticing*, not acting. Evaluate (3g) in the alive path **strictly after**
+(3c) soft-fail-wipe → (3b) wedge → (3e) stuck-alive-sync, reusing the
+`NODE_STATE`/`CURRENT_LCL`/`PROC_RESPONSIVE` already computed by (3e) and
+`STARTUP_PEAK_MB` from the check-7 startup-RSS snippet. The decision is made by
+the pure function `classify_catchup_stalled` (`scripts/lib/monitor-decisions.sh`,
+already sourced), the **sole reader/writer** of its own per-session state file
+(`catchup_stalled_state` — NOT (3e)'s `stuck_restart_state`).
+
+The discriminator: `henyey_startup_peak_anon_rss_mb` is set only *after* the
+startup await returns, so it is **absent** (or the present-at-0 variant, `0`) on a
+node whose await never returned. `classify_catchup_stalled` treats absent OR `0`
+identically as "startup not complete"; a legitimately-replaying node has a
+non-zero peak and is excluded.
+
+```bash
+UPTIME_SEC=$(ps -o etimes= -p "$(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")" 2>/dev/null | tr -d ' ')
+CATCHUP_STATE_FILE="/home/tomer/data/$MONITOR_SESSION_ID/metrics/catchup_stalled_state"
+mkdir -p "$(dirname "$CATCHUP_STATE_FILE")"
+classify_catchup_stalled "$NODE_STATE" "$CURRENT_LCL" "$STARTUP_PEAK_MB" \
+  "$UPTIME_SEC" "$PROC_RESPONSIVE" "$CATCHUP_STATE_FILE" "$(date +%s)"
+```
+
+`classify_catchup_stalled` sets `CATCHUP_STALLED` ∈ `yes|no`. It is `yes` only
+when ALL five hold: `NODE_STATE` matches `catching up` (case-insensitive
+substring; disjoint from (3e)'s `valid|synced|track`); `PROC_RESPONSIVE=yes`
+((3b) owns the unresponsive case); `STARTUP_PEAK_MB` empty or `0`;
+`UPTIME_SEC >= 300`; and frozen-lcl wall-clock dwell `>= 600s` (cadence-independent,
+mirroring check (2)'s `<ledger>|<ts>` STUCK idiom — the intentional ~10 min
+first-detection latency is by design). Thresholds are named constants at the top
+of the function.
+
+- On `CATCHUP_STALLED=yes`: **do NOT restart.** Emit a WARNING banner (not
+  ACTION — no corrective action is taken) and, using the `filing_search` dedup
+  idiom, **search for the existing open catchup-stalled issue and comment on it**
+  (do NOT open a fresh issue per tick while the condition persists),
+  cross-linking #3702/#3797. Append `WATCH_ITEMS+=("catchup_stalled=1")`.
+- On `CATCHUP_STALLED=no`: report-only, no action this tick.
 
 **(4) Memory** — `ps -o rss= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`, convert to MB.
 
@@ -2162,7 +2233,7 @@ Print a multiline status report:
 MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   node:    mode=<MODE> session=<session-id> pid=<PID> fresh_start=<yes|no>
   wipe:    <per wipe-state composition table — omitted when no wipe>
-  sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|20m|60m>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
+  sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|20m|60m>[, startup_peak=<N|absent>, apply_chain=<succ>/<fail>]) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>) | CATCHUP STALLED (uptime=Xm, startup_peak=absent, apply_chain=0/0 — commented #<N>)>
   mem:     <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
            heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB peak=<startup_peak|N/A>MB
   disk:    <used>/<total> (<pct>%) | session+data=<size>

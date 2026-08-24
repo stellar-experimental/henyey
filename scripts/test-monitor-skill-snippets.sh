@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=478
+TAP_PLAN=487
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2421,6 +2421,142 @@ PYEOF
   else
     tap_not_ok "log-scan: stall_recovered ERROR line excluded from unexpected-ERROR count" \
       "carve-out marker missing from (1) Log scan in monitor-tick/SKILL.md"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # classify_catchup_stalled (T64a–T64h) — issue #3799
+  # Source: scripts/lib/monitor-decisions.sh — (3g) catchup-stalled REPORT-ONLY
+  # detector: a live, /info-answering node stuck in `Catching Up` whose startup
+  # catchup await never returned (startup_peak gauge absent-or-0) and whose lcl is
+  # frozen. Sibling to (3e), mutually exclusive by construction (3e requires
+  # valid|synced|track; this requires `Catching Up`).
+  #
+  # Contract: classify_catchup_stalled NODE_STATE CURRENT_LCL STARTUP_PEAK_MB \
+  #             UPTIME_SEC PROC_RESPONSIVE STATE_FILE [NOW_EPOCH]
+  # Sets CATCHUP_STALLED ∈ yes|no. The function is the sole reader/writer of
+  # STATE_FILE (its own — NOT (3e)'s stuck_restart_state). NOW_EPOCH is injectable
+  # for deterministic tests. Report-only: no cooldown/streak/restart machinery.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  local NOW_CS=1700000000             # fixed reference for catchup-stalled tests
+  local cs_dir="$TEST_ROOT/catchup-stalled"
+  mkdir -p "$cs_dir"
+
+  # Helper: seed a state file with a frozen lcl that has been frozen for N seconds
+  # (so frozen_lcl_seconds = N at NOW_CS). Mirrors _sa_seed's dwell bookkeeping.
+  _cs_seed() {
+    # $1=file $2=frozen_lcl $3=frozen_for_sec
+    local f="$1" lcl="$2" frozen_for="$3"
+    printf 'frozen_lcl=%s\nfrozen_since_epoch=%s\n' \
+      "$lcl" "$((NOW_CS - frozen_for))" > "$f"
+  }
+
+  # ── Test 64a: full wedge signature → yes ───────────────────────────────────
+  # Catching up + startup_peak absent (empty) + uptime 1080 + lcl frozen 700s +
+  # responsive. The reproduced #3702/#3797 signature.
+  local cs_a="$cs_dir/a.state"
+  _cs_seed "$cs_a" 63733600 700
+  classify_catchup_stalled "Catching up" 63733600 "" 1080 "yes" "$cs_a" "$NOW_CS"
+  if [[ "$CATCHUP_STALLED" == "yes" ]]; then
+    tap_ok "catchup-stalled: full wedge (Catching up + startup_peak absent + uptime 1080 + frozen 700s + responsive) → yes"
+  else
+    tap_not_ok "catchup-stalled: full wedge → yes" "got CATCHUP_STALLED=$CATCHUP_STALLED"
+  fi
+
+  # ── Test 64b: legitimate replay (startup completed) → no ───────────────────
+  # startup_peak set (27000) proves the await returned and app.run() spawned;
+  # a genuinely-replaying node must never be flagged.
+  local cs_b="$cs_dir/b.state"
+  _cs_seed "$cs_b" 63733600 700
+  classify_catchup_stalled "Catching up" 63733600 27000 1080 "yes" "$cs_b" "$NOW_CS"
+  if [[ "$CATCHUP_STALLED" == "no" ]]; then
+    tap_ok "catchup-stalled: legitimate replay (startup_peak=27000) → no"
+  else
+    tap_not_ok "catchup-stalled: legitimate replay → no" "got CATCHUP_STALLED=$CATCHUP_STALLED"
+  fi
+
+  # ── Test 64c: warmup (uptime 120 < 300) → no ───────────────────────────────
+  # Under the bucket-restore + cache-scan window; too early to judge.
+  local cs_c="$cs_dir/c.state"
+  _cs_seed "$cs_c" 63733600 700
+  classify_catchup_stalled "Catching up" 63733600 "" 120 "yes" "$cs_c" "$NOW_CS"
+  if [[ "$CATCHUP_STALLED" == "no" ]]; then
+    tap_ok "catchup-stalled: warmup (uptime 120 < 300) → no"
+  else
+    tap_not_ok "catchup-stalled: warmup → no" "got CATCHUP_STALLED=$CATCHUP_STALLED"
+  fi
+
+  # ── Test 64d: dwell not met — lcl advanced this tick → no + re-anchor ───────
+  # State says frozen at 63733600 for 700s, but CURRENT_LCL advanced to 63733700
+  # → reset frozen_since to NOW and do NOT fire.
+  local cs_d="$cs_dir/d.state"
+  _cs_seed "$cs_d" 63733600 700
+  classify_catchup_stalled "Catching up" 63733700 "" 1080 "yes" "$cs_d" "$NOW_CS"
+  local d_result="$CATCHUP_STALLED"
+  local d_frozen_lcl d_frozen_since
+  d_frozen_lcl=$(grep '^frozen_lcl=' "$cs_d" | cut -d= -f2)
+  d_frozen_since=$(grep '^frozen_since_epoch=' "$cs_d" | cut -d= -f2)
+  if [[ "$d_result" == "no" && "$d_frozen_lcl" == "63733700" && "$d_frozen_since" == "$NOW_CS" ]]; then
+    tap_ok "catchup-stalled: lcl advanced this tick → no (re-anchors frozen_since)"
+  else
+    tap_not_ok "catchup-stalled: lcl advanced this tick → no" \
+      "result=$d_result frozen_lcl=$d_frozen_lcl frozen_since=$d_frozen_since (want no/63733700/$NOW_CS)"
+  fi
+
+  # ── Test 64e: healthy synced (Synced!) → no (disjoint from (3e)) ────────────
+  # State-gate is `catching up` only; a synced node is (3e)'s domain, never here.
+  local cs_e="$cs_dir/e.state"
+  _cs_seed "$cs_e" 63733600 700
+  classify_catchup_stalled "Synced!" 63733600 "" 1080 "yes" "$cs_e" "$NOW_CS"
+  if [[ "$CATCHUP_STALLED" == "no" ]]; then
+    tap_ok "catchup-stalled: healthy synced (Synced!) → no (disjoint from (3e))"
+  else
+    tap_not_ok "catchup-stalled: healthy synced → no" "got CATCHUP_STALLED=$CATCHUP_STALLED"
+  fi
+
+  # ── Test 64f: present-at-0 variant (startup_peak=0) → yes ───────────────────
+  # The gauge present but 0 is treated identically to absent (startup not done).
+  local cs_f="$cs_dir/f.state"
+  _cs_seed "$cs_f" 63733600 700
+  classify_catchup_stalled "Catching up" 63733600 0 1080 "yes" "$cs_f" "$NOW_CS"
+  if [[ "$CATCHUP_STALLED" == "yes" ]]; then
+    tap_ok "catchup-stalled: present-at-0 variant (startup_peak=0) → yes"
+  else
+    tap_not_ok "catchup-stalled: present-at-0 variant → yes" "got CATCHUP_STALLED=$CATCHUP_STALLED"
+  fi
+
+  # ── Test 64g: unresponsive (PROC_RESPONSIVE=no) → no ((3b) owns wedge) ──────
+  local cs_g="$cs_dir/g.state"
+  _cs_seed "$cs_g" 63733600 700
+  classify_catchup_stalled "Catching up" 63733600 "" 1080 "no" "$cs_g" "$NOW_CS"
+  if [[ "$CATCHUP_STALLED" == "no" ]]; then
+    tap_ok "catchup-stalled: unresponsive (PROC_RESPONSIVE=no) → no ((3b) owns wedge)"
+  else
+    tap_not_ok "catchup-stalled: unresponsive → no" "got CATCHUP_STALLED=$CATCHUP_STALLED"
+  fi
+
+  # ── Test 64h: fresh/absent state file → no (dwell 0, latency locked in) ─────
+  # First detection of a freeze must NOT fire — the ~10 min dwell latency is
+  # intentional. An absent state file anchors frozen_since to NOW → dwell 0.
+  local cs_h="$cs_dir/h.state"   # deliberately NOT seeded (absent)
+  classify_catchup_stalled "Catching up" 63733600 "" 1080 "yes" "$cs_h" "$NOW_CS"
+  local h_result="$CATCHUP_STALLED"
+  local h_frozen_since
+  h_frozen_since=$(grep '^frozen_since_epoch=' "$cs_h" | cut -d= -f2)
+  if [[ "$h_result" == "no" && "$h_frozen_since" == "$NOW_CS" ]]; then
+    tap_ok "catchup-stalled: fresh/absent state file → no (dwell 0, first-detection latency locked in)"
+  else
+    tap_not_ok "catchup-stalled: fresh/absent state file → no" \
+      "result=$h_result frozen_since=$h_frozen_since (want no/$NOW_CS)"
+  fi
+
+  # ── Test 64consistency: SKILL.md references classify_catchup_stalled ────────
+  local tick_file_cs="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'classify_catchup_stalled' "$tick_file_cs"; then
+    tap_ok "consistency: monitor-tick/SKILL.md references classify_catchup_stalled"
+  else
+    tap_not_ok "consistency: monitor-tick/SKILL.md references classify_catchup_stalled" \
+      "(3g) rung not wired in monitor-tick/SKILL.md"
   fi
 
   # ════════════════════════════════════════════════════════════════════════════
