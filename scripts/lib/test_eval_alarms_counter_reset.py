@@ -511,6 +511,155 @@ def test_post_restart_below_threshold_does_not_fire():
             f"Below-threshold reset must not set post_restart, got {result.get('post_restart')!r}"
 
 
+# ── cold-catchup carveout tests (issue #3816) ────────────────────────────────
+
+def test_post_restart_fire_suppressed_on_cold_catchup():
+    """A baseline-reset (PID-change) tick whose absolute counter crosses
+    post_restart_absolute_threshold must NOT fire post-restart when the node
+    just completed a from-scratch (HAS-restore) catchup this incarnation —
+    signalled by stellar_history_bucket_apply_success_total > 0. Being behind
+    for minutes across ~10^5 ledgers is the point of a cold catchup, not a stall.
+
+    Fails on origin/main: eval_counter_streak has no `fresh_start` kwarg
+    (TypeError) and no cold-catchup gate, so the PID-change branch fires
+    post_restart at absolute=63.
+    Passes after: the cold-catchup gate returns collecting_baseline.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "111",
+            "start_ticks": "100",
+            "counter_value": "0",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        # cur_val 63 >= threshold 50, AND a cold-catchup bucket-apply happened
+        # this incarnation (labeled per-archive series, value >= 1).
+        current = {
+            "recovery-stalled-metric": [({}, 63.0)],
+            "stellar_history_bucket_apply_success_total": [({"archive": "sdf"}, 1.0)],
+        }
+
+        result = eval_counter_streak(alarm, current, state_dir, "222", "200",
+                                     fresh_start=False)
+
+        assert result["state"] == "collecting_baseline", \
+            f"Cold catchup must suppress the post-restart fire, got {result['state']}"
+        assert not result.get("post_restart"), \
+            f"Cold catchup must not set post_restart, got {result.get('post_restart')!r}"
+        assert result.get("cold_catchup_exemption"), \
+            f"Cold-catchup suppression must set the exemption marker, got {result.get('cold_catchup_exemption')!r}"
+
+        # Fresh baseline still written before the (suppressed) fire check.
+        snap = read_snapshot(snap_path)
+        assert snap["pid"] == "222", "fresh baseline pid must be written"
+        assert snap["breach_streak"] == "0", "fresh baseline streak must be 0"
+
+
+def test_render_cold_catchup_exemption_line():
+    """render_aggregate labels a collecting_baseline result carrying the
+    cold_catchup_exemption marker with the documented exemption suffix.
+
+    Fails on origin/main: the renderer has no such branch and emits the plain
+    `recovery_stalled: collecting baseline` line.
+    """
+    r = {
+        "contributes_to": "recovery_stalled",
+        "state": "collecting_baseline",
+        "cold_catchup_exemption": True,
+    }
+    out = render_aggregate([r], watcher_mode=False)
+    line = out["recovery_stalled_line"]
+    assert line == "recovery_stalled: collecting baseline (cold-catchup exemption)", \
+        f"Expected cold-catchup exemption form, got: {line!r}"
+
+
+def test_post_restart_fire_suppressed_on_fresh_start():
+    """The fresh_start OR arm: even without the bucket-apply metric on this tick,
+    a FRESH_START=yes (state-wipe) tick must suppress the post-restart fire.
+
+    Fails on origin/main: no `fresh_start` kwarg (TypeError) and no gate.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "111",
+            "start_ticks": "100",
+            "counter_value": "0",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        # No bucket-apply series present; fresh_start=True is the only signal.
+        current = {"recovery-stalled-metric": [({}, 63.0)]}
+
+        result = eval_counter_streak(alarm, current, state_dir, "222", "200",
+                                     fresh_start=True)
+
+        assert result["state"] == "collecting_baseline", \
+            f"FRESH_START must suppress the post-restart fire, got {result['state']}"
+        assert not result.get("post_restart"), \
+            f"FRESH_START must not set post_restart, got {result.get('post_restart')!r}"
+        assert result.get("cold_catchup_exemption"), \
+            f"FRESH_START suppression must set the exemption marker, got {result.get('cold_catchup_exemption')!r}"
+
+
+def test_post_restart_fire_still_fires_warm_restart():
+    """Guard for #3197/#3198: a warm near-tip restart (no bucket-apply series,
+    fresh_start=False) must STILL fire post-restart at absolute >= threshold.
+    The carveout must be conditional on the cold-catchup signal, not swallow the
+    warm-restart stall detection the check exists to provide.
+
+    Passes before AND after the fix (with the new default kwarg), proving the
+    carveout is conditional.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "111",
+            "start_ticks": "100",
+            "counter_value": "0",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        # No bucket-apply series (warm restart, pure ledger-chain replay).
+        current = {"recovery-stalled-metric": [({}, 63.0)]}
+
+        result = eval_counter_streak(alarm, current, state_dir, "222", "200",
+                                     fresh_start=False)
+
+        assert result["state"] == "firing", \
+            f"Warm restart must still fire post-restart, got {result['state']}"
+        assert result.get("post_restart") is True, \
+            f"Warm restart must set post_restart, got {result.get('post_restart')!r}"
+        assert not result.get("cold_catchup_exemption"), \
+            f"Warm restart must not set the exemption marker, got {result.get('cold_catchup_exemption')!r}"
+
+
 # ── missing-process-identity guard tests (issue #3279) ───────────────────────
 
 def test_missing_identity_does_not_poison_snapshot_or_fire():
