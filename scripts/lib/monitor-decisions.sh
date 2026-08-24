@@ -1329,6 +1329,147 @@ classify_stuck_alive_sync() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# classify_catchup_stalled NODE_STATE CURRENT_LCL STARTUP_PEAK_MB UPTIME_SEC \
+#                          PROC_RESPONSIVE STATE_FILE [NOW_EPOCH]
+#
+# Pure decision function for the monitor-tick alive-path sub-check (3g):
+# "catchup-stalled" REPORT-ONLY detector (issue #3799).
+#
+# Detects the deterministic catchup wedge that every existing gate declines to
+# fire on: a live, /info-answering node stuck in `Catching Up` whose startup
+# catchup await (`run_cmd.rs`) never returned, so `app.run()` (watchdog + main
+# loop) is never spawned and the download-verify-replay pipeline never iterates.
+# The node sits `Catching Up` with a frozen lcl and zero pipeline progress while
+# check (2) waits its full 60m crash-recovery deadline. See #3702/#3797 for the
+# live reproducer.
+#
+# Why the other gates miss it (and why this one is a separate, report-only rung):
+#   (3b) wedge     — needs a never-spawned watchdog + dead `/info`; here /info
+#                    answers in <100ms, so (3b) correctly declines.
+#   (3c) soft-fail — needs `fatal_wipe_required`, never emitted on this path.
+#   (3e) stuck-alive — excludes `Catching Up` by design (state gate is
+#                    valid|synced|track); its exclusion is LOAD-BEARING — a
+#                    restart on a legitimately-replaying validator is harmful.
+# (3g) is the MIRROR-SIBLING of (3e): (3e) requires valid|synced|track, this
+# requires `Catching Up` — mutually exclusive by construction. It is
+# REPORT-ONLY (no Stop/Rotate/Relaunch): a restart here would destroy the
+# reproducer; the value is in NOTICING, not acting. Hence no cooldown / streak /
+# max-restart machinery — just a yes/no verdict.
+#
+# The discriminator: `henyey_startup_peak_anon_rss_mb` is set only AFTER the
+# startup await returns (peak_rss_sampler stop, before the first ledger close).
+# On a node whose await never returned it is ABSENT (or, in the present-at-0
+# variant, 0). The detector treats absent OR 0 identically as "startup not
+# complete." A legitimately-replaying node has a non-zero peak and is excluded.
+#
+# Mirrors classify_stuck_alive_sync's injectable-time design: NOW_EPOCH is the
+# optional last positional arg (defaults to wall clock) so all dwell arithmetic
+# is deterministically testable.
+#
+# SOLE READER/WRITER of STATE_FILE — its OWN per-session file
+# (`catchup_stalled_state`), NOT (3e)'s `stuck_restart_state`. The caller
+# supplies only the live CURRENT_LCL value and the file path; this function owns
+# all reads/writes of `frozen_lcl` and `frozen_since_epoch`. On each call: if
+# CURRENT_LCL != frozen_lcl, the lcl advanced (NOT stuck) → reset
+# frozen_lcl=CURRENT_LCL and frozen_since_epoch=NOW; else frozen_since_epoch
+# accumulates. frozen_lcl_seconds = NOW - frozen_since_epoch. Reuses the exact
+# reset-on-advance dwell bookkeeping from classify_stuck_alive_sync.
+#
+# Thresholds (named constants — operators may retune):
+#   CATCHUP_MIN_UPTIME_SEC=300   past the bucket-restore + cache-scan window
+#                                (both reproducer launches reached the range
+#                                declaration by ~110s; 300s is a safe floor).
+#   CATCHUP_DWELL_SEC=600        frozen-lcl wall-clock dwell (cadence-independent;
+#                                mirrors check (2)'s "<ledger>|<ts>" STUCK idiom,
+#                                so it fires at ~10 min of freeze regardless of
+#                                tick spacing). The intentional ~10 min
+#                                first-detection latency is by design.
+#
+# State-gate match: case-insensitive substring `catching up` — disjoint from
+# (3e)'s `valid|synced|track`, verified against the real /info `state` enum
+# (crates/app/src/compat_http/handlers/info.rs): catch-up → "Catching up".
+#
+# Sets global CATCHUP_STALLED ∈ "yes" | "no":
+#   yes — ALL five conditions hold (state, responsive, startup absent/0, uptime,
+#         dwell). REPORT-ONLY: the caller files/comments but takes NO action.
+#   no  — any condition fails. State is persisted either way.
+# Returns: 0 always. Does NO process I/O (no kill/relaunch) — report-only rung.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_catchup_stalled() {
+  local node_state="$1"
+  local current_lcl="$2"
+  local startup_peak_mb="$3"
+  local uptime_sec="$4"
+  local proc_responsive="$5"
+  local state_file="$6"
+  local now_epoch="${7:-$(date +%s)}"
+
+  # Named thresholds (operator-retunable).
+  local CATCHUP_MIN_UPTIME_SEC=300
+  local CATCHUP_DWELL_SEC=600
+
+  CATCHUP_STALLED="no"
+
+  # ── Read prior state (this function is the sole reader/writer). ─────────────
+  local frozen_lcl="" frozen_since_epoch=""
+  if [[ -f "$state_file" ]]; then
+    local key val
+    while IFS='=' read -r key val; do
+      case "$key" in
+        frozen_lcl)         frozen_lcl="$val" ;;
+        frozen_since_epoch) frozen_since_epoch="$val" ;;
+      esac
+    done < "$state_file"
+  fi
+
+  # ── Frozen-lcl bookkeeping: reset on advance, else accumulate. ──────────────
+  if [[ "$current_lcl" != "$frozen_lcl" ]]; then
+    frozen_lcl="$current_lcl"
+    frozen_since_epoch="$now_epoch"
+  fi
+  # Defensive: if the state file was missing/corrupt, anchor frozen_since to now.
+  [[ -z "$frozen_since_epoch" ]] && frozen_since_epoch="$now_epoch"
+
+  local frozen_lcl_seconds=$(( now_epoch - frozen_since_epoch ))
+  [[ "$frozen_lcl_seconds" -lt 0 ]] && frozen_lcl_seconds=0
+
+  # ── Persist the (possibly reset) state before any early return. ─────────────
+  _write_catchup_state() {
+    printf 'frozen_lcl=%s\nfrozen_since_epoch=%s\n' \
+      "$frozen_lcl" "$frozen_since_epoch" \
+      > "$state_file" 2>/dev/null || true
+  }
+
+  # ── Five-way AND-gate. Any miss → "no" (state persisted, no action). ────────
+  # 1. State is `Catching Up` (case-insensitive substring; disjoint from (3e)).
+  local lc_state
+  lc_state=$(printf '%s' "$node_state" | tr '[:upper:]' '[:lower:]')
+  case "$lc_state" in
+    *catching\ up*) : ;;   # match — continue
+    *) _write_catchup_state; CATCHUP_STALLED="no"; return 0 ;;
+  esac
+  # 2. Process alive AND responsive ((3b) owns the unresponsive/wedge case).
+  [[ "$proc_responsive" == "yes" ]] || { _write_catchup_state; CATCHUP_STALLED="no"; return 0; }
+  # 3. Startup NOT complete: startup_peak gauge absent (empty) OR present-at-0.
+  #    A non-zero peak proves the await returned → legitimate replay → decline.
+  if [[ -n "$startup_peak_mb" ]] && [[ "$startup_peak_mb" =~ ^[0-9]+$ ]] \
+     && [[ "$startup_peak_mb" -gt 0 ]]; then
+    _write_catchup_state; CATCHUP_STALLED="no"; return 0
+  fi
+  # 4. Past the warmup window.
+  [[ "$uptime_sec" =~ ^[0-9]+$ ]] && [[ "$uptime_sec" -ge "$CATCHUP_MIN_UPTIME_SEC" ]] \
+    || { _write_catchup_state; CATCHUP_STALLED="no"; return 0; }
+  # 5. Frozen-lcl dwell met (cadence-independent ~10 min freeze).
+  [[ "$frozen_lcl_seconds" -ge "$CATCHUP_DWELL_SEC" ]] \
+    || { _write_catchup_state; CATCHUP_STALLED="no"; return 0; }
+
+  # ── Fire (report-only): all five conditions hold. ──────────────────────────
+  _write_catchup_state
+  CATCHUP_STALLED="yes"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # classify_event_loop_stall LOG_FILE STATE_FILE [NOW_EPOCH]
 #
 # Pure decision function for the monitor-tick alive-path sub-check (3f)
