@@ -752,6 +752,8 @@ metric_catalog! {
             => "Total fetch-response/-request messages dropped on the bounded fetch intake channel when full (#3661)";
         OVERLAY_CATCHUP_MESSAGES_DROPPED_TOTAL = "henyey_overlay_catchup_messages_dropped_total"
             => "Total catchup-cache fan-out messages dropped on the bounded catchup channel when full (#3661)";
+        OVERLAY_BROADCAST_BLACKOUT_TOTAL = "henyey_overlay_broadcast_blackout_total"
+            => "Broadcast calls that reached ZERO peers because every targeted peer's outbound channel was full (dropped>0 && sent==0) (#3792)";
         OVERLAY_ERROR_READ_TOTAL = "stellar_overlay_error_read_total"
             => "Total overlay read errors";
         OVERLAY_ERROR_WRITE_TOTAL = "stellar_overlay_error_write_total"
@@ -991,6 +993,9 @@ metric_catalog! {
             "reason", henyey_herder::scp_verify::PostVerifyReason;
         OVERLAY_SEND_TOTAL = "stellar_overlay_send_total"
             => "Overlay messages sent by type (success-only, post-wire-send)",
+            "type", henyey_overlay::OverlayMessageKind;
+        OVERLAY_BROADCAST_FANOUT_DROP_TOTAL = "henyey_overlay_broadcast_fanout_drop_total"
+            => "Outbound broadcast fan-out messages dropped by type because the target peer's channel was full (#3792)",
             "type", henyey_overlay::OverlayMessageKind;
     }
 
@@ -1371,6 +1376,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_MESSAGE_BROADCAST_TOTAL.absolute(ov.messages_broadcast);
         OVERLAY_FETCH_MESSAGES_DROPPED_TOTAL.absolute(ov.fetch_messages_dropped);
         OVERLAY_CATCHUP_MESSAGES_DROPPED_TOTAL.absolute(ov.catchup_messages_dropped);
+        OVERLAY_BROADCAST_BLACKOUT_TOTAL.absolute(ov.broadcast_blackout);
         OVERLAY_ERROR_READ_TOTAL.absolute(ov.errors_read);
         OVERLAY_ERROR_WRITE_TOTAL.absolute(ov.errors_write);
         OVERLAY_TIMEOUT_IDLE_TOTAL.absolute(ov.timeouts_idle);
@@ -1411,6 +1417,14 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         // Stage F.3: per-message-type send counter (issue #2245).
         for kind in henyey_overlay::OverlayMessageKind::ALL {
             OVERLAY_SEND_TOTAL.absolute(kind.label(), ov.send_by_type[kind as usize]);
+        }
+
+        // #3792: per-message-type broadcast fan-out drop counter.
+        for kind in henyey_overlay::OverlayMessageKind::ALL {
+            OVERLAY_BROADCAST_FANOUT_DROP_TOTAL.absolute(
+                kind.label(),
+                ov.broadcast_fanout_drop_by_type[kind as usize],
+            );
         }
     } else {
         // Ensure gauge is zeroed if overlay stops.
@@ -2785,6 +2799,42 @@ mod tests {
                 reason
             );
         }
+    }
+
+    /// Regression for #3792: the overlay broadcast fan-out drop series and the
+    /// blackout counter must be in the catalog and pre-registered at zero, so
+    /// the drops are visible on `/metrics` before the first drop. On
+    /// origin/main both series are absent from the catalog, so no HELP renders
+    /// and this test FAILS.
+    #[test]
+    fn test_overlay_broadcast_drop_metrics_bridged() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+
+        assert!(
+            output.contains("# HELP henyey_overlay_broadcast_fanout_drop_total"),
+            "missing HELP for henyey_overlay_broadcast_fanout_drop_total"
+        );
+        assert!(
+            output.contains("# HELP henyey_overlay_broadcast_blackout_total"),
+            "missing HELP for henyey_overlay_broadcast_blackout_total"
+        );
+        // Per-type label pre-registered at zero. Label value is the lowercase
+        // `OverlayMessageKind::label()` (`scp_message`), NOT the uppercase wire
+        // name used in the WARN text.
+        assert!(
+            output.contains("henyey_overlay_broadcast_fanout_drop_total{type=\"scp_message\"} 0"),
+            "scp_message fan-out drop series should be pre-registered at 0; got:\n{output}"
+        );
+        // Unlabeled blackout counter pre-registered at zero.
+        assert!(
+            output.contains("henyey_overlay_broadcast_blackout_total 0"),
+            "blackout counter should be pre-registered at 0"
+        );
     }
 
     #[test]

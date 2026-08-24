@@ -270,6 +270,20 @@ pub struct OverlayMetrics {
     /// task was not draining (#3661). Recoverable: the cache is pre-warm only;
     /// re-fetched/re-flooded after the catchup→Tracking handoff.
     pub catchup_messages_dropped: Counter,
+    /// Per-message-type outbound broadcast fan-out drops, indexed by
+    /// [`OverlayMessageKind`]. Incremented in `OverlayManager::broadcast` when a
+    /// target peer's `outbound_tx` channel is `Full` (#3792). Dedicated series
+    /// so the broadcast fan-out drops — dominated by our own `SCP_MESSAGE`
+    /// envelopes — are not conflated with the 5 other sites that feed the
+    /// aggregate `messages_dropped` (which is fed alongside this, for continuity,
+    /// but is never bridged to `/metrics`).
+    pub broadcast_fanout_drop_by_type: [Counter; OverlayMessageKind::COUNT],
+    /// Broadcast "blackouts": calls where at least one peer was targeted but
+    /// every one rejected via `Full` (`dropped > 0 && sent == 0`), so the
+    /// message reached ZERO peers (#3792). Qualitatively worse than losing one
+    /// peer out of many — this is the series worth alerting on. Incremented once
+    /// per such call.
+    pub broadcast_blackout: Counter,
 
     // ===== Byte Metrics =====
     /// Bytes read from peers (wire-level: `AuthenticatedMessage` XDR body, excluding the
@@ -437,6 +451,10 @@ impl OverlayMetrics {
             messages_broadcast: self.messages_broadcast.get(),
             fetch_messages_dropped: self.fetch_messages_dropped.get(),
             catchup_messages_dropped: self.catchup_messages_dropped.get(),
+            broadcast_fanout_drop_by_type: std::array::from_fn(|i| {
+                self.broadcast_fanout_drop_by_type[i].get()
+            }),
+            broadcast_blackout: self.broadcast_blackout.get(),
 
             // Byte metrics
             bytes_read: self.bytes_read.get(),
@@ -523,6 +541,7 @@ impl OverlayMetrics {
             &self.messages_broadcast,
             &self.fetch_messages_dropped,
             &self.catchup_messages_dropped,
+            &self.broadcast_blackout,
             &self.bytes_read,
             &self.bytes_written,
             &self.async_read,
@@ -573,6 +592,10 @@ impl OverlayMetrics {
         for counter in &self.send_by_type {
             counter.reset();
         }
+
+        for counter in &self.broadcast_fanout_drop_by_type {
+            counter.reset();
+        }
     }
 }
 
@@ -588,6 +611,11 @@ pub struct OverlayMetricsSnapshot {
     pub fetch_messages_dropped: u64,
     /// Catchup-cache channel drops (#3661).
     pub catchup_messages_dropped: u64,
+    /// Per-message-type outbound broadcast fan-out drops (#3792), indexed by
+    /// [`OverlayMessageKind`].
+    pub broadcast_fanout_drop_by_type: [u64; OverlayMessageKind::COUNT],
+    /// Broadcast calls that reached ZERO peers (`dropped > 0 && sent == 0`) (#3792).
+    pub broadcast_blackout: u64,
 
     // Byte metrics
     pub bytes_read: u64,
