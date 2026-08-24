@@ -527,6 +527,14 @@ def make_result(
         # only inside extra_values, so without this it never reaches the
         # renderer and a post-restart fire is mislabeled (burst) (#3274).
         "post_restart": bool(extra_values and extra_values.get("post_restart")),
+        # Surface the cold-catchup exemption marker (#3816) the same way as
+        # post_restart above: extra_values keys are NOT auto-promoted, so
+        # without this the exemption never reaches the renderer and a suppressed
+        # post-restart fire on a healthy cold catchup renders as a plain
+        # "collecting baseline" with no visible reason for the quiet.
+        "cold_catchup_exemption": bool(
+            extra_values and extra_values.get("cold_catchup_exemption")
+        ),
     }
 
     # Safety net: warn about unresolved template placeholders.
@@ -1482,10 +1490,26 @@ def eval_counter_streak(
     start_ticks: str,
     gap_stale: bool = False,
     too_fresh: bool = False,
+    fresh_start: bool = False,
 ) -> dict:
     """Evaluate a counter-streak alarm.
 
     Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
+
+    Cold-catchup carveout (#3816): the post-restart absolute fire (#3198) exists
+    to catch a *warm* restart whose startup stall burst straddles the
+    baseline-reset tick. A *cold* catchup after a state wipe legitimately accrues
+    >= post_restart_absolute_threshold escalation ticks (being behind for minutes
+    across ~10^5 ledgers is the point, not a stall). We suppress the one-shot
+    post-restart fire when this incarnation demonstrably did a from-scratch
+    HAS-restore catchup — signalled by stellar_history_bucket_apply_success_total
+    (per-incarnation counter, only emitted on the bucket-apply path, 0/absent on a
+    warm near-tip restart), OR by FRESH_START=yes as a cheap belt-and-suspenders
+    arm. A genuinely *stuck* cold catchup is still caught: only the one-shot fire
+    is exempted; the ordinary same-PID delta/streak/burst path fires on later
+    ticks if the counter keeps climbing. Keying on bucket-apply (not crash
+    recovery) is deliberate — #3197's warm-restart stall did NO bucket apply, so
+    the blind spot the check exists to close stays closed.
     """
     ev_default = default_extra_values(alarm, "counter-streak")
 
@@ -1511,6 +1535,14 @@ def eval_counter_streak(
     if cur_val is None:
         return make_result(alarm, "skipped", skip_reason="metric not found",
                            extra_values=ev_default)
+
+    # Cold-catchup signal (#3816), observable at the baseline-reset (fire) tick.
+    # form1's fallback returns the first series' value even though the counter is
+    # labeled per-archive; the counter is only exported once it increments (>= 1)
+    # on a from-scratch HAS-restore catchup, so presence with value > 0 means a
+    # cold catchup happened this incarnation. Absent (None) on a warm restart.
+    bucket_apply = extract_value(current, "stellar_history_bucket_apply_success_total", "form1")
+    cold_catchup = (bucket_apply is not None and bucket_apply > 0) or fresh_start
 
     snapshot_file = alarm.get("snapshot_file", "counter_streak_snapshot")
     snapshot_path = state_dir / snapshot_file
@@ -1538,6 +1570,15 @@ def eval_counter_streak(
             write_snapshot(snapshot_path, new_snapshot)
             post_restart = maybe_post_restart_fire(alarm, cur_val)
             if post_restart is not None:
+                if cold_catchup:
+                    # #3816: a healthy from-scratch catchup legitimately crossed
+                    # the absolute threshold — suppress the one-shot fire. The
+                    # fresh baseline is already written, so a genuinely stuck
+                    # cold catchup still fires via the same-PID delta/streak path.
+                    return make_result(
+                        alarm, "collecting_baseline",
+                        extra_values={"cold_catchup_exemption": True, **ev_default},
+                    )
                 return post_restart
             return make_result(alarm, "collecting_baseline",
                                extra_values=ev_default)
@@ -1575,6 +1616,12 @@ def eval_counter_streak(
         write_snapshot(snapshot_path, new_snapshot)
         post_restart = maybe_post_restart_fire(alarm, cur_val)
         if post_restart is not None:
+            if cold_catchup:
+                # #3816: cold-catchup exemption, mirroring the PID-change branch.
+                return make_result(
+                    alarm, "collecting_baseline",
+                    extra_values={"cold_catchup_exemption": True, **ev_default},
+                )
             return post_restart
         return make_result(alarm, "collecting_baseline",
                            extra_values=ev_default)
@@ -1755,7 +1802,13 @@ def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
         elif r["state"] == "skipped":
             recovery_stalled_line = f"recovery_stalled: skipped ({r.get('skip_reason', '')})"
         elif r["state"] == "collecting_baseline":
-            recovery_stalled_line = "recovery_stalled: collecting baseline"
+            # #3816: surface the cold-catchup exemption so an operator watching a
+            # state-wipe recovery sees why the post-restart fire stayed quiet,
+            # instead of an unexplained "collecting baseline".
+            if r.get("cold_catchup_exemption"):
+                recovery_stalled_line = "recovery_stalled: collecting baseline (cold-catchup exemption)"
+            else:
+                recovery_stalled_line = "recovery_stalled: collecting baseline"
         else:
             recovery_stalled_line = f"recovery_stalled: ok (delta={r.get('value', 0)})"
 
@@ -2089,7 +2142,7 @@ def main() -> int:
                 )
             elif kind == "counter-streak":
                 result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val,
-                                             gap_stale, too_fresh)
+                                             gap_stale, too_fresh, fresh_start)
             else:
                 result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 
