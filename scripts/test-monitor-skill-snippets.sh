@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=478
+TAP_PLAN=479
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -11287,6 +11287,30 @@ Cargo.toml"
   else
     tap_not_ok "structural: Test 6 boundary check is deterministic and guarded (#3766)" \
       "Test 6 must mock 7199 (not the exact 7200 boundary) and guard its check_session_wiped call via exit_code6"
+  fi
+
+  # ── Structural self-test: check (11) urgent-label gate is conditional (#3820) ──
+  # Post-#3351 the deploy gate consumes ONLY `Verify Execution (Mainnet)`, so a
+  # main-branch CI failure is `urgent` ONLY when that exact workflow is red.
+  # Guard against the pre-#3820 regressions:
+  #   (a) the stale "blocks deploy and meets the urgent criteria" rationale must
+  #       be gone (§10 removed the CI-blocks-deploy premise it rested on);
+  #   (b) the section must gate the urgent label on `Verify Execution (Mainnet)`;
+  #   (c) step 5's `gh issue create` must NOT carry an unconditional
+  #       `--label urgent` — the label is appended only via an `ONLY IF` gate.
+  # Scope to the extracted `## CI check workflow` section so unrelated matches
+  # elsewhere in SKILL.md (e.g. §10) can't mask a regression.
+  local ci_section
+  ci_section=$(extract_md_section "$tick_md" '^## CI check workflow')
+  if [[ -n "$ci_section" ]] \
+     && ! grep -q 'blocks deploy and meets the urgent criteria' <<<"$ci_section" \
+     && grep -q 'Verify Execution (Mainnet)' <<<"$ci_section" \
+     && ! grep -q 'gh issue create --label urgent' <<<"$ci_section" \
+     && grep -q 'ONLY IF' <<<"$ci_section"; then
+    tap_ok "structural: check (11) gates urgent on Verify Execution (Mainnet), stale blocks-deploy rationale struck (#3820)"
+  else
+    tap_not_ok "structural: check (11) gates urgent on Verify Execution (Mainnet), stale blocks-deploy rationale struck (#3820)" \
+      "check (11) must strike 'blocks deploy and meets the urgent criteria', gate urgent on 'Verify Execution (Mainnet)', and drop the unconditional 'gh issue create --label urgent' in favor of an 'ONLY IF' gate"
   fi
 }
 check_skill_structure
