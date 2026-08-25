@@ -10,7 +10,7 @@
 
 | Label | Criteria | Examples |
 |-------|----------|----------|
-| `urgent` | Blocks validator operation or consensus participation | Hash mismatch (any kind), wedged node (frozen event loop, watchdog auto-abort), failing CI on origin/main blocking deploy, panic or crash from production code, SYNC FAILURE past active deadline, OOM-driven restart, deploy regression |
+| `urgent` | Blocks validator operation or consensus participation | Hash mismatch (any kind), wedged node (frozen event loop, watchdog auto-abort), failing CI on origin/main blocking deploy (post-#3351 that means a failing `Verify Execution (Mainnet)` run — the only workflow the deploy gate consumes; other workflow failures no longer gate deploy and file **unlabeled**), panic or crash from production code, SYNC FAILURE past active deadline, OOM-driven restart, deploy regression |
 | `alarm-regression` | Alarm that was meaningfully active (≥5% of ticks) in the replay baseline has gone completely silent (0% firing) in the current replay window | An alarm tracking recovery-stalled ticks that stops firing after a code change, an alarm for high open_fds that disappears after a refactor |
 | *(no label)* | Non-urgent: does not block operation | Calibration, threshold tuning, NONC alerts, cosmetic noise, follow-up improvements, metric drift without visible effect |
 | `not-ready` | Needs operator decision before any code change | Tier-3 self-reflection issues, design decisions pending, ambiguous requirements needing human input |

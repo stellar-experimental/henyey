@@ -2213,12 +2213,16 @@ Only act on failures from the last 2 hours (compare `createdAt` with
 4. Check for an existing open issue:
    `gh issue list --search "<workflow name + signature>" --state open`.
    If one matches, `gh issue comment <N>` with the new evidence (sha, log
-   snippet, timestamp) and ensure it has the `urgent` label
-   (`gh issue edit <N> --add-label urgent`) — failing CI on origin/main
-   blocks deploy and meets the urgent criteria.
+   snippet, timestamp). Add the `urgent` label
+   (`gh issue edit <N> --add-label urgent`) **ONLY IF** the failing workflow is
+   `Verify Execution (Mainnet)` — post-#3351 that is the sole workflow the
+   deploy gate consumes (§10 step 4), and its failure is a hash/parity mismatch
+   that independently meets the urgent criteria. Every other main-branch
+   workflow (`CI`, `Quickstart`, `Gitlinks`, `History Publish`, `Push on main`)
+   no longer gates deploy, so comment/file it **unlabeled**.
    **Board-route:** if NOT on project board, add to Backlog:
    `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
-5. Otherwise, file a new issue: `gh issue create --label urgent --title "<workflow>: <short signature>" --body "..."` with investigation findings.
+5. Otherwise, file a new issue: `gh issue create --title "<workflow>: <short signature>" --body "..."` with investigation findings — append `--label urgent` **ONLY IF** the failing workflow is `Verify Execution (Mainnet)` (same predicate as step 4); every other main-branch workflow files **unlabeled**.
    **Board-route:** `bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog`
 6. Do NOT commit a fix. Report: `CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>`.
 
