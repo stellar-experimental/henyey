@@ -158,7 +158,15 @@ def test_zero_denominator_streak_renders_inert():
         assert result["skip_reason"].startswith("inert (denominator 0 for"), \
             f"expected inert skip_reason, got {result['skip_reason']!r}"
 
-        out = render_aggregate([result], watcher_mode=False)
+        # Production always has three ratio alarms (scp / apply / pending); the
+        # per-alarm parts renderer runs whenever they are not ALL skipped. Give
+        # the inert `pending` result a healthy `scp` sibling so the realistic
+        # per-alarm path is exercised.
+        scp_ok = {
+            "name": "scp-accept-rate-low", "state": "ok",
+            "contributes_to": "metrics_ratio", "value": 0.02,
+        }
+        out = render_aggregate([scp_ok, result], watcher_mode=False)
         line = out["metrics_ratio_line"]
         assert "pending inert (denominator 0 for" in line, \
             f"expected inert render, got {line!r}"
