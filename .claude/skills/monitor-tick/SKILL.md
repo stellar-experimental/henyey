@@ -2199,7 +2199,8 @@ Otherwise enter the deploy path:
 **(11a) Scope**: only inspect workflows that run on branch main.
 `gh run list --branch main --limit 10 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'`.
 Ignore runs triggered by PRs on other branches. Scan for completed runs with
-conclusion `failure`.
+conclusion `failure` **or `cancelled`** — a `cancelled` run is NOT automatically
+green (see the hang-cancel handling below, #3823).
 
 **(11b) Job-level** (CRITICAL — catches continue-on-error failures): For the
 latest completed run of EACH distinct workflow name (enumerate dynamically
@@ -2207,16 +2208,49 @@ from 11a, do NOT hard-code names — and take the run **IDs** from THIS tick's
 11a output, never carry an ID list over from a previous tick: a workflow that
 ran again since then has a new ID, so a reused ID reports a stale conclusion,
 the same wrong-conclusion class as #3883), check individual jobs:
-`gh run view <ID> --json jobs --jq '.jobs[] | select(.conclusion == "failure") | "\(.name)|\(.conclusion)"'`.
+`gh run view <ID> --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | "\(.name)|\(.conclusion)|\(.startedAt)|\(.completedAt)"'`.
 Workflows with continue-on-error jobs report run-level conclusion `success`
 even when jobs fail — you MUST check job-level conclusions. If any jobs have
-conclusion `failure`, treat it the same as a run-level failure.
+conclusion `failure`, treat it the same as a run-level failure. Use the
+**immutable per-job conclusion** here (not the run-level one): a retry resets a
+run's `conclusion` to `null`, but a concluded job's value is fixed, so reading
+per-job also closes the run-level non-monotonicity that would otherwise let a
+retry hide a `cancelled` result on the next tick (#3823 comment 6).
+
+**Classifying a `cancelled` job (#3823)** — a job wall-clock-killed at its
+`timeout-minutes` cap resolves `cancelled`, not `failure`. That is the WORSE of
+the two testnet-shard modes (#3768): `if: failure()` never fires, so the #3289
+watchdog diagnostics dump is destroyed and `--log-failed` is empty. But a
+routine concurrency supersede also resolves `cancelled`, and surfacing those
+would recreate the #3653 alarm fatigue. Discriminate with the shared pure
+function `classify_ci_cancel` (`scripts/lib/monitor-decisions.sh`):
+
+```bash
+source scripts/lib/monitor-decisions.sh
+# For a cancelled job, gather its inputs:
+#  - HAS_SUCCESSOR: `yes` iff a NEWER run of the SAME workflow AND same head ref
+#    (main) exists in the 11a listing — matches the concurrency group keyed on
+#    github.ref, so a concurrent PR run of the same workflow is NOT a supersede.
+#  - DURATION_SEC : the job's completedAt − startedAt, in seconds.
+#  - TIMEOUT_SEC  : the job-level `timeout-minutes` from the workflow YAML, in
+#    seconds (quickstart.yml=45m=2700, history-publish.yml=40m=2400). NOT the
+#    step-level `step_timeout_minutes: 25` — the step timeout is only
+#    corroborating evidence in the report. If unreadable, the function fails
+#    toward surfacing (treats a no-successor cancel as a hang).
+classify_ci_cancel "$conclusion" "$has_successor" "$duration_sec" "$timeout_sec"
+# CI_CANCEL_CLASS ∈ not-cancel | supersede-cancel | hang-cancel | manual-cancel
+```
+
+Only `hang-cancel` is CI-not-green. `supersede-cancel` and `manual-cancel` stay
+green; `not-cancel` defers to the failure/success handling above.
 
 **REPORTING RULE** — NEVER report `ci: all green` if ANY job has conclusion
-`failure`, even if the run-level conclusion is `success`. The `ci:` line in
-the status report MUST reflect the WORST job-level result across all
-workflows. A continue-on-error job failure is NOT green — it is RED. Do not
-qualify failures as "known", "pre-existing", or "cosmetic".
+`failure`, OR is classified `hang-cancel` by `classify_ci_cancel`, even if the
+run-level conclusion is `success` (or `cancelled`). The `ci:` line in the status
+report MUST reflect the WORST job-level result across all workflows, ranked:
+**job `failure` > `hang-cancel` > `supersede-cancel`/`manual-cancel`/green**. A
+continue-on-error job failure is NOT green — it is RED. A `hang-cancel` is NOT
+green either. Do not qualify failures as "known", "pre-existing", or "cosmetic".
 
 Only act on failures from the last 2 hours (compare `createdAt` with
 `date -u +%Y-%m-%dT%H:%M:%SZ`). For each failure:
@@ -2242,6 +2276,9 @@ Only act on failures from the last 2 hours (compare `createdAt` with
    If the failure is clearly NOT automation (build error from real code,
    test assertion mismatch, hash mismatch, panic from production code),
    skip the rerun and proceed to step 4.
+   **Never auto-rerun a `hang-cancel`** (#3823): #3768 shows the rerun burns
+   another full-length runner slot and lands identically at the same
+   `timeout-minutes` wall. File/comment instead (step 4/5); do not `gh run rerun`.
 4. Check for an existing open issue:
    `gh issue list --search "<workflow name + signature>" --state open`.
    If one matches, `gh issue comment <N>` with the new evidence (sha, log
@@ -2519,7 +2556,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   recovery_stalled: <ok (delta=0) | breach (delta=N, streak M/3) | WARNING delta=N (M ticks) — investigating | WARNING delta=N (burst) — investigating | skipped (<reason>) | collecting baseline>
   deploy:  <up-to-date | DEFERRED (quarantined: <sha8> reachable from origin/main — see ~/data/deploy_quarantine.txt) | BLOCKED (quarantine file unreadable — fail-closed) | BLOCKED (quarantine ancestry check failed for <sha8> — fail-closed) | DEFERRED (cool-down: ...) | SYNCED (no-binary-impact: ...) | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
-  ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
+  ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N> | WORKFLOW job CANCELLED-HANG (<Ns>) — run <id>, filed/commented #<N>>
   self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```
 
