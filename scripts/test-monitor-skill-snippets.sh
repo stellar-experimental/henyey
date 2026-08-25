@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=479
+TAP_PLAN=486
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2575,6 +2575,89 @@ PYEOF
   else
     tap_not_ok "consistency: monitor-tick/SKILL.md references eval_obsrvr_not_indexed_streak" \
       "check (9) not wired to the streak escalator"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # classify_ci_cancel (T63aa–T63ag) — #3823
+  # Source: scripts/lib/monitor-decisions.sh — monitor-tick check (11) CI check.
+  #
+  # classify_ci_cancel CONCLUSION HAS_SUCCESSOR DURATION_SEC TIMEOUT_SEC
+  #   prints exactly one of four stable literals on stdout (and exports the same
+  #   value in CI_CANCEL_CLASS):
+  #     not-cancel | supersede-cancel | hang-cancel | manual-cancel
+  #   Only `hang-cancel` is CI-not-green. It fires when a job was cancelled
+  #   (conclusion=cancelled) with NO superseding run and its wall-clock duration
+  #   reached its job-level `timeout-minutes` cap — i.e. it was killed at the
+  #   cap (#3768's 55m-job / timeout-minutes:45 fixture), the mode where
+  #   `if: failure()` never runs so the #3289 diagnostics dump is destroyed.
+  #   A missing/unreadable timeout on a no-successor cancel falls back to
+  #   `hang-cancel` (fail toward surfacing, never hiding).
+  #
+  # RED on origin/main: the function is absent there, so any call aborts the
+  # harness with "command not found" (set -euo pipefail), and check (11b)'s
+  # `select(.conclusion == "failure")` returns empty for a cancelled job (scored
+  # green). GREEN after #3823.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 63aa: no-successor cancel at its cap → hang-cancel (#3768 fixture) ──
+  # 55m job (3300s) vs timeout-minutes:45 (2700s), no superseding run.
+  local cc
+  cc=$(classify_ci_cancel cancelled no 3300 2700)
+  if [[ "$cc" == "hang-cancel" ]]; then
+    tap_ok "ci-cancel-classify: cancelled/no-successor/3300>=2700 → hang-cancel"
+  else
+    tap_not_ok "ci-cancel-classify: cancelled/no-successor/3300>=2700 → hang-cancel" "got '$cc'"
+  fi
+
+  # ── Test 63ab: routine concurrency supersede-cancel stays green (#3653) ──────
+  # A newer run for the SAME workflow+ref exists → intentional cancel, not a hang.
+  cc=$(classify_ci_cancel cancelled yes 600 2700)
+  if [[ "$cc" == "supersede-cancel" ]]; then
+    tap_ok "ci-cancel-classify: cancelled/successor → supersede-cancel (stays green)"
+  else
+    tap_not_ok "ci-cancel-classify: cancelled/successor → supersede-cancel" "got '$cc'"
+  fi
+
+  # ── Test 63ac: cancelled under cap, no successor → manual-cancel (not a hang) ─
+  cc=$(classify_ci_cancel cancelled no 120 2700)
+  if [[ "$cc" == "manual-cancel" ]]; then
+    tap_ok "ci-cancel-classify: cancelled/no-successor/120<2700 → manual-cancel"
+  else
+    tap_not_ok "ci-cancel-classify: cancelled/no-successor/120<2700 → manual-cancel" "got '$cc'"
+  fi
+
+  # ── Test 63ad: failure conclusion is not a cancel → not-cancel (path intact) ─
+  cc=$(classify_ci_cancel failure no 1560 2700)
+  if [[ "$cc" == "not-cancel" ]]; then
+    tap_ok "ci-cancel-classify: failure → not-cancel (failure/success handling unchanged)"
+  else
+    tap_not_ok "ci-cancel-classify: failure → not-cancel" "got '$cc'"
+  fi
+
+  # ── Test 63ae: missing/unreadable timeout, no successor → hang-cancel ────────
+  # Fail toward surfacing: if the job's timeout-minutes can't be read, a
+  # no-successor cancel MUST NOT be hidden as manual-cancel.
+  cc=$(classify_ci_cancel cancelled no 3300 "")
+  if [[ "$cc" == "hang-cancel" ]]; then
+    tap_ok "ci-cancel-classify: unreadable timeout + no successor → hang-cancel (fail-open)"
+  else
+    tap_not_ok "ci-cancel-classify: unreadable timeout + no successor → hang-cancel" "got '$cc'"
+  fi
+
+  # ── Test 63af: duration exactly at the cap → hang-cancel (>= boundary) ───────
+  cc=$(classify_ci_cancel cancelled no 2700 2700)
+  if [[ "$cc" == "hang-cancel" ]]; then
+    tap_ok "ci-cancel-classify: duration == timeout → hang-cancel (>= boundary)"
+  else
+    tap_not_ok "ci-cancel-classify: duration == timeout → hang-cancel" "got '$cc'"
+  fi
+
+  # ── Test 63ag: consistency — SKILL.md check (11) references classify_ci_cancel
+  if grep -q 'classify_ci_cancel' "$tick_file_ob"; then
+    tap_ok "consistency: monitor-tick/SKILL.md references classify_ci_cancel"
+  else
+    tap_not_ok "consistency: monitor-tick/SKILL.md references classify_ci_cancel" \
+      "check (11) not wired to the shared cancel classifier"
   fi
 
   # ── Test 64: Tick history capture invokes the single-writer helper ──────────

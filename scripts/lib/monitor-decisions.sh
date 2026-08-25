@@ -1598,6 +1598,100 @@ eval_obsrvr_not_indexed_streak() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# classify_ci_cancel CONCLUSION HAS_SUCCESSOR DURATION_SEC TIMEOUT_SEC
+#
+# Pure decision function for monitor-tick check (11) CI check (issue #3823).
+#
+# check (11a)/(11b) historically keyed EXCLUSIVELY on conclusion `failure`, so a
+# CI job wall-clock-killed at its `timeout-minutes` cap — which resolves as
+# conclusion `cancelled`, NOT `failure` — was scored `ci: all green`. Per the
+# #3768 / #3741 thread that is the WORSE of the two testnet-shard failure modes:
+# because the job ends `cancelled`, `if: failure()` never fires, the #3289
+# watchdog diagnostics dump is destroyed, and `gh run view --log-failed` returns
+# nothing. So the monitor was blind exactly where the evidence is thinnest.
+#
+# This function maps a run/job outcome to ONE of four stable literals so the tick
+# can distinguish a reportable hang-cancel from a routine supersede-cancel
+# (avoiding the #3653 alarm-fatigue regression that a blanket "match cancelled"
+# would cause):
+#
+#   not-cancel       - conclusion != cancelled. Defer to the existing
+#                      failure/success handling; this function has no opinion.
+#   supersede-cancel - a newer run for the SAME workflow AND same head ref exists
+#                      (routine concurrency cancel, `cancel-in-progress: true`).
+#                      Intentionally obsolete → stays green.
+#   hang-cancel      - no superseding run AND the run's wall-clock duration
+#                      reached its job-level `timeout-minutes` cap → killed at the
+#                      cap. CI-NOT-GREEN and REPORTABLE.
+#   manual-cancel    - no superseding run and duration is under the cap (an
+#                      early cancel for some other reason). Low-tier, stays green.
+#
+# Arguments:
+#   CONCLUSION    - the IMMUTABLE per-job/per-attempt conclusion (from
+#                   `gh run view <ID> --json jobs`), NOT the run-level conclusion.
+#                   Using the per-job value also closes the run-level
+#                   non-monotonicity (thread comment 6): a retry resets run-level
+#                   `conclusion` to `null`, but a concluded job's value is fixed.
+#   HAS_SUCCESSOR - literal `yes`/`no`: whether a newer run of the SAME workflow
+#                   AND same head ref (`main`) exists. Ref-scoped to match the
+#                   concurrency group keyed on `github.ref` — a concurrent PR run
+#                   of the same workflow is NOT a supersede and must not hide a
+#                   real main hang. Anything other than `yes` is treated as `no`.
+#   DURATION_SEC  - the job's wall-clock seconds (from its `startedAt`/
+#                   `completedAt`). Non-numeric / empty ⇒ unreadable.
+#   TIMEOUT_SEC   - the job-level `timeout-minutes` from the workflow YAML, in
+#                   seconds (quickstart.yml=45m=2700, history-publish.yml=40m=
+#                   2400). NOT the step-level `step_timeout_minutes` — the step
+#                   timeout is only corroborating evidence in the report.
+#                   Non-numeric / empty ⇒ unreadable.
+#
+# Fail-open rule: when TIMEOUT_SEC or DURATION_SEC is missing/unreadable and the
+# cancel has no successor, classify `hang-cancel` — fail toward surfacing, never
+# toward hiding a possible hang. GitHub's ~5m force-kill grace means a real hang
+# overshoots the job cap comfortably, so the coarse `>=` floor is safe.
+#
+# Prints exactly one literal on stdout AND sets global CI_CANCEL_CLASS to the
+# same value (mirrors the classify_* siblings' echo-plus-global contract).
+# Returns: 0 always. Does no process/network I/O — the caller gathers the inputs.
+# Portability: POSIX-ish Bash/zsh; no external processes, no bashisms.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_ci_cancel() {
+  local conclusion="$1"
+  local has_successor="$2"
+  local duration_sec="$3"
+  local timeout_sec="$4"
+
+  # Not a cancel → the existing failure/success path owns it.
+  if [[ "$conclusion" != "cancelled" ]]; then
+    CI_CANCEL_CLASS="not-cancel"
+    printf '%s' "$CI_CANCEL_CLASS"
+    return 0
+  fi
+
+  # A newer run for the same workflow+ref superseded this one → routine cancel.
+  if [[ "$has_successor" == "yes" ]]; then
+    CI_CANCEL_CLASS="supersede-cancel"
+    printf '%s' "$CI_CANCEL_CLASS"
+    return 0
+  fi
+
+  # No successor. Decide hang vs early cancel by the job's own timeout cap.
+  # Fail-open: any unreadable input surfaces as a hang rather than hiding it.
+  if [[ "$duration_sec" =~ ^[0-9]+$ ]] && [[ "$timeout_sec" =~ ^[0-9]+$ ]]; then
+    if [[ "$duration_sec" -ge "$timeout_sec" ]]; then
+      CI_CANCEL_CLASS="hang-cancel"
+    else
+      CI_CANCEL_CLASS="manual-cancel"
+    fi
+  else
+    CI_CANCEL_CLASS="hang-cancel"
+  fi
+
+  printf '%s' "$CI_CANCEL_CLASS"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # prune_rotated_logs LOGS_DIR [KEEP_PER_CATEGORY]
 #
 # Rotated-log retention for monitor-tick check (5). Keeps the newest
