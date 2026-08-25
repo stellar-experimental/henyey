@@ -753,7 +753,17 @@ ratio_threshold = 0.50
 min_volume = 100
 streak_threshold = 3
 severity = "WARN"
-gates = ["synced-only", "validator-only"]
+# NO synced-only gate (#3826): the denominator stellar_herder_pending_received_total
+# only accrues while the node buffers future-slot SCP envelopes (crates/herder/src/
+# pending.rs) — i.e. at/near sync, the exact regime `synced-only` suppresses. With
+# the gate on, the only condition that feeds the denominator was the one that
+# disabled the alarm, making it structurally unfireable (0 over 13 days of
+# archives). `min_volume = 100` plus eval_counter_ratio's own fresh_start /
+# ledger_age>30s / uptime<600s guards already suppress catchup noise, so dropping
+# the gate makes the alarm reachable without reintroducing that noise.
+gates = ["validator-only"]
+baseline_version = 2
+semantic_change_date = "2026-08-25T00:00:00Z"  # gate removal via #3826
 # pending counters are optional — if missing, only this check skips
 optional_counters = true
 cooldown_key = "pending_too_old_ratio"

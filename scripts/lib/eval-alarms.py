@@ -68,6 +68,29 @@ SCHEMA_VERSION = 1
 # a still-running tick).
 SKIP_INTERVAL_TOO_SHORT = "interval too short"
 
+# Structural-inertness marker for counter-ratio alarms (#3826). When a ratio's
+# denominator delta is 0 for INERT_ZERO_DEN_TICKS consecutive evaluation ticks,
+# the alarm is not merely "quiet this tick" — its denominator is structurally
+# empty, so the ratio can never be computed. eval_counter_ratio flips the
+# skip_reason from the generic `low volume (delta=0 < …)` to
+# `inert (denominator 0 for N ticks)` at that point, and render_aggregate
+# surfaces it as `<short> inert (…)` so a permanently-dead ratio is visible in
+# the tick report instead of masquerading as a routine low-volume skip.
+INERT_ZERO_DEN_TICKS = 20
+SKIP_INERT_PREFIX = "inert"
+
+# Startup gate/metric contradiction lint (#3826). Maps a gate to the metric-name
+# prefixes whose data-bearing regime that gate excludes: an alarm carrying the
+# gate AND drawing an input from a mapped family is structurally unfireable (the
+# gate suppresses the only regime that feeds the metric). Seeded with the single
+# proven case — `synced-only` ⊥ the `stellar_herder_pending_*` family, whose
+# counters accrue only while the node buffers future-slot envelopes (i.e. at/near
+# sync, the regime synced-only suppresses). Keep this narrow; if it grows to
+# model many gate⊥metric relationships, split it into a dedicated schema check.
+GATE_METRIC_CONTRADICTIONS = {
+    "synced-only": ["stellar_herder_pending_"],
+}
+
 # Skip reasons that must NOT trigger a counter-snapshot reset (#3758). These are
 # monitoring-side caller errors (e.g. an abbreviated tick that failed to export
 # PID/START_TICKS) that carry ZERO information about the node — treating them as
@@ -1396,6 +1419,11 @@ def eval_counter_ratio(
     prev_num_key = f"{alarm_name}_numerator"
     prev_den_key = f"{alarm_name}_denominator"
     streak_key = f"{alarm_name}_streak"
+    # Structural-inertness streak (#3826): consecutive evaluation ticks with
+    # den_delta == 0. Reset in every re-baseline branch (collecting_baseline,
+    # counter reset, gap_stale) so a fresh baseline never inherits a stale
+    # inert count, exactly like {name}_streak.
+    zero_den_key = f"{alarm_name}_zero_den_streak"
 
     if not snapshot or prev_num_key not in snapshot:
         # Collecting baseline — write current values
@@ -1405,18 +1433,21 @@ def eval_counter_ratio(
         snapshot[prev_num_key] = str(int(cur_num))
         snapshot[prev_den_key] = str(int(cur_den))
         snapshot[streak_key] = "0"
+        snapshot[zero_den_key] = "0"
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
     prev_num = int(snapshot[prev_num_key])
     prev_den = int(snapshot[prev_den_key])
     streak = int(snapshot.get(streak_key, "0"))
+    zero_den_streak = int(snapshot.get(zero_den_key, "0"))
 
     # Counter reset check
     if cur_num < prev_num or cur_den < prev_den:
         snapshot[prev_num_key] = str(int(cur_num))
         snapshot[prev_den_key] = str(int(cur_den))
         snapshot[streak_key] = "0"
+        snapshot[zero_den_key] = "0"
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
@@ -1434,6 +1465,7 @@ def eval_counter_ratio(
         snapshot[prev_num_key] = str(int(cur_num))
         snapshot[prev_den_key] = str(int(cur_den))
         snapshot[streak_key] = "0"
+        snapshot[zero_den_key] = "0"
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
@@ -1460,16 +1492,44 @@ def eval_counter_ratio(
     min_volume = alarm.get("min_volume", 0)
     if den_delta < min_volume:
         snapshot[streak_key] = "0"
+        if den_delta == 0:
+            # Structural inertness (#3826): the denominator did not move AT ALL
+            # this tick. Track how many consecutive ticks that has held; once it
+            # reaches INERT_ZERO_DEN_TICKS, flip the skip_reason so a permanently
+            # dead ratio is distinguishable from a merely quiet-but-working one.
+            zero_den_streak += 1
+            snapshot[zero_den_key] = str(zero_den_streak)
+            write_snapshot(snapshot_path, snapshot)
+            if zero_den_streak >= INERT_ZERO_DEN_TICKS:
+                return make_result(
+                    alarm, "skipped",
+                    skip_reason=f"{SKIP_INERT_PREFIX} (denominator 0 for {zero_den_streak} ticks)",
+                    extra_values=ev_default)
+            return make_result(
+                alarm, "skipped",
+                skip_reason=f"low volume (delta={int(den_delta)} < {min_volume})",
+                extra_values=ev_default)
+        # 0 < den_delta < min_volume — real (if small) denominator activity, so
+        # the ratio is NOT structurally inert; reset the zero-den streak.
+        snapshot[zero_den_key] = "0"
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "skipped", skip_reason=f"low volume (delta={int(den_delta)} < {min_volume})",
                            extra_values=ev_default)
 
     # Compute ratio
     if den_delta == 0:
+        # Reachable only when min_volume == 0 (den_delta >= min_volume passed
+        # above with min_volume 0). Still a zero-denominator tick — advance the
+        # inert streak for consistency, though the result renders as ok.
         snapshot[streak_key] = "0"
+        zero_den_streak += 1
+        snapshot[zero_den_key] = str(zero_den_streak)
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "ok", value=0, threshold=alarm["ratio_threshold"],
                            extra_values=ev_default)
+
+    # Denominator moved — not inert; reset the zero-den streak.
+    snapshot[zero_den_key] = "0"
 
     ratio = num_delta / den_delta
     ratio_op = alarm.get("ratio_op", ">")
@@ -1824,7 +1884,15 @@ def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
                 elif r["state"] == "breach":
                     parts.append(f"{short} breach ({r['details']})")
                 elif r["state"] == "skipped":
-                    parts.append(f"{short} skipped ({r.get('skip_reason', '')})")
+                    sr = r.get("skip_reason", "")
+                    # Structural inertness (#3826): render `<short> inert (…)`
+                    # directly rather than `<short> skipped (…)`, so a ratio whose
+                    # denominator has been 0 for many ticks reads as a visible
+                    # permanent no-op instead of a routine low-volume skip.
+                    if sr.startswith(SKIP_INERT_PREFIX):
+                        parts.append(f"{short} {sr}")
+                    else:
+                        parts.append(f"{short} skipped ({sr})")
                 elif r["state"] == "collecting_baseline":
                     parts.append(f"{short} collecting baseline")
                 else:
@@ -2016,6 +2084,52 @@ def validate_catalog(catalog: dict) -> list[str]:
     return errors
 
 
+def _alarm_input_metrics(alarm: dict) -> list[str]:
+    """Collect every metric name an alarm draws an input value from.
+
+    Covers the scalar (`metric`, `numerator`, `denominator`) and list-sum
+    (`metric_sum`, `numerator_sum`, `denominator_sum`) forms.
+    """
+    metrics: list[str] = []
+    for key in ("metric", "numerator", "denominator"):
+        val = alarm.get(key)
+        if isinstance(val, str) and val:
+            metrics.append(val)
+    for key in ("metric_sum", "numerator_sum", "denominator_sum"):
+        val = alarm.get(key)
+        if isinstance(val, list):
+            metrics.extend(m for m in val if isinstance(m, str) and m)
+    return metrics
+
+
+def lint_gate_metric_contradictions(catalog: dict) -> list[str]:
+    """Flag alarms whose gate set excludes the regime their inputs come from.
+
+    A gate/metric contradiction (#3826) is an alarm carrying a gate whose
+    suppressed regime is the ONLY regime that feeds one of the alarm's input
+    metrics — the alarm is present, well-formed, and structurally unfireable.
+    Returns a list of non-fatal warning strings (empty when clean). Driven by
+    GATE_METRIC_CONTRADICTIONS; kept intentionally narrow (see that constant).
+    """
+    warnings: list[str] = []
+    for alarm in catalog.get("alarm", []):
+        gates = alarm.get("gates", [])
+        if not gates:
+            continue
+        name = alarm.get("name", "<unnamed>")
+        metrics = _alarm_input_metrics(alarm)
+        for gate in gates:
+            for prefix in GATE_METRIC_CONTRADICTIONS.get(gate, []):
+                hit = next((m for m in metrics if m.startswith(prefix)), None)
+                if hit is not None:
+                    warnings.append(
+                        f"alarm '{name}': gate '{gate}' excludes the regime that "
+                        f"feeds input metric '{hit}' (prefix '{prefix}') — the "
+                        f"alarm is structurally unfireable"
+                    )
+    return warnings
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -2072,6 +2186,13 @@ def main() -> int:
         for e in errors:
             print(f"SCHEMA ERROR: {e}", file=sys.stderr)
         return 1
+
+    # Authoring-time gate/metric contradiction lint (#3826). NON-fatal: these
+    # surface a structurally-unfireable alarm (a gate excluding the only regime
+    # its inputs come from) as a loud stderr warning without failing the catalog
+    # or the tick, so a future author sees it at the point the alarm is written.
+    for w in lint_gate_metric_contradictions(catalog):
+        print(f"SCHEMA WARNING: {w}", file=sys.stderr)
 
     if args.validate_only:
         print(json.dumps({"schema_version": SCHEMA_VERSION, "valid": True, "alarm_count": len(catalog.get("alarm", []))}))
