@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=478
+TAP_PLAN=479
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1604,6 +1604,7 @@ run_tests() {
   # Test 41: TOML catalog file exists, is parseable, and contains recovery-stalled alarm
   # Extract recovery-stalled alarm constants from metric-alarms.toml
   local streak_val burst_val delta_val post_restart_val snapshot_file mode_val metric_name metric_label
+  local extraction_val post_restart_label_val
   # Use Python to extract the recovery-stalled alarm entry from the TOML
   local toml_extract
   toml_extract=$(python3 - "$constants_file" <<'PYEOF'
@@ -1620,6 +1621,8 @@ for a in data['alarm']:
         print('burst_val=' + str(a['burst_threshold']))
         print('delta_val=' + str(a['delta_threshold']))
         print('post_restart_val=' + str(a.get('post_restart_absolute_threshold', 0)))
+        print('extraction_val=' + str(a.get('extraction', '')))
+        print('post_restart_label_val=' + str(a.get('post_restart_absolute_label', '')))
         print('snapshot_file=' + a['snapshot_file'])
         print('metric_name=' + a['metric'])
         labels = a.get('labels', [])
@@ -1645,6 +1648,18 @@ PYEOF
     else
       tap_not_ok "metric-alarms: recovery-stalled post_restart_absolute_threshold == 50" \
         "expected post_restart_absolute_threshold=50, got '$post_restart_val'"
+    fi
+    # Test 41c: family-union re-key (#3824). The delta/streak/burst trigger must
+    # observe the SUM of all 8 `reason` series (extraction=form2-sum-all), and
+    # the post-restart absolute guard must be scoped to a single historically
+    # calibrated label (post_restart_absolute_label=forcing_catchup_behind) so a
+    # summed warmup value (~113) does not false-fire the absolute check.
+    if [[ "$extraction_val" == "form2-sum-all" \
+          && "$post_restart_label_val" == "forcing_catchup_behind" ]]; then
+      tap_ok "metric-alarms: recovery-stalled family-union (form2-sum-all + post_restart_absolute_label)"
+    else
+      tap_not_ok "metric-alarms: recovery-stalled family-union (form2-sum-all + post_restart_absolute_label)" \
+        "expected extraction=form2-sum-all and post_restart_absolute_label=forcing_catchup_behind, got extraction='$extraction_val' label='$post_restart_label_val'"
     fi
   else
     tap_not_ok "metric-alarms: TOML exists and parseable" \
