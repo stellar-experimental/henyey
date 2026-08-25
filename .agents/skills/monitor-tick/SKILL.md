@@ -121,7 +121,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/prev.prom` | previous Prometheus scrape | check 12 |
 | `metrics/scrape_identity` | process identity of the scrape now in prev.prom | check 12 |
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
-| `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
+| `metrics/recovery_family_streak_snapshot` | counter-streak state (check 12b; #3824 family-union) | check 12b ([metric-alarms](../shared/metric-alarms.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
 | `metrics/archive/` | Per-tick snapshot dirs (current.prom + prev.prom + metadata.env), rolling 500, atomic write | check 12 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
@@ -1119,7 +1119,7 @@ against a node that is in real-time sync with age=2s).
      breach on the next tick before firing.
    - All other §GAUGES are unaffected — they are point-in-time readings from
      `current.prom` only.
-   - Do NOT skip ratio_snapshot or counter_streak_snapshot checks — they have
+   - Do NOT skip ratio_snapshot or recovery_family_streak_snapshot checks — they have
      their own independent PID/start_ticks invalidation logic and snapshot files.
      Independence is safe: each check reads PID/start_ticks from `/proc` and
      compares against its own snapshot.
@@ -1357,11 +1357,24 @@ eval_result=$(python3 scripts/lib/eval-alarms.py \
 > This section is authoritative for the state machine *logic*; inline literals
 > are cross-validated against the TOML by `scripts/test-monitor-skill-snippets.sh`.
 
-This check tracks `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}`
-using a streak-gated alert, independent of Check 12's ratio checks. It runs on
-its own state machine because ratio checks are globally skipped during unsync
+This check tracks the **sum of every `reason` series** of
+`henyey_recovery_stalled_tick_total` (family-union, `extraction = "form2-sum-all"`,
+#3824) using a streak-gated alert, independent of Check 12's ratio checks. It runs
+on its own state machine because ratio checks are globally skipped during unsync
 states (ledger age > 30s, gap > 5, etc.), but the recovery-stalled counter fires
 precisely during recovery transitions when the node is briefly unsynced.
+
+> **Why the family sum, not a single label (#3824):** Check 12b previously keyed
+> only on `{reason="forcing_catchup_behind"}`. During an *at-tip* stall the node
+> takes the `forcing_catchup_not_behind` branch by construction, so the one label
+> the alarm watched was exactly the branch that could not move — a real recovery
+> episode incremented two uncovered labels and the tick reported `ok (delta=0)`.
+> Summing the whole family makes the trigger observe whichever branch moves and
+> covers any future `reason`. On a fire a per-reason breakdown is appended
+> (`[by reason: <label>+<delta>, …]`). Streak-3 / burst-10 gating still absorbs
+> transient single-tick blips (including the deliberately-non-alarming
+> `near_tip_gap1_suppressed` / `near_tip_park_inflated` suppression counters), so
+> #3728's false-positive class does not return.
 
 **Data source:** Reuses the same `/metrics` scrape result (`$metrics_body` /
 `metrics/current.prom`) already fetched by check-12. Does NOT perform a
@@ -1370,14 +1383,17 @@ second `/metrics` fetch.
 **Applicability:** Validator mode only. In watcher mode, skip Check 12b entirely
 and omit the `recovery_stalled:` line from the status report.
 
-**Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/counter_streak_snapshot`
+**Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/recovery_family_streak_snapshot`
+(renamed from `counter_streak_snapshot` in #3824 to force a clean re-baseline on
+the family-union deploy — the old baseline is absent at the new path, so the
+first post-migration tick re-collects without a spurious post-restart fire.)
 
-Format:
+`counter_value` is the **sum of all `reason` series** (the family-union unit):
 ```
 version=1
 pid=<PID>
 start_ticks=<field 22 from /proc/$PID/stat>
-counter_value=<value>
+counter_value=<family sum across all reason series>
 breach_streak=<N>
 ```
 
@@ -1390,7 +1406,8 @@ counters to a pre-restart baseline.
 **Skip conditions (skip Check 12b only when any is true):**
 - `/metrics` fetch failed this tick (same condition check-12 detects)
 - `/metrics` returns "recorder not installed"
-- `forcing_catchup_behind` label missing from the scrape
+- `henyey_recovery_stalled_tick_total` metric family absent from the scrape
+  (no `reason` series present at all)
 
 On skip: write snapshot preserving existing `counter_value` value (or
 0 if no prior snapshot) with `breach_streak=0`. Next healthy
@@ -1410,10 +1427,15 @@ the first tick after a restart where the counter jumps from 0 to the current
 absolute value.
 
 **Post-restart absolute-value fire (#3198):** After writing the fresh baseline,
-evaluate the *absolute* `counter_value` value that the reset would
-otherwise discard. If it meets `post_restart_absolute_threshold` (= `50`, from
-`metric-alarms.toml`), fire WARN once on this invalidation tick instead of
-reporting `collecting baseline`, and route through the Bug Filing Workflow.
+evaluate the *absolute* value that the reset would otherwise discard. Under the
+#3824 family-union the trigger sums all reasons, but this absolute guard stays
+**scoped to a single calibrated series** via `post_restart_absolute_label`
+(= `forcing_catchup_behind`): the summed family legitimately reaches ~113 during
+warmup, which would false-fire the absolute threshold (tuned for
+`forcing_catchup_behind` alone) every restart. If that scoped label's absolute
+value meets `post_restart_absolute_threshold` (= `50`, from `metric-alarms.toml`),
+fire WARN once on this invalidation tick instead of reporting `collecting
+baseline`, and route through the Bug Filing Workflow.
 This closes the blind spot from #3197/#3198: a self-recovering
 `forcing_catchup_behind` stall that completes before the 15m clean-restart sync
 deadline (so check (2) never reports SYNC FAILURE) and accrues its entire burst
@@ -1428,9 +1450,10 @@ reset) are covered, so the absolute baseline is never silently discarded.
 Otherwise (absolute value below threshold, or threshold disabled): report
 `recovery_stalled: collecting baseline` as before.
 
-**Per-tick logic (not skipped AND not invalidated):**
+**Per-tick logic (not skipped AND not invalidated):** `counter_value` is the
+**family sum** across all `reason` series (#3824):
 ```
-delta = current(counter_value) - prev(counter_value)
+delta = current(family_sum) - prev(family_sum)
 
 if delta >= 10:
     # Immediate-fire override: large burst indicates sustained stalling.
@@ -1454,10 +1477,10 @@ trouble regardless of tick granularity.
 Second tick has a valid prev for delta comparison and begins normal evaluation.
 
 **Alert identity and cooldown:**
-- Cooldown key: `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` (full selector-qualified)
+- Cooldown key: `henyey_recovery_stalled_tick_total` (family-level, #3824)
 - Cooldown period: 7200s (2h)
-- Issue search: `gh issue list --search 'metrics: henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}' --state open`
-- Issue title on filing: `metrics: henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} — sustained breach`
+- Issue search: `gh issue list --search 'metrics: henyey_recovery_stalled_tick_total (family)' --state open`
+- Issue title on filing: `metrics: henyey_recovery_stalled_tick_total (family) — sustained breach`
 - Filing follows the standard Bug Filing Workflow (§Firing alerts — cooldown + filing)
 
 **Integration with metrics aggregate:** Check 12b alerts are NOT counted in the

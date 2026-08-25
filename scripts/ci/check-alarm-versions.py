@@ -29,7 +29,7 @@ SEMANTIC_FIELDS = frozenset({
     "op", "threshold", "multiplier", "min_absolute",
     "gates", "for_ticks",
     "burst_threshold", "delta_threshold", "streak_threshold",
-    "post_restart_absolute_threshold",
+    "post_restart_absolute_threshold", "post_restart_absolute_label",
     "denominator", "denominator_metric", "denominator_sum",
     "denominator_extraction", "denominator_includes_numerator",
     "numerator", "numerator_metric", "numerator_sum", "numerator_extraction",
