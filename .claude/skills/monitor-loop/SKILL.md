@@ -245,11 +245,11 @@ table is the human reference.
 These counter-based checks use streak gating rather than immediate-fire thresholds
 because single-tick increments are often transient self-recovering events that
 don't warrant operator attention (see #2309). State is tracked independently of
-the ratio checks in a separate snapshot (`metrics/counter_streak_snapshot`).
+the ratio checks in a separate snapshot (`metrics/recovery_family_streak_snapshot`).
 
 | Metric | Delta threshold | Streak threshold | Burst threshold | Severity | Rationale |
 |--------|-----------------|------------------|-----------------|----------|-----------|
-| `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` | ≥ 1 | 3 ticks | ≥ 10 | WARN | Recovery forced catchup while behind consensus; single occurrences are transient self-recovering events (see #2309); large bursts indicate sustained stalling |
+| `henyey_recovery_stalled_tick_total` (sum of all `reason` series, #3824) | ≥ 1 | 3 ticks | ≥ 10 | WARN | Recovery stalled — the delta/streak/burst trigger observes the SUM of every `reason` series (an at-tip stall moves `forcing_catchup_not_behind`/`near_tip_peer_scp_recovery`, not `forcing_catchup_behind`); single-tick blips are transient self-recovering events (see #2309/#3728) absorbed by streak-3 gating; large bursts indicate sustained stalling. Post-restart absolute guard stays scoped to `forcing_catchup_behind` via `post_restart_absolute_label` |
 
 **D. Ratio checks — fire on sustained ratio breach (3 consecutive ticks)**
 
@@ -296,7 +296,7 @@ pending_breach_streak=<N>
 ```
 Invalidate on PID/start_ticks change, malformed snapshot, or counter reset (current < previous).
 
-**Counter-streak snapshot** persisted at `~/data/<session-id>/metrics/counter_streak_snapshot`
+**Counter-streak snapshot** persisted at `~/data/<session-id>/metrics/recovery_family_streak_snapshot`
 (format and invalidation rules defined in Check 12b of monitor-tick/SKILL.md;
 path canonicalized in [`shared/metric-alarms.toml`](../shared/metric-alarms.toml)).
 Separate from ratio snapshot — runs independently of ratio skip conditions (see

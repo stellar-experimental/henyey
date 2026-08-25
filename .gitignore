@@ -102,6 +102,7 @@ crates/*/transactions/[0-9a-f][0-9a-f]/
 /metrics/gauge_persistence
 /metrics/scrape_identity
 /metrics/counter_streak_snapshot
+/metrics/recovery_family_streak_snapshot
 /metrics/ratio_snapshot
 /metrics/counter_dynamic_snapshot
 /metrics/anomaly_cooldown.json

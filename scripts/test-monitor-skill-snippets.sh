@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=478
+TAP_PLAN=479
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1604,6 +1604,7 @@ run_tests() {
   # Test 41: TOML catalog file exists, is parseable, and contains recovery-stalled alarm
   # Extract recovery-stalled alarm constants from metric-alarms.toml
   local streak_val burst_val delta_val post_restart_val snapshot_file mode_val metric_name metric_label
+  local extraction_val post_restart_label_val
   # Use Python to extract the recovery-stalled alarm entry from the TOML
   local toml_extract
   toml_extract=$(python3 - "$constants_file" <<'PYEOF'
@@ -1620,6 +1621,8 @@ for a in data['alarm']:
         print('burst_val=' + str(a['burst_threshold']))
         print('delta_val=' + str(a['delta_threshold']))
         print('post_restart_val=' + str(a.get('post_restart_absolute_threshold', 0)))
+        print('extraction_val=' + str(a.get('extraction', '')))
+        print('post_restart_label_val=' + str(a.get('post_restart_absolute_label', '')))
         print('snapshot_file=' + a['snapshot_file'])
         print('metric_name=' + a['metric'])
         labels = a.get('labels', [])
@@ -1645,6 +1648,18 @@ PYEOF
     else
       tap_not_ok "metric-alarms: recovery-stalled post_restart_absolute_threshold == 50" \
         "expected post_restart_absolute_threshold=50, got '$post_restart_val'"
+    fi
+    # Test 41c: family-union re-key (#3824). The delta/streak/burst trigger must
+    # observe the SUM of all 8 `reason` series (extraction=form2-sum-all), and
+    # the post-restart absolute guard must be scoped to a single historically
+    # calibrated label (post_restart_absolute_label=forcing_catchup_behind) so a
+    # summed warmup value (~113) does not false-fire the absolute check.
+    if [[ "$extraction_val" == "form2-sum-all" \
+          && "$post_restart_label_val" == "forcing_catchup_behind" ]]; then
+      tap_ok "metric-alarms: recovery-stalled family-union (form2-sum-all + post_restart_absolute_label)"
+    else
+      tap_not_ok "metric-alarms: recovery-stalled family-union (form2-sum-all + post_restart_absolute_label)" \
+        "expected extraction=form2-sum-all and post_restart_absolute_label=forcing_catchup_behind, got extraction='$extraction_val' label='$post_restart_label_val'"
     fi
   else
     tap_not_ok "metric-alarms: TOML exists and parseable" \
@@ -1712,9 +1727,10 @@ PYEOF
   fi
 
   # Test 48: Cross-file — monitor-loop table row matches TOML values (row-specific)
-  # Use metric_label from TOML to select the row (not hardcoded)
+  # Select the row by the family metric name (#3824: the single-label selector was
+  # dropped in favour of the family-union sum, so metric_name is the stable key).
   local recovery_row
-  recovery_row=$(echo "$loop_streak_table" | grep -F "$metric_label" || true)
+  recovery_row=$(echo "$loop_streak_table" | grep -F "$metric_name" || true)
   if [[ -n "$recovery_row" ]] \
      && echo "$recovery_row" | grep -Fq "${streak_val} ticks" \
      && echo "$recovery_row" | grep -Fq "≥ ${burst_val}" \
@@ -1763,13 +1779,16 @@ PYEOF
       "Expected '$metric_name' in both Check 12b section and monitor-loop table"
   fi
 
-  # Test 53: Metric label from TOML appears in both SKILL.md files
-  if echo "$check_12b_section" | grep -Fq "$metric_label" \
-     && echo "$loop_streak_table" | grep -Fq "$metric_label"; then
-    tap_ok "check-12b-semantics: metric label from TOML in both specs ($metric_label)"
+  # Test 53: Post-restart scoped label from TOML appears in both SKILL.md files
+  # (#3824: the family-union trigger has no single selector, but the post-restart
+  # absolute guard is scoped to post_restart_absolute_label, and both specs must
+  # document that scoping so the ~113 warmup sum does not appear to absolute-fire.)
+  if echo "$check_12b_section" | grep -Fq "$post_restart_label_val" \
+     && echo "$loop_streak_table" | grep -Fq "$post_restart_label_val"; then
+    tap_ok "check-12b-semantics: post_restart_absolute_label from TOML in both specs ($post_restart_label_val)"
   else
-    tap_not_ok "check-12b-semantics: metric label from TOML in both specs" \
-      "Expected '$metric_label' in both Check 12b section and monitor-loop table"
+    tap_not_ok "check-12b-semantics: post_restart_absolute_label from TOML in both specs" \
+      "Expected '$post_restart_label_val' in both Check 12b section and monitor-loop table"
   fi
 
   # Test 53b: recovery-stalled snapshot_file is a BARE filename (no '/'), matching
@@ -1780,11 +1799,11 @@ PYEOF
   # invalid; the bare name resolves single-level under --state-dir. Substring greps
   # (Tests 44/48) do NOT catch the doubling because the bare name is a substring of
   # the doubled path — hence this dedicated structural assertion.
-  if [[ "$snapshot_file" != */* && "$snapshot_file" == "counter_streak_snapshot" ]]; then
+  if [[ "$snapshot_file" != */* && "$snapshot_file" == "recovery_family_streak_snapshot" ]]; then
     tap_ok "metric-alarms: recovery-stalled snapshot_file is bare filename ($snapshot_file)"
   else
     tap_not_ok "metric-alarms: recovery-stalled snapshot_file is bare filename" \
-      "snapshot_file must be the bare name 'counter_streak_snapshot' (no '/' prefix), got '$snapshot_file' — a directory prefix doubles the resolved path under --state-dir .../metrics (#3222)"
+      "snapshot_file must be the bare name 'recovery_family_streak_snapshot' (no '/' prefix), got '$snapshot_file' — a directory prefix doubles the resolved path under --state-dir .../metrics (#3222/#3824)"
   fi
 
   # Test 53c: check-12b Format block documents the evaluator's ACTUAL snapshot
@@ -4745,6 +4764,7 @@ PYEOF
     "gauge_persistence"
     "scrape_identity"
     "counter_streak_snapshot"
+    "recovery_family_streak_snapshot"
     "ratio_snapshot"
     "counter_dynamic_snapshot"
     "anomaly_cooldown.json"
@@ -5380,7 +5400,7 @@ except:
   # Pre-seed a snapshot from the PRE-restart incarnation (pid=1000). The catalog
   # snapshot_file is the BARE name (#3222), so the evaluator resolves it directly
   # under --state-dir (no 'metrics/' subdir).
-  cat > "$state_dir_148c/counter_streak_snapshot" <<'SNAP_148C'
+  cat > "$state_dir_148c/recovery_family_streak_snapshot" <<'SNAP_148C'
 version=1
 pid=1000
 start_ticks=1000
@@ -5426,7 +5446,7 @@ except:
   # Test 148d: recovery-stalled clean restart below threshold does NOT fire.
   local state_dir_148d
   state_dir_148d=$(mktemp -d)
-  cat > "$state_dir_148d/counter_streak_snapshot" <<'SNAP_148D'
+  cat > "$state_dir_148d/recovery_family_streak_snapshot" <<'SNAP_148D'
 version=1
 pid=1000
 start_ticks=1000
@@ -5498,7 +5518,7 @@ except:
     # $1 = state-dir; (re)write the PRE-restart snapshot fixture. The catalog
     # snapshot_file is the BARE name (#3222), so the evaluator resolves it
     # directly under --state-dir (no 'metrics/' subdir).
-    cat > "$1/counter_streak_snapshot" <<'SNAP_148E'
+    cat > "$1/recovery_family_streak_snapshot" <<'SNAP_148E'
 version=1
 pid=1000
 start_ticks=1000
@@ -5556,7 +5576,7 @@ TICK_PROM_148E
   # so parse_args() exits non-zero, out3 is empty, and rs3 != firing.
   seed_148e_snapshot "$state_dir_148e"
   local snap_before_148e
-  snap_before_148e=$(cat "$state_dir_148e/counter_streak_snapshot")
+  snap_before_148e=$(cat "$state_dir_148e/recovery_family_streak_snapshot")
   local out3_148e rs3_148e snap_after_148e
   out3_148e=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
     PID=2000 START_TICKS=2000 \
@@ -5572,11 +5592,11 @@ TICK_PROM_148E
     tap_not_ok "eval-alarms: --no-snapshot-write run 3 (with flag) still fires recovery-stalled" \
       "expected firing with --no-snapshot-write, got $rs3_148e (unknown flag on origin/main?)"
   fi
-  snap_after_148e=$(cat "$state_dir_148e/counter_streak_snapshot")
+  snap_after_148e=$(cat "$state_dir_148e/recovery_family_streak_snapshot")
   if [[ "$snap_before_148e" == "$snap_after_148e" ]]; then
-    tap_ok "eval-alarms: --no-snapshot-write leaves counter_streak_snapshot byte-unchanged"
+    tap_ok "eval-alarms: --no-snapshot-write leaves recovery_family_streak_snapshot byte-unchanged"
   else
-    tap_not_ok "eval-alarms: --no-snapshot-write leaves counter_streak_snapshot byte-unchanged" \
+    tap_not_ok "eval-alarms: --no-snapshot-write leaves recovery_family_streak_snapshot byte-unchanged" \
       "snapshot mutated despite --no-snapshot-write"
   fi
   rm -f "$tick_prom_148e"
@@ -5701,7 +5721,7 @@ GAP_CUR
   # reset never triggers; gap-staleness is what re-baselines here.
   local state_dir_148h tick_prom_148h
   state_dir_148h=$(mktemp -d)
-  cat > "$state_dir_148h/counter_streak_snapshot" <<'SNAP_148H'
+  cat > "$state_dir_148h/recovery_family_streak_snapshot" <<'SNAP_148H'
 version=1
 pid=3366449
 start_ticks=5000
@@ -5722,8 +5742,8 @@ TICK_PROM_148H
     --state-dir "$state_dir_148h" 2>/dev/null) || true
   rs_state_148h=$(rs_state_of "$out_148h")
   local snap_cv_148h snap_streak_148h
-  snap_cv_148h=$(grep '^counter_value=' "$state_dir_148h/counter_streak_snapshot" | cut -d= -f2)
-  snap_streak_148h=$(grep '^breach_streak=' "$state_dir_148h/counter_streak_snapshot" | cut -d= -f2)
+  snap_cv_148h=$(grep '^counter_value=' "$state_dir_148h/recovery_family_streak_snapshot" | cut -d= -f2)
+  snap_streak_148h=$(grep '^breach_streak=' "$state_dir_148h/recovery_family_streak_snapshot" | cut -d= -f2)
   if [[ "$rs_state_148h" == "collecting_baseline" \
         && "$snap_cv_148h" == "703" && "$snap_streak_148h" == "0" ]]; then
     tap_ok "eval-alarms: recovery-stalled burst gap-stale re-baseline (703 ⇒ collecting_baseline, snapshot reseeded to 703 streak 0, not firing)"

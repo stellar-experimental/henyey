@@ -210,6 +210,66 @@ def extract_value(
     return None
 
 
+def post_restart_label_value(
+    alarm: dict,
+    current: dict[str, list[tuple[dict[str, str], float]]],
+    fallback: float,
+) -> float:
+    """Value fed to the post-restart absolute guard for a counter-streak alarm.
+
+    The delta/streak/burst trigger observes the family SUM (extraction
+    ``form2-sum-all``), but the post-restart absolute guard (#3198) is calibrated
+    for a single historically-tuned series (#3824). When
+    ``post_restart_absolute_label`` is set, the guard evaluates ONLY that
+    ``reason`` series (not the aggregate sum, which legitimately reaches ~113
+    during warmup and would false-fire the absolute threshold every restart).
+    A missing scoped series is treated as 0 (no fire). When the field is absent,
+    fall back to the value the trigger already uses (the aggregate).
+    """
+    label = alarm.get("post_restart_absolute_label")
+    if not label:
+        return fallback
+    v = extract_value(
+        current, alarm["metric"], "form2", [{"key": "reason", "value": label}]
+    )
+    return v if v is not None else 0.0
+
+
+def compute_reason_breakdown(
+    current: dict[str, list[tuple[dict[str, str], float]]],
+    prev: dict[str, list[tuple[dict[str, str], float]]] | None,
+    metric: str,
+    label_key: str = "reason",
+) -> list[dict]:
+    """Per-``reason`` cross-tick deltas for a family-union counter-streak fire.
+
+    A summed fire reports only the aggregate delta (e.g. 161) with no attribution
+    (#3824). This computes each ``reason`` series' current-vs-prev delta, keeps
+    only the nonzero movers, and returns them sorted by descending delta so a
+    fire can name the labels that actually moved. Read-only/additive — no
+    snapshot-schema change. Returns [] when ``prev`` is unavailable.
+    """
+    if not prev:
+        return []
+    cur_series: dict[str, float] = {}
+    for lbl, val in current.get(metric, []):
+        r = lbl.get(label_key)
+        if r is not None:
+            cur_series[r] = val
+    prev_series: dict[str, float] = {}
+    for lbl, val in prev.get(metric, []):
+        r = lbl.get(label_key)
+        if r is not None:
+            prev_series[r] = val
+    out: list[dict] = []
+    for reason, cval in cur_series.items():
+        delta = int(cval) - int(prev_series.get(reason, 0.0))
+        if delta != 0:
+            out.append({"reason": reason, "delta": delta})
+    out.sort(key=lambda b: (-b["delta"], b["reason"]))
+    return out
+
+
 def extract_sum(
     metrics: dict[str, list[tuple[dict[str, str], float]]],
     metric_names: list[str],
@@ -1482,10 +1542,15 @@ def eval_counter_streak(
     start_ticks: str,
     gap_stale: bool = False,
     too_fresh: bool = False,
+    prev: dict | None = None,
 ) -> dict:
     """Evaluate a counter-streak alarm.
 
     Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
+
+    ``prev`` (the previous scrape's parsed metrics) is optional and used only to
+    attach a per-``reason`` breakdown on breach/firing when the alarm observes a
+    family sum (#3824); it does not affect the trigger's snapshot-based delta.
     """
     ev_default = default_extra_values(alarm, "counter-streak")
 
@@ -1536,7 +1601,8 @@ def eval_counter_streak(
                 "breach_streak": "0",
             }
             write_snapshot(snapshot_path, new_snapshot)
-            post_restart = maybe_post_restart_fire(alarm, cur_val)
+            post_restart = maybe_post_restart_fire(
+                alarm, post_restart_label_value(alarm, current, cur_val))
             if post_restart is not None:
                 return post_restart
             return make_result(alarm, "collecting_baseline",
@@ -1564,6 +1630,14 @@ def eval_counter_streak(
     # branch: write the fresh baseline FIRST, then evaluate the discarded
     # absolute value for a post-restart fire (#3198). The fire here uses the
     # absolute value, so it is not double-counting a delta.
+    #
+    # Under the family-union extraction (#3824), cur_val here is the SUM of all
+    # `reason` series. All 8 series live in the same metric family and reset
+    # together on a restart / metric re-registration, so a partial reset that
+    # left the sum flat is not a real case — the sum regressing is the correct
+    # reset signal. The post-restart guard stays scoped to the single calibrated
+    # label via post_restart_label_value (the summed value legitimately reaches
+    # ~113 during warmup and must not absolute-fire).
     if cur_val < prev_counter:
         new_snapshot = {
             "version": "1",
@@ -1573,7 +1647,8 @@ def eval_counter_streak(
             "breach_streak": "0",
         }
         write_snapshot(snapshot_path, new_snapshot)
-        post_restart = maybe_post_restart_fire(alarm, cur_val)
+        post_restart = maybe_post_restart_fire(
+            alarm, post_restart_label_value(alarm, current, cur_val))
         if post_restart is not None:
             return post_restart
         return make_result(alarm, "collecting_baseline",
@@ -1625,6 +1700,21 @@ def eval_counter_streak(
 
     ev = {"streak": streak, "streak_threshold": streak_threshold}
 
+    # Per-reason attribution for a family-union fire (#3824). Computed once; a
+    # summed delta otherwise reports only the aggregate with no moving-label
+    # names. Read-only vs `prev` — no snapshot-schema change. Empty when prev is
+    # absent (e.g. no-prev.prom tick) or nothing moved.
+    breakdown = compute_reason_breakdown(current, prev, metric)
+
+    def _with_breakdown(result: dict) -> dict:
+        if breakdown:
+            result["reason_breakdown"] = breakdown
+            # Thread into filing details so a filed issue names the movers, not
+            # just the aggregate delta (#3824).
+            suffix = f" by_reason: {format_reason_breakdown(breakdown)}"
+            result["details"] = (result.get("details", "") or "") + suffix
+        return result
+
     if delta >= burst_threshold:
         streak += 1
         new_snapshot = {
@@ -1635,10 +1725,10 @@ def eval_counter_streak(
             "breach_streak": str(streak),
         }
         write_snapshot(snapshot_path, new_snapshot)
-        return make_result(
+        return _with_breakdown(make_result(
             alarm, "firing", value=delta, threshold=burst_threshold,
             for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
-        )
+        ))
 
     if delta >= delta_threshold:
         streak += 1
@@ -1652,14 +1742,14 @@ def eval_counter_streak(
         write_snapshot(snapshot_path, new_snapshot)
 
         if streak >= streak_threshold:
-            return make_result(
+            return _with_breakdown(make_result(
                 alarm, "firing", value=delta, threshold=delta_threshold,
                 for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
-            )
-        return make_result(
+            ))
+        return _with_breakdown(make_result(
             alarm, "breach", value=delta, threshold=delta_threshold,
             for_ticks_elapsed=streak, extra_values={"streak": streak, "streak_threshold": streak_threshold},
-        )
+        ))
 
     # delta == 0
     new_snapshot = {
@@ -1674,6 +1764,19 @@ def eval_counter_streak(
 
 
 # ── Aggregate line rendering ────────────────────────────────────────────────
+
+def format_reason_breakdown(breakdown: list[dict]) -> str:
+    """Render a per-reason breakdown as `reason+delta` comma-separated tokens."""
+    return ", ".join(f"{b['reason']}+{b['delta']}" for b in breakdown)
+
+
+def _reason_breakdown_suffix(result: dict) -> str:
+    """Advisory ` [by reason: ...]` suffix for a family-union fire (#3824)."""
+    breakdown = result.get("reason_breakdown")
+    if not breakdown:
+        return ""
+    return f" [by reason: {format_reason_breakdown(breakdown)}]"
+
 
 def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
     """Render aggregate status lines from alarm results."""
@@ -1749,9 +1852,11 @@ def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
             else:
                 streak = r.get("for_ticks_elapsed", 0)
                 recovery_stalled_line = f"recovery_stalled: WARNING delta={r['value']} ({streak} ticks) — investigating"
+            recovery_stalled_line += _reason_breakdown_suffix(r)
         elif r["state"] == "breach":
             streak = r.get("for_ticks_elapsed", 0)
             recovery_stalled_line = f"recovery_stalled: breach (delta={r['value']}, streak {streak}/3)"
+            recovery_stalled_line += _reason_breakdown_suffix(r)
         elif r["state"] == "skipped":
             recovery_stalled_line = f"recovery_stalled: skipped ({r.get('skip_reason', '')})"
         elif r["state"] == "collecting_baseline":
@@ -1899,6 +2004,14 @@ def validate_catalog(catalog: dict) -> list[str]:
                 errors.append(f"{name}: counter-streak requires 'streak_threshold'")
             if "burst_threshold" not in alarm:
                 errors.append(f"{name}: counter-streak requires 'burst_threshold'")
+            # post_restart_absolute_label (#3824) scopes the post-restart absolute
+            # guard to a single `reason` series while the trigger sums the family.
+            # Optional, but must be a string when present (it becomes a label
+            # selector value passed to extract_value).
+            prl = alarm.get("post_restart_absolute_label")
+            if prl is not None and not isinstance(prl, str):
+                errors.append(
+                    f"{name}: invalid post_restart_absolute_label '{prl}' (must be a string)")
 
     return errors
 
@@ -2089,7 +2202,7 @@ def main() -> int:
                 )
             elif kind == "counter-streak":
                 result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val,
-                                             gap_stale, too_fresh)
+                                             gap_stale, too_fresh, prev=prev)
             else:
                 result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 

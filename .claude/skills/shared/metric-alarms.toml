@@ -771,11 +771,15 @@ notes = "Overlay lag or stale-envelope flood. Investigate overlay peer health an
 name = "recovery-stalled"
 metric = "henyey_recovery_stalled_tick_total"
 kind = "counter-streak"
-extraction = "form2"
-labels = [{ key = "reason", value = "forcing_catchup_behind" }]
-# Relaxed label validation: only forcing_catchup_behind required.
-# Other labels (backoff_active, forcing_catchup_not_behind, etc.) are
-# created dynamically on first use — may not exist on fresh nodes.
+# Family-union observation (#3824): the delta/streak/burst trigger observes the
+# SUM of ALL `reason` series, not a single label. During an at-tip stall the node
+# takes the `forcing_catchup_not_behind` branch by construction, so the previously
+# watched `forcing_catchup_behind` label was exactly the branch that could not
+# move — a real recovery episode incremented two uncovered labels and the tick
+# reported `ok (delta=0)`. Summing routes every series (including any future
+# `reason` added to consensus.rs) through the single-snapshot delta machine.
+extraction = "form2-sum-all"
+labels = []
 delta_threshold = 1
 streak_threshold = 3
 burst_threshold = 10
@@ -787,15 +791,28 @@ burst_threshold = 10
 # episode accrued 213; a clean restart reaching real-time sync promptly accrues
 # only a handful. 0/absent disables the check.
 post_restart_absolute_threshold = 50
-baseline_version = 3  # bumped in #3222: de-double snapshot_file (metrics/ prefix removed → bare filename)
-semantic_change_date = "2026-06-07T00:00:00Z"
+# The post-restart absolute guard stays SCOPED to a single historically
+# calibrated series (#3824): the summed family legitimately reaches ~113 during
+# warmup (`near_tip_peer_scp_recovery` alone ~50), which would false-fire the
+# absolute threshold (50, tuned on #3197/#3198 for `forcing_catchup_behind`
+# alone) every restart. The delta/burst trigger uses the sum; only the absolute
+# guard reads this single label.
+post_restart_absolute_label = "forcing_catchup_behind"
+baseline_version = 4  # bumped in #3824: family-union re-key (single label → sum of all reasons)
+semantic_change_date = "2026-08-25T00:00:00Z"
 severity = "WARN"
 gates = ["validator-only"]
-snapshot_file = "counter_streak_snapshot"
-cooldown_key = "henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"}"
+# Renamed from counter_streak_snapshot in #3824 to force a clean re-baseline on
+# deploy: the old baseline is absent at the new path, so the evaluator's
+# empty-snapshot first-tick branch re-collects WITHOUT a spurious post-restart
+# fire (a version-field bump would route the accumulated counter through the
+# post-restart path). The old file is left orphaned — harmless; this alarm is the
+# only counter-streak consumer.
+snapshot_file = "recovery_family_streak_snapshot"
+cooldown_key = "henyey_recovery_stalled_tick_total"
 cooldown_seconds = 7200
-filing_title = "metrics: henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"} — sustained breach"
-filing_search = "metrics: henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"}"
+filing_title = "metrics: henyey_recovery_stalled_tick_total (family) — sustained breach"
+filing_search = "metrics: henyey_recovery_stalled_tick_total (family)"
 summary = "Recovery stalled — sustained breach"
 details = "delta={value} streak={streak}/{streak_threshold}"
 notes = ""
