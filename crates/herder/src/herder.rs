@@ -120,6 +120,28 @@ const DEFAULT_CHECKPOINT_FREQUENCY: u64 = 64;
 /// nodes to fetch historical sets they missed.
 const PENDING_TX_SET_MAX_AGE_SECS: u64 = 120;
 
+/// `build_value_ms` above which value-building is flagged as a slow consensus
+/// trigger. Set above the observed p99 (~166ms) so the WARN marks a genuine
+/// outlier rather than firing on the typical trigger (p50 ~60ms). See #3839.
+const SLOW_BUILD_VALUE_WARN_MS: u128 = 250;
+
+/// `nominate_ms` above which nomination is flagged slow. Kept independent from
+/// (and lower than) the build-value bar because the two distributions differ
+/// by ~2 orders of magnitude (nominate p99 ~22ms vs build_value p99 ~166ms);
+/// 50ms remains a ~2x-p99 outlier for nomination and preserves the genuine
+/// sole-trigger firings (nominate 51-61ms with build_value 4-7ms) in #3839.
+const SLOW_NOMINATE_WARN_MS: u128 = 50;
+
+/// Returns true when a consensus trigger's timing warrants a `slow consensus
+/// trigger` WARN. The two arms have independent thresholds because the
+/// value-building and nomination timing distributions differ by ~2 orders of
+/// magnitude; sharing a single bar (the pre-#3839 behavior) meant the
+/// build-value bar sat below its own median while the nomination bar could
+/// only fire once nomination stalls happened to clear the build-value bar.
+fn is_slow_consensus_trigger(build_value_ms: u128, nominate_ms: u128) -> bool {
+    build_value_ms > SLOW_BUILD_VALUE_WARN_MS || nominate_ms > SLOW_NOMINATE_WARN_MS
+}
+
 /// Interval for garbage-collecting unreferenced persisted transaction sets.
 ///
 /// Parity: stellar-core `Herder.cpp:22` — `TX_SET_GC_DELAY = 1 minute`.
@@ -3228,7 +3250,7 @@ impl Herder {
         }
         let nominate_ms = t1.elapsed().as_millis();
 
-        if build_value_ms > 50 || nominate_ms > 50 {
+        if is_slow_consensus_trigger(build_value_ms, nominate_ms) {
             tracing::warn!(
                 slot,
                 build_value_ms,
@@ -5299,6 +5321,42 @@ mod tests {
         ScpStatementPledges, ScpStatementPrepare, Signature as XdrSignature, StellarValue,
         StellarValueExt, TimePoint, Value, WriteXdr,
     };
+
+    // --- slow-consensus-trigger threshold calibration (#3839) ---
+
+    #[test]
+    fn test_slow_consensus_trigger_typical_build_value_no_warn() {
+        // p50 build_value_ms (~60ms) must stay quiet under the 250ms bar.
+        assert!(!is_slow_consensus_trigger(60, 0));
+    }
+
+    #[test]
+    fn test_slow_consensus_trigger_build_value_outlier_warns() {
+        assert!(is_slow_consensus_trigger(251, 0));
+    }
+
+    #[test]
+    fn test_slow_consensus_trigger_build_value_boundary_exclusive() {
+        // Strictly-greater semantics preserved: exactly 250ms does not fire.
+        assert!(!is_slow_consensus_trigger(250, 0));
+    }
+
+    #[test]
+    fn test_slow_consensus_trigger_nominate_sole_trigger_warns() {
+        // Genuine disjoint nomination stall (build_value fast, nominate slow):
+        // the decoupled arm still fires. Shape from the #3839 correction.
+        assert!(is_slow_consensus_trigger(4, 53));
+    }
+
+    #[test]
+    fn test_slow_consensus_trigger_nominate_boundary_exclusive() {
+        assert!(!is_slow_consensus_trigger(0, 50));
+    }
+
+    #[test]
+    fn test_slow_consensus_trigger_both_healthy_no_warn() {
+        assert!(!is_slow_consensus_trigger(60, 22));
+    }
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         make_lm_at_seq_for_stale_test(0)
