@@ -404,6 +404,25 @@ impl FloodGate {
         }
     }
 
+    /// Estimate the heap footprint of the seen-message map (#3845).
+    ///
+    /// O(1): reads the entry count only. The per-entry `peers` sets are *not*
+    /// walked — that would be O(n) over up to `max_entries` (~1M) entries on
+    /// the ledger-close report path — so only the flat `IndexMap` payload (the
+    /// dominant term) is counted. Returns `(bytes, entry_count)`.
+    pub fn estimate_heap_bytes(&self) -> (u64, u64) {
+        use henyey_common::memory::hashmap_heap_bytes;
+        let len = self.map.lock().entries.len();
+        // IndexMap ≈ a Vec of (K, V) entries plus a hash index table; the flat
+        // hashmap helper over the entry count approximates both.
+        let bytes = hashmap_heap_bytes(
+            len,
+            std::mem::size_of::<Hash256>(),
+            std::mem::size_of::<SeenEntry>(),
+        );
+        (bytes as u64, len as u64)
+    }
+
     /// Removes flood records from ledgers before `ledger_seq`.
     ///
     /// Matches upstream stellar-core's `clearBelow(maxLedger)` which removes
@@ -1356,5 +1375,27 @@ mod tests {
         assert_eq!(keys[1], he); // E moved to B's position
         assert_eq!(keys[2], hc);
         assert_eq!(keys[3], hd);
+    }
+
+    /// #3845: `estimate_heap_bytes` is 0 on an empty flood gate and grows
+    /// monotonically as messages are recorded.
+    #[test]
+    fn test_flood_gate_estimate_heap_bytes_monotonic() {
+        let gate = FloodGate::new();
+        let (bytes0, count0) = gate.estimate_heap_bytes();
+        assert_eq!((bytes0, count0), (0, 0), "empty flood gate costs 0");
+
+        gate.record_local_broadcast(make_hash(1), 1);
+        let (bytes1, count1) = gate.estimate_heap_bytes();
+        assert!(bytes1 > 0);
+        assert_eq!(count1, 1);
+
+        gate.record_local_broadcast(make_hash(2), 1);
+        let (bytes2, count2) = gate.estimate_heap_bytes();
+        assert!(
+            bytes2 > bytes1,
+            "a second message must increase the estimate"
+        );
+        assert_eq!(count2, 2);
     }
 }

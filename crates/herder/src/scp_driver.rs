@@ -1288,6 +1288,14 @@ impl ScpDriver {
         self.externalize_lag.read().get_lag_info_summary(&qset)
     }
 
+    /// Estimate the heap footprint of the externalize-lag tracker (#3845).
+    ///
+    /// Exposed so the herder's memory reporter can attribute the driver-owned
+    /// lag maps, which live outside the ledger manager's report call site.
+    pub fn estimate_externalize_lag_heap_bytes(&self) -> usize {
+        self.externalize_lag.read().estimate_heap_bytes()
+    }
+
     /// Elapsed time since the first SCP activity was recorded for `slot`.
     /// Returns `None` if `record_slot_activity` was never called for this slot
     /// (e.g., catchup/fast-forward paths).

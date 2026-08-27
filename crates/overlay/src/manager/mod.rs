@@ -341,6 +341,28 @@ impl KnownPeerSet {
         }
     }
 
+    /// Estimate the heap footprint of the known-peer collections (#3845).
+    ///
+    /// O(1): reads Vec/HashSet capacities only. The `String` hostnames inside
+    /// each `PeerAddress` are not walked; only the inline element footprints are
+    /// counted (conservative under-count of a small, bounded structure).
+    pub(super) fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::{hashset_heap_bytes, vec_heap_bytes};
+        vec_heap_bytes(
+            self.config_entries.capacity(),
+            std::mem::size_of::<PeerAddress>(),
+        ) + vec_heap_bytes(
+            self.resolved.capacity(),
+            std::mem::size_of::<Option<PeerAddress>>(),
+        ) + vec_heap_bytes(
+            self.discovered.capacity(),
+            std::mem::size_of::<PeerAddress>(),
+        ) + hashset_heap_bytes(
+            self.discovered_keys.capacity(),
+            std::mem::size_of::<DialKey>(),
+        )
+    }
+
     /// Apply DNS resolution results. `results` must be positionally aligned
     /// with `config_entries`. On `Some(addr)`: updates resolution. On `None`:
     /// preserves last-good (does NOT clear).
@@ -1359,6 +1381,67 @@ pub struct OverlayManager {
     /// loop is already parked. The two dedicated drop counters remain the source
     /// of truth, so throttling loses no volume.
     broadcast_backpressure_warn_last_ms: AtomicU64,
+}
+
+impl henyey_common::memory::MemoryReporter for OverlayManager {
+    /// Report the overlay-owned heap components that live outside the ledger
+    /// manager's own report call site (#3845): the flood gate's seen-message
+    /// map, the connected-peer maps, and the known/banned peer sets. Each
+    /// estimate is O(1) and takes only short-lived locks — none re-enters the
+    /// ledger — so it is safe to call from the ledger-close report path.
+    ///
+    /// `BanManager`/`PeerManager` DB caches are intentionally excluded (they are
+    /// not `OverlayManager` fields); a follow-up can add them if they prove
+    /// material. `DashMap` capacity is not exposed, so `len()` is used as a
+    /// conservative floor for the sharded maps.
+    fn memory_components(&self) -> Vec<henyey_common::memory::ComponentMemory> {
+        use henyey_common::memory::{hashmap_heap_bytes, hashset_heap_bytes, ComponentMemory};
+
+        let (flood_bytes, flood_count) = self.flood_gate.estimate_heap_bytes();
+
+        let peers_len = self.peers.len();
+        let info_len = self.peer_info_cache.len();
+        let ext_len = self.peer_latest_externalized.len();
+
+        let banned_bytes = {
+            let banned = self.banned_peers.read();
+            hashset_heap_bytes(banned.capacity(), std::mem::size_of::<PeerId>())
+        };
+        let known_bytes = self.known_peers.read().estimate_heap_bytes();
+
+        vec![
+            ComponentMemory::new("overlay_flood", flood_bytes, flood_count),
+            ComponentMemory::new(
+                "overlay_peers",
+                hashmap_heap_bytes(
+                    peers_len,
+                    std::mem::size_of::<PeerId>(),
+                    std::mem::size_of::<PeerHandle>(),
+                ) as u64,
+                peers_len as u64,
+            ),
+            ComponentMemory::new(
+                "overlay_peer_info_cache",
+                hashmap_heap_bytes(
+                    info_len,
+                    std::mem::size_of::<PeerId>(),
+                    std::mem::size_of::<PeerInfo>(),
+                ) as u64,
+                info_len as u64,
+            ),
+            ComponentMemory::new(
+                "overlay_peer_externalized",
+                hashmap_heap_bytes(
+                    ext_len,
+                    std::mem::size_of::<PeerId>(),
+                    std::mem::size_of::<AtomicU64>(),
+                ) as u64,
+                ext_len as u64,
+            ),
+            ComponentMemory::new("overlay_banned_peers", banned_bytes as u64, 0),
+            ComponentMemory::new("overlay_known_peers", known_bytes as u64, 0),
+        ]
+    }
 }
 
 impl OverlayManager {
@@ -5987,6 +6070,30 @@ pub(crate) mod tests {
                 "Survey has invalid signature",
             ),
             "send_error_and_drop should report false for an unknown peer"
+        );
+    }
+
+    /// #3845: the `MemoryReporter` impl exposes exactly the six named overlay
+    /// components, so the periodic memory report can attribute them.
+    #[test]
+    fn test_overlay_memory_components_names() {
+        use henyey_common::memory::MemoryReporter;
+        let config = OverlayConfig::testnet();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let names: Vec<&str> = manager.memory_components().iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "overlay_flood",
+                "overlay_peers",
+                "overlay_peer_info_cache",
+                "overlay_peer_externalized",
+                "overlay_banned_peers",
+                "overlay_known_peers",
+            ]
         );
     }
 }

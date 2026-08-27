@@ -560,6 +560,48 @@ pub struct Herder {
     is_applying_flag: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+impl henyey_common::memory::MemoryReporter for Herder {
+    /// Report the herder-owned heap components that live outside the ledger
+    /// manager's own report call site (#3845): the transaction queue, the
+    /// fetching-envelope buffers, the SCP slot/quorum trackers, and the
+    /// externalize-lag maps. Each estimate is O(1)/O(bounded) and takes only
+    /// short-lived read locks — none re-enters the ledger — so it is safe to
+    /// call from the ledger-close report path.
+    fn memory_components(&self) -> Vec<henyey_common::memory::ComponentMemory> {
+        use henyey_common::memory::ComponentMemory;
+        vec![
+            ComponentMemory::new(
+                "herder_tx_queue",
+                self.tx_queue.estimate_heap_bytes() as u64,
+                self.tx_queue.len() as u64,
+            ),
+            ComponentMemory::new(
+                "herder_fetching_envelopes",
+                self.fetching_envelopes.estimate_heap_bytes() as u64,
+                0,
+            ),
+            ComponentMemory::new(
+                "herder_scp_slots",
+                self.slot_quorum_tracker.read().estimate_heap_bytes() as u64,
+                0,
+            ),
+            {
+                let quorum = self.quorum_tracker.read();
+                ComponentMemory::new(
+                    "herder_quorum",
+                    quorum.estimate_heap_bytes() as u64,
+                    quorum.tracked_node_count() as u64,
+                )
+            },
+            ComponentMemory::new(
+                "herder_externalize_lag",
+                self.scp_driver.estimate_externalize_lag_heap_bytes() as u64,
+                0,
+            ),
+        ]
+    }
+}
+
 impl Herder {
     /// Create a new Herder (observer mode, no secret key).
     pub fn new(
@@ -16509,6 +16551,25 @@ mod fetching_envelopes_routing_tests {
         assert!(
             !herder.scp.has_slot(100),
             "slot 100 should be purged from SCP (below purge boundary, not checkpoint)"
+        );
+    }
+
+    /// #3845: the `MemoryReporter` impl exposes exactly the five named herder
+    /// components, so the periodic memory report can attribute them.
+    #[test]
+    fn test_herder_memory_components_names() {
+        use henyey_common::memory::MemoryReporter;
+        let herder = make_test_herder();
+        let names: Vec<&str> = herder.memory_components().iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "herder_tx_queue",
+                "herder_fetching_envelopes",
+                "herder_scp_slots",
+                "herder_quorum",
+                "herder_externalize_lag",
+            ]
         );
     }
 }

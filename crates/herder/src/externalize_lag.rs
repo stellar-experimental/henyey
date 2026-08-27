@@ -52,6 +52,30 @@ impl ExternalizeLagTracker {
         }
     }
 
+    /// Estimate the heap footprint of the lag-tracking maps (#3845).
+    ///
+    /// O(number of tracked nodes) — reading only map/deque capacities. Each
+    /// per-node deque is capped at `MAX_LAG_SAMPLES`.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::{hashmap_heap_bytes, vecdeque_heap_bytes};
+        // node_lag: HashMap<NodeId, VecDeque<Duration>>.
+        let mut total = hashmap_heap_bytes(
+            self.node_lag.capacity(),
+            std::mem::size_of::<NodeId>(),
+            std::mem::size_of::<VecDeque<Duration>>(),
+        );
+        for samples in self.node_lag.values() {
+            total += vecdeque_heap_bytes(samples.capacity(), std::mem::size_of::<Duration>());
+        }
+        // first_externalize: HashMap<SlotIndex, Instant>.
+        total += hashmap_heap_bytes(
+            self.first_externalize.capacity(),
+            std::mem::size_of::<SlotIndex>(),
+            std::mem::size_of::<Instant>(),
+        );
+        total
+    }
+
     /// Record an externalize event for a slot.
     ///
     /// - On the first call per slot, sets `first_externalize[slot] = now`.
@@ -439,5 +463,24 @@ mod tests {
         };
         let json = serde_json::to_value(&without_lag).unwrap();
         assert!(json["lag_ms"].is_null());
+    }
+
+    /// #3845: `estimate_heap_bytes` is 0 for a fresh tracker and grows as slots
+    /// and per-node lag samples are recorded.
+    #[test]
+    fn test_externalize_lag_estimate_heap_bytes_grows() {
+        let mut tracker = ExternalizeLagTracker::new();
+        assert_eq!(tracker.estimate_heap_bytes(), 0);
+
+        let self_node = make_node(1);
+        let peer = make_node(2);
+        let t0 = Instant::now();
+        tracker.record_event(100, &self_node, true, t0);
+        tracker.record_event(100, &peer, false, t0 + Duration::from_millis(50));
+        let after = tracker.estimate_heap_bytes();
+        assert!(
+            after > 0,
+            "recording a slot + peer lag sample must cost more than 0"
+        );
     }
 }

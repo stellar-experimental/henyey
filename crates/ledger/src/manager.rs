@@ -1641,6 +1641,19 @@ pub struct LedgerManager {
     /// Used to compute `stellar_ledger_age_closed_seconds` — the time elapsed
     /// between consecutive close_ledger calls, matching stellar-core's mLastClose.
     last_close_wall_time: Mutex<std::time::Instant>,
+
+    /// Registry of external subsystems that report per-component heap usage
+    /// into the periodic memory report (see #3845).
+    ///
+    /// Held as `Weak` because reporters (herder, overlay) themselves hold an
+    /// `Arc<LedgerManager>`; a strong back-ref would form a reference cycle and
+    /// leak — self-defeating for a memory-observability feature. Dead reporters
+    /// upgrade to `None` and are pruned in [`Self::build_memory_report`].
+    ///
+    /// Interior-mutability (`&self`) registration via `register_memory_reporter`
+    /// mirrors the existing interpose-hook precedent, so subsystems can register
+    /// after the `LedgerManager` is behind an `Arc`.
+    memory_reporters: Mutex<Vec<std::sync::Weak<dyn henyey_common::memory::MemoryReporter>>>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1648,6 +1661,31 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     let _ = assert_send_sync::<LedgerManager> as fn();
 };
+
+/// Upgrade each registered weak memory reporter, collect its components, and
+/// prune any that have been dropped (see #3845).
+///
+/// Factored out as a free function so it can be unit-tested directly without a
+/// heavy `LedgerManager` constructor. Only the registry lock is held, and it is
+/// released *before* any `memory_components()` call — so a reporter is free to
+/// touch the ledger from inside its report without a lock-order inversion, and
+/// the prune never runs while a component guard is held.
+fn collect_and_prune_reporters(
+    reporters: &Mutex<Vec<std::sync::Weak<dyn henyey_common::memory::MemoryReporter>>>,
+) -> Vec<henyey_common::memory::ComponentMemory> {
+    // Snapshot the live reporters and drop dead weaks under the registry lock,
+    // then release it before invoking any reporter callback.
+    let live: Vec<Arc<dyn henyey_common::memory::MemoryReporter>> = {
+        let mut guard = reporters.lock();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut components = Vec::new();
+    for reporter in live {
+        components.extend(reporter.memory_components());
+    }
+    components
+}
 
 impl LedgerManager {
     /// Create a new ledger manager.
@@ -1699,7 +1737,23 @@ impl LedgerManager {
             commit_publication_interpose: Mutex::new(None),
             invariant_manager: None,
             last_close_wall_time: Mutex::new(std::time::Instant::now()),
+            memory_reporters: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register an external subsystem to contribute per-component heap
+    /// estimates to the periodic memory report (see #3845).
+    ///
+    /// Takes a `Weak` (see the `memory_reporters` field docs for the cycle
+    /// rationale) and `&self` so callers can register after the manager is
+    /// wrapped in an `Arc`. Registration order is not significant — the report
+    /// simply concatenates each live reporter's components after the
+    /// ledger-owned ones.
+    pub fn register_memory_reporter(
+        &self,
+        reporter: std::sync::Weak<dyn henyey_common::memory::MemoryReporter>,
+    ) {
+        self.memory_reporters.lock().push(reporter);
     }
 
     /// Get the network ID.
@@ -3414,6 +3468,12 @@ impl LedgerManager {
                 ));
             }
         }
+
+        // External subsystem components (herder, overlay, …) registered via
+        // `register_memory_reporter`. Collected last, after all ledger-owned
+        // component guards above have been released, so no reporter callback can
+        // deadlock against a lock this method still holds (#3845).
+        components.extend(collect_and_prune_reporters(&self.memory_reporters));
 
         crate::memory_report::MemoryReport::new(ledger_seq, components)
     }
@@ -12124,6 +12184,91 @@ mod tests {
             cost.soroban_state_target_size_bytes,
             30 * 1024 * 1024 * 1024_i64,
             "V20 initial ledger-cost target size is 30 GB before V23"
+        );
+    }
+
+    // --- Memory reporter registry (#3845) ---
+
+    use henyey_common::memory::{ComponentMemory, MemoryReporter};
+
+    /// A minimal reporter that yields one named component, for exercising the
+    /// weak-upgrade / merge / prune path without a heavy subsystem.
+    struct FakeReporter {
+        name: &'static str,
+        bytes: u64,
+    }
+
+    impl MemoryReporter for FakeReporter {
+        fn memory_components(&self) -> Vec<ComponentMemory> {
+            vec![ComponentMemory::new(self.name, self.bytes, 1)]
+        }
+    }
+
+    #[test]
+    fn test_register_memory_reporter_appends_components() {
+        let reporters: Mutex<Vec<std::sync::Weak<dyn MemoryReporter>>> = Mutex::new(Vec::new());
+        let a: Arc<dyn MemoryReporter> = Arc::new(FakeReporter {
+            name: "fake_a",
+            bytes: 100,
+        });
+        let b: Arc<dyn MemoryReporter> = Arc::new(FakeReporter {
+            name: "fake_b",
+            bytes: 200,
+        });
+        reporters.lock().push(Arc::downgrade(&a));
+        reporters.lock().push(Arc::downgrade(&b));
+
+        let components = collect_and_prune_reporters(&reporters);
+        let names: Vec<_> = components.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"fake_a"));
+        assert!(names.contains(&"fake_b"));
+        assert_eq!(components.iter().map(|c| c.bytes).sum::<u64>(), 300);
+        // Both weaks are still live, so nothing was pruned.
+        assert_eq!(reporters.lock().len(), 2);
+    }
+
+    #[test]
+    fn test_dropped_memory_reporter_is_skipped() {
+        let reporters: Mutex<Vec<std::sync::Weak<dyn MemoryReporter>>> = Mutex::new(Vec::new());
+        let live: Arc<dyn MemoryReporter> = Arc::new(FakeReporter {
+            name: "live",
+            bytes: 42,
+        });
+        reporters.lock().push(Arc::downgrade(&live));
+        {
+            // This reporter is dropped at the end of the block, so its weak
+            // must upgrade to None and be pruned on the next collection.
+            let dead: Arc<dyn MemoryReporter> = Arc::new(FakeReporter {
+                name: "dead",
+                bytes: 999,
+            });
+            reporters.lock().push(Arc::downgrade(&dead));
+            assert_eq!(reporters.lock().len(), 2);
+        }
+
+        let components = collect_and_prune_reporters(&reporters);
+        let names: Vec<_> = components.iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["live"]);
+        // The dead weak was pruned from the registry.
+        assert_eq!(reporters.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_register_memory_reporter_via_manager() {
+        let lm = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig::default(),
+        );
+        let reporter: Arc<dyn MemoryReporter> = Arc::new(FakeReporter {
+            name: "registered",
+            bytes: 7,
+        });
+        lm.register_memory_reporter(Arc::downgrade(&reporter));
+
+        let report = lm.build_memory_report(1);
+        assert!(
+            report.components.iter().any(|c| c.name == "registered"),
+            "registered reporter's component must appear in the memory report"
         );
     }
 }

@@ -2102,6 +2102,16 @@ impl App {
                 tracing::warn!(error = %err, "Failed to store local quorum set");
             }
         }
+
+        // Register the herder as a memory reporter so the periodic memory report
+        // folds in its per-subsystem heap components (tx queue, SCP-slot
+        // retention, fetching envelopes, quorum + externalize-lag maps). Weak so
+        // the herder's `Arc<LedgerManager>` back-ref doesn't form a leak-cycle
+        // (#3845).
+        ledger_manager
+            .register_memory_reporter(Arc::downgrade(&herder)
+                as std::sync::Weak<dyn henyey_common::memory::MemoryReporter>);
+
         herder
     }
 
