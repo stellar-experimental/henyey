@@ -1097,10 +1097,10 @@ attributed `phase` from the greppable log summary line:
 PROM=/home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom
 STARTUP_PEAK_MB=$(awk '/^henyey_startup_peak_anon_rss_mb /{printf "%d", $2}' "$PROM" 2>/dev/null)
 # phase label lives in the log summary line, not the gauge:
-#   "...startup_peak_anon_rss_mb=<N> phase=<phase>..."
-STARTUP_PEAK_PHASE=$(grep -oE 'startup_peak_anon_rss_mb=[0-9]+ phase=[a-z_-]+' \
+#   '...startup_peak_anon_rss_mb=<N> phase="<phase>"...'   (tracing quotes string fields)
+STARTUP_PEAK_PHASE=$(grep -oE 'startup_peak_anon_rss_mb=[0-9]+ phase="?[a-z_-]+"?' \
   /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>/dev/null \
-  | tail -1 | grep -oE 'phase=[a-z_-]+' | cut -d= -f2)
+  | tail -1 | grep -oE 'phase="?[a-z_-]+"?' | cut -d= -f2 | tr -d '"')
 if [ -n "$STARTUP_PEAK_MB" ] && [ "$STARTUP_PEAK_MB" -gt 0 ]; then
   WATCH_ITEMS+=("startup_peak_mb=$STARTUP_PEAK_MB${STARTUP_PEAK_PHASE:+ (phase=$STARTUP_PEAK_PHASE)}")
 fi
