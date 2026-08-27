@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=486
+TAP_PLAN=488
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -10659,14 +10659,14 @@ BOARDEOF
 
   # ── eval_memory_guardrail (host-RAM-relative HIGH-MEMORY guardrail, #3227) ──
   # Pure decision fn: eval_memory_guardrail rss_mb avail_mb host_ram_gb \
-  #   heap_prev_mb heap_curr_mb heap_prev2_mb → sets MEMORY_GUARDRAIL_VERDICT
+  #   heap_prev2_mb heap_prev_mb heap_curr_mb → sets MEMORY_GUARDRAIL_VERDICT
   # to none | report-high-mem | restart. Integer-MB math, no bc/floats.
   # Thresholds: report > 0.65*ram; restart > 0.75*ram AND avail < 0.12*ram AND
   # latest two heap_components_mb deltas both > 500 MB.
 
   # 32 GB host, RSS=24500 (>0.75*32GB=24576? no — 24500<24576). Use 24600 to be
   # unambiguously past the 0.75 floor while keeping >7 GB margin to the 32 GB wall.
-  eval_memory_guardrail 24600 3500 32 17000 17600 16400
+  eval_memory_guardrail 24600 3500 32 16400 17000 17600
   if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
     tap_ok "eval_memory_guardrail: 32GB RSS>0.75 + avail<0.12 + heap +600/+600 → restart"
   else
@@ -10704,7 +10704,7 @@ BOARDEOF
   # rule (RSS>16GB AND avail<8GB AND heap growing) would have been at/near
   # restart here; the host-relative rule does NOT false-fire because
   # 24000 < 0.65*61GB=40601 ⇒ verdict none. This is the "no false-fire on 61 GB" case.
-  eval_memory_guardrail 24000 7000 61 17000 17600 16400
+  eval_memory_guardrail 24000 7000 61 16400 17000 17600
   if [[ "$MEMORY_GUARDRAIL_VERDICT" == "none" ]]; then
     tap_ok "eval_memory_guardrail: 61GB RSS=24G (old 16/8 rule near-restart) → none"
   else
@@ -10713,7 +10713,7 @@ BOARDEOF
 
   # 61 GB host, RSS=46000 (>0.75*61GB=46848? no — 46000<46848). Use 47000 to clear
   # the 0.75 floor: legit 61 GB restart still works when host genuinely under pressure.
-  eval_memory_guardrail 47000 7000 61 17000 17600 16400
+  eval_memory_guardrail 47000 7000 61 16400 17000 17600
   if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
     tap_ok "eval_memory_guardrail: 61GB RSS>0.75 + avail<0.12 + heap growing → restart"
   else
