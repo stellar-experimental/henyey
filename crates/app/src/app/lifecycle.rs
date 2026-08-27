@@ -1968,7 +1968,17 @@ impl App {
         let peer_count = overlay.peer_count();
         tracing::info!(peer_count, "Overlay network started");
 
-        *self.overlay.write().await = Some(Arc::new(overlay));
+        let overlay = Arc::new(overlay);
+
+        // Register the overlay as a memory reporter so the periodic memory report
+        // folds in its per-subsystem heap components (flood gate, peer maps,
+        // known/banned peer sets). Weak so it does not extend the overlay's
+        // lifetime (#3845).
+        self.ledger_manager
+            .register_memory_reporter(Arc::downgrade(&overlay)
+                as std::sync::Weak<dyn henyey_common::memory::MemoryReporter>);
+
+        *self.overlay.write().await = Some(overlay);
 
         // Grab the tracking flag handle so synchronous callbacks can update it.
         if let Some(ref om) = *self.overlay.read().await {

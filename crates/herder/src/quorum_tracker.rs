@@ -176,6 +176,23 @@ impl SlotQuorumTracker {
             self.slot_nodes.remove(&slot);
         }
     }
+
+    /// Estimate the heap footprint of the per-slot node sets (#3845).
+    ///
+    /// O(number of tracked slots) — bounded by `max_slots` — reading only
+    /// map/set capacities.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::{hashmap_heap_bytes, hashset_heap_bytes};
+        let mut total = hashmap_heap_bytes(
+            self.slot_nodes.capacity(),
+            std::mem::size_of::<SlotIndex>(),
+            std::mem::size_of::<HashSet<NodeId>>(),
+        );
+        for nodes in self.slot_nodes.values() {
+            total += hashset_heap_bytes(nodes.capacity(), std::mem::size_of::<NodeId>());
+        }
+        total
+    }
 }
 
 /// Metadata about a node in the transitive quorum graph.
@@ -381,6 +398,29 @@ impl QuorumTracker {
         self.quorum
             .get(node_id)
             .map(|info| &info.closest_validators)
+    }
+
+    /// Estimate the heap footprint of the transitive quorum map (#3845).
+    ///
+    /// O(number of tracked nodes) — reading only map/set capacities. The
+    /// per-node `Option<ScpQuorumSet>` payloads are excluded (shared/cached
+    /// elsewhere); only the inline `NodeInfo` and each node's
+    /// `closest_validators` set are counted.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::{btreemap_heap_bytes, hashmap_heap_bytes};
+        let mut total = hashmap_heap_bytes(
+            self.quorum.capacity(),
+            std::mem::size_of::<NodeId>(),
+            std::mem::size_of::<NodeInfo>(),
+        );
+        for info in self.quorum.values() {
+            total += btreemap_heap_bytes(
+                info.closest_validators.len(),
+                std::mem::size_of::<NodeId>(),
+                0,
+            );
+        }
+        total
     }
 }
 
@@ -652,5 +692,39 @@ mod tests {
         let closest_d = tracker.find_closest_validators(&node_d).unwrap();
         assert!(closest_d.contains(&node_b));
         assert!(!closest_d.contains(&node_c));
+    }
+
+    /// #3845: `SlotQuorumTracker::estimate_heap_bytes` is 0 when empty and grows
+    /// as slot/node entries are recorded.
+    #[test]
+    fn test_slot_quorum_tracker_estimate_heap_bytes_grows() {
+        let mut tracker = SlotQuorumTracker::new(None, 0);
+        assert_eq!(tracker.estimate_heap_bytes(), 0);
+
+        tracker.record_envelope(100, make_node_id(2));
+        let with_one = tracker.estimate_heap_bytes();
+        assert!(with_one > 0);
+
+        tracker.record_envelope(100, make_node_id(3));
+        tracker.record_envelope(101, make_node_id(4));
+        assert!(tracker.estimate_heap_bytes() > with_one);
+    }
+
+    /// #3845: `QuorumTracker::estimate_heap_bytes` grows as the transitive
+    /// quorum map is expanded.
+    #[test]
+    fn test_quorum_tracker_estimate_heap_bytes_grows() {
+        let local = make_node_id(1);
+        let node_b = make_node_id(2);
+        let mut tracker = QuorumTracker::new(local.clone());
+        let empty = tracker.estimate_heap_bytes();
+
+        tracker
+            .expand(&local, make_quorum_set(vec![node_b.clone()], 1))
+            .expect("expand local");
+        assert!(
+            tracker.estimate_heap_bytes() > empty,
+            "expanding the quorum map must increase the estimate"
+        );
     }
 }

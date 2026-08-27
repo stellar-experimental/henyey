@@ -2774,6 +2774,64 @@ impl TransactionQueue {
         self.store.read().is_empty()
     }
 
+    /// Estimate the heap footprint of this queue's owned collections (#3845).
+    ///
+    /// Reads capacities/lengths only — it never iterates entries (the
+    /// banned-transactions deque is bounded by the ban depth, so summing its
+    /// inner sets' capacities is a small constant). Each lock is taken and
+    /// released independently, so no two queue locks are held at once and the
+    /// documented `store → account_states → banned → seen` order cannot be
+    /// violated. The shared `Arc<TransactionEnvelope>` payloads are excluded —
+    /// only the inline `QueuedTransaction` struct is counted — to avoid
+    /// double-counting.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::{
+            btreemap_heap_bytes, hashmap_heap_bytes, hashset_heap_bytes, vecdeque_heap_bytes,
+        };
+
+        // store: by_hash HashMap + fee_index BTreeSet (same-module field access).
+        let store_bytes = {
+            let store = self.store.read();
+            hashmap_heap_bytes(
+                store.by_hash.capacity(),
+                std::mem::size_of::<Hash256>(),
+                std::mem::size_of::<QueuedTransaction>(),
+            ) + btreemap_heap_bytes(store.fee_index.len(), std::mem::size_of::<FeeEntry>(), 0)
+        };
+
+        // seen: HashSet<Hash256>.
+        let seen_bytes = {
+            let seen = self.seen.read();
+            hashset_heap_bytes(seen.capacity(), std::mem::size_of::<Hash256>())
+        };
+
+        // banned_transactions: VecDeque<HashSet<Hash256>> (depth bounded by ban depth).
+        let banned_bytes = {
+            let banned = self.banned_transactions.read();
+            let outer =
+                vecdeque_heap_bytes(banned.capacity(), std::mem::size_of::<HashSet<Hash256>>());
+            let inner: usize = banned
+                .iter()
+                .map(|s| hashset_heap_bytes(s.capacity(), std::mem::size_of::<Hash256>()))
+                .sum();
+            outer + inner
+        };
+
+        // account_states: HashMap<Vec<u8>, AccountState> — add an estimate for
+        // the heap-allocated XDR-encoded AccountId keys.
+        let account_bytes = {
+            let states = self.account_states.read();
+            const ACCOUNT_KEY_HEAP_BYTES: usize = 40;
+            hashmap_heap_bytes(
+                states.capacity(),
+                std::mem::size_of::<Vec<u8>>(),
+                std::mem::size_of::<AccountState>(),
+            ) + states.len() * ACCOUNT_KEY_HEAP_BYTES
+        };
+
+        store_bytes + seen_bytes + banned_bytes + account_bytes
+    }
+
     /// Reset all lane-based and global eviction fee thresholds.
     ///
     /// Called whenever the queue is rebuilt or transactions are evicted/shifted
@@ -11825,5 +11883,27 @@ mod broadcast_visitor_tests {
         assert_eq!(stats.pending_count, 1);
         // Age 5 should clamp into bucket [3]
         assert_eq!(stats.pending_txs_age, [0, 0, 0, 1]);
+    }
+
+    /// #3845: `estimate_heap_bytes` is ~0 on an empty queue and grows once
+    /// transactions (and bans) populate the owned collections.
+    #[test]
+    fn test_tx_queue_estimate_heap_bytes_grows() {
+        let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
+        let empty = queue.estimate_heap_bytes();
+
+        let tx1 = make_test_envelope(200, 1);
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        let with_one = queue.estimate_heap_bytes();
+        assert!(
+            with_one > empty,
+            "adding a transaction must increase the heap estimate ({with_one} !> {empty})"
+        );
+
+        // Banning populates the banned-transactions deque.
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+        queue.ban(&[Hash256::hash_xdr(&tx2)]);
+        assert!(queue.estimate_heap_bytes() >= with_one);
     }
 }

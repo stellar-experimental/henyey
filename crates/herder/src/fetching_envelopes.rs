@@ -744,6 +744,37 @@ impl FetchingEnvelopes {
         self.stats.read().clone()
     }
 
+    /// Estimate the heap footprint of the per-slot envelope buffers (#3845).
+    ///
+    /// O(number of buffered slots) — bounded by `max_future_slots` — reading
+    /// only map/set/vec capacities. Envelope payloads themselves are carried by
+    /// the SCP layer and are not double-counted here; only the inline
+    /// `ScpEnvelope`/`FetchingEntry` struct footprints are included.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::{
+            btreemap_heap_bytes, hashmap_heap_bytes, hashset_heap_bytes, vec_heap_bytes,
+        };
+        let slots = self.slots.read();
+        // Outer BTreeMap<SlotIndex, SlotEnvelopes>.
+        let mut total = btreemap_heap_bytes(
+            slots.len(),
+            std::mem::size_of::<SlotIndex>(),
+            std::mem::size_of::<SlotEnvelopes>(),
+        );
+        // Per-slot inner collections (same-module private field access).
+        for slot in slots.values() {
+            total += hashset_heap_bytes(slot.discarded.capacity(), std::mem::size_of::<Hash256>());
+            total += hashset_heap_bytes(slot.processed.capacity(), std::mem::size_of::<Hash256>());
+            total += hashmap_heap_bytes(
+                slot.fetching.capacity(),
+                std::mem::size_of::<Hash256>(),
+                std::mem::size_of::<FetchingEntry>(),
+            );
+            total += vec_heap_bytes(slot.ready.capacity(), std::mem::size_of::<ScpEnvelope>());
+        }
+        total
+    }
+
     /// Trim stale data while preserving state for slots after catchup.
     /// Called after catchup to release memory from stale data.
     pub fn trim_stale(&self, keep_after_slot: SlotIndex) {
@@ -3074,6 +3105,24 @@ mod tests {
             broadcast_count.load(Ordering::SeqCst),
             1,
             "duplicate dep arrival must not re-trigger broadcast"
+        );
+    }
+
+    /// #3845: `estimate_heap_bytes` is 0 with no buffered slots and grows once
+    /// slots hold envelopes.
+    #[test]
+    fn test_fetching_envelopes_estimate_heap_bytes_grows() {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
+        assert_eq!(fetching.estimate_heap_bytes(), 0, "empty buffers cost 0");
+
+        fetching.test_insert_ready(100, vec![make_envelope(100, 1), make_envelope(100, 2)]);
+        let with_slot = fetching.estimate_heap_bytes();
+        assert!(with_slot > 0, "a buffered slot must cost more than 0");
+
+        fetching.test_insert_ready(101, vec![make_envelope(101, 3)]);
+        assert!(
+            fetching.estimate_heap_bytes() > with_slot,
+            "a second buffered slot must increase the estimate"
         );
     }
 }
