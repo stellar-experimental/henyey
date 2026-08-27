@@ -10720,6 +10720,44 @@ BOARDEOF
     tap_not_ok "eval_memory_guardrail: 61GB legit-restart case" "got $MEMORY_GUARDRAIL_VERDICT"
   fi
 
+  # ── Consumer-side regression (#3846): the LIVE SKILL.md invocation must fire
+  # restart under the documented chronological heap order. The six direct-call
+  # cases above pass args in the function's own order, so they structurally
+  # cannot catch a SKILL.md/function argument-order divergence (the #3844 defect
+  # class). Extract and eval the real two-line invocation from each monitor-tick
+  # SKILL.md copy, so either one drifting from the signature is caught here.
+  local _guardrail_md
+  for _guardrail_md in \
+    "$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md" \
+    "$REPO_ROOT/.agents/skills/monitor-tick/SKILL.md"; do
+    # Extract the invocation: from the `eval_memory_guardrail "$RSS_MB"` line
+    # through the first line WITHOUT a trailing backslash (captures both
+    # continuation lines robustly).
+    local _guardrail_call
+    _guardrail_call=$(awk '
+      /eval_memory_guardrail "\$RSS_MB"/ { grab=1 }
+      grab { print }
+      grab && !/\\[[:space:]]*$/ { exit }
+    ' "$_guardrail_md")
+    # Documented growth trajectory: RSS 47 GB / avail 7 GB on a 61 GB host,
+    # heap +600/+600 MB (prev2=16400 prev=17000 curr=17600). Bind as plain
+    # shell vars (do NOT env-prefix the `eval` builtin) and reset the verdict
+    # immediately before eval so a prior value cannot mask a regression.
+    RSS_MB=47000
+    AVAIL_MB=7000
+    MONITOR_HOST_RAM_GB=61
+    HEAP_PREV2_MB=16400
+    HEAP_PREV_MB=17000
+    HEAP_CURR_MB=17600
+    MEMORY_GUARDRAIL_VERDICT=""
+    eval "$_guardrail_call"
+    if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
+      tap_ok "eval_memory_guardrail: SKILL.md documented call order fires restart on +600/+600 ($_guardrail_md)"
+    else
+      tap_not_ok "eval_memory_guardrail: SKILL.md documented call order → restart ($_guardrail_md)" "got $MEMORY_GUARDRAIL_VERDICT"
+    fi
+  done
+
   # ── Structural assertions (#3227): monitor-tick wires the guardrail + surfaces peak ──
   local tick_md="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
   if grep -q 'eval_memory_guardrail' "$tick_md"; then
