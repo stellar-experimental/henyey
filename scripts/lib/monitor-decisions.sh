@@ -579,7 +579,7 @@ detect_soft_fail_blocked() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# eval_memory_guardrail RSS_MB AVAIL_MB HOST_RAM_GB HEAP_PREV_MB HEAP_CURR_MB HEAP_PREV2_MB
+# eval_memory_guardrail RSS_MB AVAIL_MB HOST_RAM_GB HEAP_PREV2_MB HEAP_PREV_MB HEAP_CURR_MB
 #
 # Pure decision function for the monitor-tick HIGH-MEMORY guardrail (issue #3227).
 # Host-RAM-relative thresholds (replaces the old absolute 12/16/8 GB literals) so
@@ -609,9 +609,9 @@ eval_memory_guardrail() {
   local rss_mb="$1"
   local avail_mb="$2"
   local host_ram_gb="$3"
-  local heap_prev_mb="$4"
-  local heap_curr_mb="$5"
-  local heap_prev2_mb="$6"
+  local heap_prev2_mb="$4"
+  local heap_prev_mb="$5"
+  local heap_curr_mb="$6"
 
   MEMORY_GUARDRAIL_VERDICT="none"
 

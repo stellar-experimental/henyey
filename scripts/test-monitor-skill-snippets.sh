@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=486
+TAP_PLAN=488
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -10659,14 +10659,14 @@ BOARDEOF
 
   # ── eval_memory_guardrail (host-RAM-relative HIGH-MEMORY guardrail, #3227) ──
   # Pure decision fn: eval_memory_guardrail rss_mb avail_mb host_ram_gb \
-  #   heap_prev_mb heap_curr_mb heap_prev2_mb → sets MEMORY_GUARDRAIL_VERDICT
+  #   heap_prev2_mb heap_prev_mb heap_curr_mb → sets MEMORY_GUARDRAIL_VERDICT
   # to none | report-high-mem | restart. Integer-MB math, no bc/floats.
   # Thresholds: report > 0.65*ram; restart > 0.75*ram AND avail < 0.12*ram AND
   # latest two heap_components_mb deltas both > 500 MB.
 
   # 32 GB host, RSS=24500 (>0.75*32GB=24576? no — 24500<24576). Use 24600 to be
   # unambiguously past the 0.75 floor while keeping >7 GB margin to the 32 GB wall.
-  eval_memory_guardrail 24600 3500 32 17000 17600 16400
+  eval_memory_guardrail 24600 3500 32 16400 17000 17600
   if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
     tap_ok "eval_memory_guardrail: 32GB RSS>0.75 + avail<0.12 + heap +600/+600 → restart"
   else
@@ -10704,7 +10704,7 @@ BOARDEOF
   # rule (RSS>16GB AND avail<8GB AND heap growing) would have been at/near
   # restart here; the host-relative rule does NOT false-fire because
   # 24000 < 0.65*61GB=40601 ⇒ verdict none. This is the "no false-fire on 61 GB" case.
-  eval_memory_guardrail 24000 7000 61 17000 17600 16400
+  eval_memory_guardrail 24000 7000 61 16400 17000 17600
   if [[ "$MEMORY_GUARDRAIL_VERDICT" == "none" ]]; then
     tap_ok "eval_memory_guardrail: 61GB RSS=24G (old 16/8 rule near-restart) → none"
   else
@@ -10713,12 +10713,50 @@ BOARDEOF
 
   # 61 GB host, RSS=46000 (>0.75*61GB=46848? no — 46000<46848). Use 47000 to clear
   # the 0.75 floor: legit 61 GB restart still works when host genuinely under pressure.
-  eval_memory_guardrail 47000 7000 61 17000 17600 16400
+  eval_memory_guardrail 47000 7000 61 16400 17000 17600
   if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
     tap_ok "eval_memory_guardrail: 61GB RSS>0.75 + avail<0.12 + heap growing → restart"
   else
     tap_not_ok "eval_memory_guardrail: 61GB legit-restart case" "got $MEMORY_GUARDRAIL_VERDICT"
   fi
+
+  # ── Consumer-side regression (#3846): the LIVE SKILL.md invocation must fire
+  # restart under the documented chronological heap order. The six direct-call
+  # cases above pass args in the function's own order, so they structurally
+  # cannot catch a SKILL.md/function argument-order divergence (the #3844 defect
+  # class). Extract and eval the real two-line invocation from each monitor-tick
+  # SKILL.md copy, so either one drifting from the signature is caught here.
+  local _guardrail_md
+  for _guardrail_md in \
+    "$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md" \
+    "$REPO_ROOT/.agents/skills/monitor-tick/SKILL.md"; do
+    # Extract the invocation: from the `eval_memory_guardrail "$RSS_MB"` line
+    # through the first line WITHOUT a trailing backslash (captures both
+    # continuation lines robustly).
+    local _guardrail_call
+    _guardrail_call=$(awk '
+      /eval_memory_guardrail "\$RSS_MB"/ { grab=1 }
+      grab { print }
+      grab && !/\\[[:space:]]*$/ { exit }
+    ' "$_guardrail_md")
+    # Documented growth trajectory: RSS 47 GB / avail 7 GB on a 61 GB host,
+    # heap +600/+600 MB (prev2=16400 prev=17000 curr=17600). Bind as plain
+    # shell vars (do NOT env-prefix the `eval` builtin) and reset the verdict
+    # immediately before eval so a prior value cannot mask a regression.
+    RSS_MB=47000
+    AVAIL_MB=7000
+    MONITOR_HOST_RAM_GB=61
+    HEAP_PREV2_MB=16400
+    HEAP_PREV_MB=17000
+    HEAP_CURR_MB=17600
+    MEMORY_GUARDRAIL_VERDICT=""
+    eval "$_guardrail_call"
+    if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
+      tap_ok "eval_memory_guardrail: SKILL.md documented call order fires restart on +600/+600 ($_guardrail_md)"
+    else
+      tap_not_ok "eval_memory_guardrail: SKILL.md documented call order → restart ($_guardrail_md)" "got $MEMORY_GUARDRAIL_VERDICT"
+    fi
+  done
 
   # ── Structural assertions (#3227): monitor-tick wires the guardrail + surfaces peak ──
   local tick_md="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
