@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=486
+TAP_PLAN=489
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -11390,6 +11390,62 @@ Cargo.toml"
   else
     tap_not_ok "structural: Test 6 boundary check is deterministic and guarded (#3766)" \
       "Test 6 must mock 7199 (not the exact 7200 boundary) and guard its check_session_wiped call via exit_code6"
+  fi
+
+  # ── Startup-peak phase extraction is quote-tolerant (#3844) ─────────────────
+  # `tracing` quotes string fields, so the check-(7) summary line the sampler
+  # emits reads `startup_peak_anon_rss_mb=21047 phase="cache-scan"`. The pre-fix
+  # snippet used `phase=[a-z_-]+`, whose class matched neither the leading `"`
+  # nor — because of the `+` — the numeric prefix, silently yielding an empty
+  # STARTUP_PEAK_PHASE and dropping the `(phase=…)` suffix from WATCH_ITEMS.
+  # This block sources the extraction snippet *from the skill itself* so the
+  # test fails on origin/main and passes only once the pattern is fixed.
+  local phase_tick_md="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  # Two nearby ```bash fences exist; select the one that actually assigns
+  # STARTUP_PEAK_PHASE by content, not position.
+  local phase_block
+  phase_block=$(awk '
+    /^```bash$/ { inblk=1; buf=""; next }
+    /^```$/     { if (inblk && buf ~ /STARTUP_PEAK_PHASE=/) printf "%s", buf; inblk=0; next }
+    inblk       { buf = buf $0 ORS }
+  ' "$phase_tick_md")
+
+  if [[ -n "$phase_block" && "$phase_block" == *STARTUP_PEAK_PHASE=* ]]; then
+    tap_ok "startup-peak phase: extracted the STARTUP_PEAK_PHASE bash block from SKILL.md"
+  else
+    tap_not_ok "startup-peak phase: extracted the STARTUP_PEAK_PHASE bash block from SKILL.md" \
+      "block empty or missing STARTUP_PEAK_PHASE= assignment"
+  fi
+
+  # Behavioral: run the extracted block against the REAL emitted (quoted) line.
+  # The block hardcodes /home/tomer/data/$MONITOR_SESSION_ID; rewrite that base
+  # to a portable temp session dir under TEST_ROOT so the test does not depend
+  # on the operator's home path (keeps CI green after the fix).
+  local phase_session phase_block_run phase_result
+  phase_session="$TEST_ROOT/phase3844"
+  mkdir -p "$phase_session/logs"
+  printf '%s\n' '2026-08-09T09:53:13.843959Z  INFO henyey_ledger::peak_rss_sampler: Startup peak RSS summary startup_peak_anon_rss_mb=21047 phase="cache-scan"' \
+    > "$phase_session/logs/monitor.log"
+  phase_block_run=$(sed "s#/home/tomer/data/\$MONITOR_SESSION_ID#$phase_session#g" <<<"$phase_block")
+  phase_result=$(
+    set +e
+    WATCH_ITEMS=()
+    eval "$phase_block_run"
+    printf '%s' "${STARTUP_PEAK_PHASE:-}"
+  )
+  if [[ "$phase_result" == "cache-scan" ]]; then
+    tap_ok "startup-peak phase: quote-tolerant extraction yields 'cache-scan' (#3844)"
+  else
+    tap_not_ok "startup-peak phase: quote-tolerant extraction yields 'cache-scan' (#3844)" \
+      "got STARTUP_PEAK_PHASE='$phase_result' (pre-fix phase=[a-z_-]+ cannot match phase=\"cache-scan\")"
+  fi
+
+  # Doc-consistency: the pattern must be quote-tolerant AND strip captured quotes.
+  if grep -qF 'phase="?[a-z_-]+"?' <<<"$phase_block" && grep -qF "tr -d '\"'" <<<"$phase_block"; then
+    tap_ok "startup-peak phase: SKILL.md pattern is quote-tolerant and strips quotes (#3844)"
+  else
+    tap_not_ok "startup-peak phase: SKILL.md pattern is quote-tolerant and strips quotes (#3844)" \
+      "expected phase=\"?[a-z_-]+\"? and a tr -d '\"' strip in the extracted block"
   fi
 }
 check_skill_structure
