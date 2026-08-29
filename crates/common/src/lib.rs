@@ -63,6 +63,7 @@ pub mod memory;
 pub mod meta;
 pub mod meta_walk;
 pub mod network;
+pub mod peer_backoff;
 pub mod protocol;
 pub mod resource;
 pub mod spawn;
