@@ -308,6 +308,45 @@ pub(super) fn is_spurious_near_tip_behind(behind_gap: u64, peer_gap: u64) -> boo
     behind_gap <= TX_SET_REQUEST_WINDOW && peer_gap == 0
 }
 
+/// Ledgers elapsed since the most recent checkpoint boundary at or before
+/// `current_ledger` (#3902).
+///
+/// A checkpoint boundary ledger (`lcl ≡ freq-1 mod freq`) reports `0`; the
+/// ledger immediately after it reports `1`, and so on. The #3902 phase-lock
+/// analysis found every long (≥330 s) near-tip freeze in a 306 h window starts
+/// within the boundary band `ledgers_past_checkpoint ∈ 0..=7` (the boundary
+/// ledger plus the seven ledgers after it — equivalently `lcl mod 64 ∈ {0..6,
+/// 63}`), so recording this at stall onset turns a 306 h offline log
+/// reconstruction into a queryable field.
+///
+/// Frequency-aware: delegates to
+/// [`henyey_history::checkpoint::latest_checkpoint_before_or_at`], so it is
+/// correct under the accelerated `checkpoint_frequency() == 8` cadence and not
+/// hardcoded to 64. Before the first checkpoint (`current_ledger < freq-1`)
+/// there is no prior boundary, so the raw ledger is returned (no underflow).
+fn ledgers_past_checkpoint(current_ledger: u32) -> u32 {
+    use henyey_history::checkpoint::latest_checkpoint_before_or_at;
+    latest_checkpoint_before_or_at(current_ledger)
+        .map(|boundary| current_ledger - boundary)
+        .unwrap_or(current_ledger)
+}
+
+/// Signed gap between the next checkpoint and the archive's latest known
+/// checkpoint (#3902).
+///
+/// A positive value means the archive is behind the next checkpoint (the
+/// "archive confirmed behind unpublished checkpoint" window the recovery
+/// routing observes); negative means the archive is ahead. `None` (a cold
+/// archive-checkpoint cache — latest unknown this tick) maps to the `-1`
+/// sentinel rather than a misleading `0`. Returned as `i64` so archive-ahead
+/// never wraps around.
+fn archive_checkpoint_lag(next_cp: u32, archive_latest: Option<u32>) -> i64 {
+    match archive_latest {
+        Some(latest) => next_cp as i64 - latest as i64,
+        None => -1,
+    }
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger.
     ///
@@ -761,6 +800,23 @@ impl App {
                 let tx_set_peers_exhausted = self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
                 let (_, auth_peer_count) = self.peer_counts().await;
                 let herder_state = self.herder.state();
+                // Checkpoint-phase diagnostics (#3902): record the
+                // checkpoint-relative position and the archive's checkpoint lag
+                // at stall onset so the phase-lock hypothesis (every long freeze
+                // starts within the 0..=7 boundary band) and the archive-behind
+                // window become queryable fields rather than a 306 h offline
+                // reconstruction. `next_cp` matches the value the recovery
+                // routing computes downstream; the archive read is the same
+                // non-blocking `parking_lot` read that path performs (no
+                // `.await`, safe on the event loop, no recovery-state side
+                // effect).
+                let ledgers_past_checkpoint = ledgers_past_checkpoint(current_ledger);
+                let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+                let archive_latest = match self.get_cached_archive_checkpoint_nonblocking() {
+                    CacheResult::Fresh(latest) | CacheResult::Stale(latest) => Some(latest),
+                    CacheResult::Cold => None,
+                };
+                let archive_checkpoint_lag = archive_checkpoint_lag(next_cp, archive_latest);
                 crate::metrics::RECOVERY_STALL_ONSET_TOTAL.increment(1);
                 tracing::info!(
                     current_ledger,
@@ -772,6 +828,10 @@ impl App {
                     pending_tx_sets = pending_tx_sets.len(),
                     tx_set_peers_exhausted,
                     auth_peer_count,
+                    ledgers_past_checkpoint,
+                    next_checkpoint = next_cp,
+                    archive_latest = ?archive_latest,
+                    archive_checkpoint_lag,
                     %herder_state,
                     %app_state,
                     "Recovery stall onset — diagnostic snapshot"
@@ -3898,6 +3958,103 @@ mod tests {
             attempts_before + 1,
             "handling the armed TriggerNextLedger event must trigger nomination \
              (timer-driven, not immediate)"
+        );
+    }
+
+    // ── checkpoint-phase onset diagnostics (#3902) ──────────────────────
+    //
+    // These cover the two pure helpers that feed the "Recovery stall onset —
+    // diagnostic snapshot" INFO line so the checkpoint-boundary phase-lock and
+    // the long/short duration split become queryable from live fields instead
+    // of a 306 h offline log reconstruction.
+
+    #[test]
+    fn test_ledgers_past_checkpoint_boundary_and_window() {
+        use super::ledgers_past_checkpoint;
+        // Real mainnet-shaped values from #3902: boundary 64066751, and the
+        // 340 s freeze at 64066755 sits at boundary+4. A checkpoint boundary
+        // ledger reports phase 0; each subsequent ledger increments by 1.
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_751),
+            0,
+            "checkpoint boundary ledger must report phase 0"
+        );
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_752),
+            1,
+            "boundary+1 must report phase 1"
+        );
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_755),
+            4,
+            "the 340 s freeze ledger sits at boundary+4 (issue's own value)"
+        );
+        assert_eq!(
+            ledgers_past_checkpoint(64_066_758),
+            7,
+            "boundary+7 is the far edge of the phase-lock band (0..=7)"
+        );
+    }
+
+    #[test]
+    fn test_ledgers_past_checkpoint_period_tracks_frequency() {
+        use super::ledgers_past_checkpoint;
+        use henyey_history::checkpoint::checkpoint_frequency;
+        // The phase must reset to 0 exactly every `checkpoint_frequency()`
+        // ledgers — proving the helper is coupled to the configured checkpoint
+        // cadence rather than a hardcoded `% 64`. Expressed symbolically in
+        // terms of the live frequency (mutating the process-global OnceLock
+        // from a unit test is unsafe — see deviation note).
+        let f = checkpoint_frequency();
+        assert_eq!(ledgers_past_checkpoint(f - 1), 0, "boundary ledger → 0");
+        assert_eq!(ledgers_past_checkpoint(f), 1, "boundary+1 → 1");
+        assert_eq!(
+            ledgers_past_checkpoint(2 * f - 1),
+            0,
+            "next boundary → 0 (period == checkpoint_frequency())"
+        );
+        assert_eq!(ledgers_past_checkpoint(2 * f), 1, "next boundary+1 → 1");
+    }
+
+    #[test]
+    fn test_ledgers_past_checkpoint_before_first_checkpoint() {
+        use super::ledgers_past_checkpoint;
+        use henyey_history::checkpoint::checkpoint_frequency;
+        // Before the first checkpoint boundary (seq < freq-1) there is no
+        // prior boundary; the helper returns the ledger itself with no panic
+        // or underflow.
+        let f = checkpoint_frequency();
+        assert_eq!(ledgers_past_checkpoint(0), 0, "genesis must not underflow");
+        assert_eq!(
+            ledgers_past_checkpoint(f - 2),
+            f - 2,
+            "one ledger before the first boundary reports the raw ledger"
+        );
+    }
+
+    #[test]
+    fn test_archive_checkpoint_lag_known_and_cold() {
+        use super::archive_checkpoint_lag;
+        // Archive one checkpoint behind the next boundary (the #3902 window:
+        // archive_latest=64066687 is exactly one checkpoint back from
+        // next_checkpoint=64066751) → positive lag.
+        assert_eq!(
+            archive_checkpoint_lag(64_066_751, Some(64_066_687)),
+            64,
+            "archive one checkpoint behind → +64"
+        );
+        // Archive ahead of the next boundary → negative lag (no wraparound).
+        assert_eq!(
+            archive_checkpoint_lag(64_066_751, Some(64_066_815)),
+            -64,
+            "archive ahead of next checkpoint → negative"
+        );
+        // Cache cold: archive latest unknown this tick → -1 sentinel, not a
+        // misleading 0.
+        assert_eq!(
+            archive_checkpoint_lag(64_066_751, None),
+            -1,
+            "cold cache → -1 sentinel"
         );
     }
 }
