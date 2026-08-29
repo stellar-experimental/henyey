@@ -34,17 +34,21 @@ set -u
 # cron runs with a minimal PATH (/usr/bin:/bin) that omits ~/.local/bin, where
 # the `claude` launcher lives (see monitor-watchdog.sh's 2026-07-22 incident).
 export PATH="/home/tomer/.local/bin:$PATH"
-CLAUDE_BIN="/home/tomer/.local/bin/claude"
 
-DATA=/home/tomer/data
-SESS="$DATA/project-loop"
-HIST="$SESS/tick-history.jsonl"
+# Paths/binaries are env-overridable (with the production values as defaults) so
+# tests can point them at a ~/data fixture; production behavior is unchanged.
+: "${CLAUDE_BIN:=/home/tomer/.local/bin/claude}"
+: "${DATA:=/home/tomer/data}"
+: "${SESS:=$DATA/project-loop}"
+: "${HIST:=$SESS/tick-history.jsonl}"
+: "${REMOTE:=https://github.com/stellar-experimental/henyey.git}"
 ALIVE="$SESS/.alive"
 LOCK="$DATA/project-loop-watchdog.lock"
 MARKER="$DATA/project-loop-watchdog.lastfire"
 LOG="$DATA/project-loop-watchdog.log"
+FAILSTREAK="$DATA/project-loop-watchdog.failstreak"
+CAP="$DATA/project-loop-watchdog.lastcapture"
 SCRATCH="$DATA/project-loop-watchdog-scratch"
-REMOTE="https://github.com/stellar-experimental/henyey.git"
 
 STALE_SECS=2700         # fire when last completed tick is older than 45 min
                         # (loop's own idle cadence widens to ~30 min; 1.5x that)
@@ -53,6 +57,12 @@ ALIVE_FRESH_SECS=1800   # skip if a tick STARTED within the last 30 min (in-flig
                         # generous to avoid double-dispatching a live session)
 REFIRE_COOLDOWN=1800    # never fire more than once per 30 min
 TICK_TIMEOUT=1800       # cap a headless tick at 30 min
+: "${ESCALATE_AFTER:=3}" # greppable escalation after N consecutive failed launches
+
+# Shared post-condition detection (#3780) — same classifier as monitor-watchdog.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/watchdog-postcondition.sh
+. "${WATCHDOG_LIB:-$SCRIPT_DIR/lib/watchdog-postcondition.sh}"
 
 # Serialize watchdog instances.
 exec 9>"$LOCK"
@@ -81,7 +91,10 @@ if [ -f "$MARKER" ]; then
   last_fire=$(cat "$MARKER" 2>/dev/null || echo 0)
   [ $(( now - last_fire )) -lt "$REFIRE_COOLDOWN" ] && exit 0
 fi
-printf '%s\n' "$now" > "$MARKER"
+# NOTE: the cooldown MARKER is intentionally NOT written here (#3780). It used
+# to be written pre-tick, so a launch that never ran a real tick (spend limit,
+# auth failure — both make `claude -p` exit 0) burned the full 30-min cooldown.
+# It is now written only after the post-condition confirms a real tick ran.
 
 # Keep the log bounded (~5 MB).
 if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 5242880 ]; then
@@ -99,11 +112,33 @@ if ! git clone --quiet --depth 1 "$REMOTE" "$SCRATCH" >> "$LOG" 2>&1; then
   exit 1
 fi
 
+# Capture the pre-tick row count and the invocation output, then classify the
+# outcome (#3780) — a new tick-history.jsonl row is the only true success signal.
+pre=$(watchdog_hist_count "$HIST")
+start=$(date -u +%s)
 cd "$SCRATCH" || exit 1
 timeout "$TICK_TIMEOUT" "$CLAUDE_BIN" --model claude-opus-4-8 --dangerously-skip-permissions \
-  -p '/project-tick' >> "$LOG" 2>&1
+  -p '/project-tick' > "$CAP" 2>&1
 rc=$?
-echo "$(date -u +%FT%TZ) watchdog: headless tick exit=$rc" >> "$LOG"
+dur=$(( $(date -u +%s) - start ))
+post=$(watchdog_hist_count "$HIST")
+cat "$CAP" >> "$LOG"   # preserve full diagnosability in the watchdog log
+outcome=$(watchdog_classify_outcome "$pre" "$post" "$dur" "$CAP")
+rm -f "$CAP"
+echo "$(date -u +%FT%TZ) watchdog: headless tick outcome=$outcome dur=${dur}s rows=$((post - pre)) exit=$rc" >> "$LOG"
+
+if [ "$outcome" = "success" ]; then
+  printf '%s\n' "$now" > "$MARKER"   # burn the cooldown only on a real tick
+  printf '0\n' > "$FAILSTREAK"
+else
+  fs=$(cat "$FAILSTREAK" 2>/dev/null || echo 0)
+  case "$fs" in ''|*[!0-9]*) fs=0 ;; esac
+  fs=$((fs + 1))
+  printf '%s\n' "$fs" > "$FAILSTREAK"
+  if [ "$fs" -ge "$ESCALATE_AFTER" ]; then
+    echo "$(date -u +%FT%TZ) watchdog: ESCALATION $fs consecutive failed launches (last outcome=$outcome) — project loop is dark and headless recovery is not working" >> "$LOG"
+  fi
+fi
 
 cd "$DATA" || true
 rm -rf "$SCRATCH"
