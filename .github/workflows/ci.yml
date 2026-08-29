@@ -181,6 +181,15 @@ jobs:
       - name: Run project-loop skill snippet harness
         run: bash scripts/test-project-loop-skill-snippets.sh
 
+  monitor-watchdog:
+    name: Monitor Watchdog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run monitor-watchdog decision + wrapper harness
+        run: bash scripts/test-monitor-watchdog.sh
+
   ssc-henyey-mixed-mission-scripts:
     name: Henyey Mixed-Image SSC Scripts
     runs-on: ubuntu-latest

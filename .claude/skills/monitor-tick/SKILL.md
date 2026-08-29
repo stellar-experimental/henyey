@@ -1341,6 +1341,20 @@ tracks node health, and this signal is not one.
    ```bash
    ARCHIVE_DIR="$HOME/data/$MONITOR_SESSION_ID/metrics/archive"
    mkdir -p "$ARCHIVE_DIR"
+
+   # Serialize this archive critical section against a concurrent HEADLESS
+   # tick launched by the crontab watchdog (scripts/monitor-watchdog.sh) on
+   # the shared whole-tick lock. Without it, an in-session tick and a
+   # watchdog-launched tick interleave their scrape->rotate->archive sequences
+   # and cross-contaminate a snapshot's current.prom/prev.prom + metadata.env
+   # (#3757 comment 5100384841 / #3789). The watchdog holds this same lock for
+   # its whole run, so if it is mid-flight this flock -w 30 may time out; when
+   # it does we SKIP writing this one snapshot and continue the tick — a missed
+   # snapshot is harmless, a corrupt one is not. Wrap ONLY this archive step
+   # (do NOT extend the lock over the status-comment/publish path — #3789).
+   TICK_LOCK="$HOME/data/monitor-tick.lock"
+   (
+   flock -w 30 8 || { echo "check-12 archive: tick lock busy after 30s — skipping this snapshot" >&2; exit 0; }
    TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
    SNAP_TMP="$ARCHIVE_DIR/${TIMESTAMP}.tmp"
    SNAP_FINAL="$ARCHIVE_DIR/${TIMESTAMP}"
@@ -1389,6 +1403,7 @@ tracks node health, and this signal is not one.
    # Clean up orphaned .tmp dirs from crashed prior ticks
    find "$ARCHIVE_DIR" -maxdepth 1 -name '*.tmp' -type d -mmin +5 \
      -exec rm -rf {} + 2>/dev/null || true
+   ) 8>"$TICK_LOCK"
    ```
 
 8. **Weekly alarm regression replay** — replay the archived metrics history
