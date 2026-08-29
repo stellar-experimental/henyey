@@ -1074,35 +1074,7 @@ impl App {
                 // from FetchingEnvelopes (both immediate-ready and deferred-ready).
                 // Parity: stellar-core PendingEnvelopes::envelopeReady().
                 Some(relay_env) = fetching_relay_rx.recv() => {
-                    let slot = relay_env.envelope.statement.slot_index;
-                    let received_at = relay_env.received_at;
-                    let ready_path = relay_env.ready_path;
-                    let relay_msg = StellarMessage::ScpMessage(relay_env.envelope);
-                    if let Some(overlay) = self.overlay().await {
-                        match overlay.broadcast(relay_msg).await {
-                            Ok(count) => {
-                                tracing::debug!(slot, peers = count, "Relayed SCP envelope");
-                                // Record receive-to-relay latency (#2648).
-                                // Only sample on successful broadcast to ≥1 peer.
-                                if count > 0 {
-                                    if let Some(t) = received_at {
-                                        let label = match ready_path {
-                                            henyey_herder::ReadyPath::Immediate => "immediate",
-                                            henyey_herder::ReadyPath::Deferred => "deferred",
-                                        };
-                                        metrics::histogram!(
-                                            "henyey_scp_receive_to_relay_seconds",
-                                            "path" => label
-                                        )
-                                        .record(t.elapsed().as_secs_f64());
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(slot, error = %e, "Failed to relay SCP envelope");
-                            }
-                        }
-                    }
+                    self.relay_ready_scp_envelope(relay_env).await;
                 }
 
                 // Process non-critical overlay messages (TX floods, etc.).
@@ -1725,6 +1697,57 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Relay a fetched-ready SCP envelope to peers — the sole relay path for
+    /// all SCP envelopes (both immediate-ready and deferred-ready), driven by
+    /// the `fetching_relay_rx` arm of the event loop.
+    ///
+    /// Parity: stellar-core `PendingEnvelopes::envelopeReady()`.
+    ///
+    /// Watchdog attribution (#3723): stamps `phase=3` ("broadcast") and a
+    /// phase-3 sub-phase around the two `.await` points, so the ~101 s freeze
+    /// class observed on 2026-07-12 is captured at its true location instead
+    /// of being misattributed to `phase=0 "waiting"` (the loop-top stamp).
+    /// `set_phase(3)` + `set_phase_sub(PHASE_3_1_OVERLAY_READ)` are stamped
+    /// before the overlay guard so even the overlay-unset path records the
+    /// broadcast phase. Behavior of the relay itself is unchanged.
+    async fn relay_ready_scp_envelope(&self, relay_env: henyey_herder::ScpRelayEnvelope) {
+        self.set_phase(3); // 3 = broadcast
+        let slot = relay_env.envelope.statement.slot_index;
+        let received_at = relay_env.received_at;
+        let ready_path = relay_env.ready_path;
+        let relay_msg = StellarMessage::ScpMessage(relay_env.envelope);
+        self.set_phase_sub(super::phase::PHASE_3_1_OVERLAY_READ);
+        if let Some(overlay) = self.overlay().await {
+            self.set_phase_sub(super::phase::PHASE_3_2_BROADCAST);
+            let broadcast_start = std::time::Instant::now();
+            let result = overlay.broadcast(relay_msg).await;
+            super::warn_if_slow(broadcast_start.elapsed(), "scp_relay_broadcast", 1);
+            match result {
+                Ok(count) => {
+                    tracing::debug!(slot, peers = count, "Relayed SCP envelope");
+                    // Record receive-to-relay latency (#2648).
+                    // Only sample on successful broadcast to ≥1 peer.
+                    if count > 0 {
+                        if let Some(t) = received_at {
+                            let label = match ready_path {
+                                henyey_herder::ReadyPath::Immediate => "immediate",
+                                henyey_herder::ReadyPath::Deferred => "deferred",
+                            };
+                            metrics::histogram!(
+                                "henyey_scp_receive_to_relay_seconds",
+                                "path" => label
+                            )
+                            .record(t.elapsed().as_secs_f64());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(slot, error = %e, "Failed to relay SCP envelope");
+                }
+            }
+        }
     }
 
     /// Dispatches the periodic known-peers refresh off the event-loop thread,
@@ -3630,6 +3653,48 @@ mod scp_dedup_pipeline_tests {
         // Second call: tombstone cleaned, re-inserts. No dedup rejection.
         app.pump_scp_intake(msg, &mut verified_rx).await;
         assert_eq!(app.scp_scheduled.dedup_count(), 0, "no dedup rejections");
+    }
+
+    /// Regression (#3723): relaying a ready SCP envelope must stamp the event
+    /// loop phase as 3 ("broadcast") with a non-zero phase-3 sub-phase.
+    ///
+    /// The 07-12 mainnet freeze (~101 s) happened in the relay-broadcast path,
+    /// but the deployed build's `phase=3 broadcast` stamp was later lost: the
+    /// generic SCP-relay arm broadcasts without any `set_phase` call, and the
+    /// loop top stamps `set_phase(0)` before every `select!`, so a freeze in
+    /// the relay path would be misattributed to `phase=0 "waiting"`. This test
+    /// pins the invariant "relaying a ready SCP envelope marks the loop phase=3
+    /// (broadcast)". It FAILS on `origin/main` (no `relay_ready_scp_envelope`,
+    /// phase stays 0).
+    ///
+    /// `set_phase(3)` and `set_phase_sub(PHASE_3_1_OVERLAY_READ)` are stamped
+    /// before the `if let Some(overlay)` guard, so the invariant holds even on
+    /// a fresh App whose overlay is unset (`None`).
+    #[tokio::test]
+    async fn test_relay_ready_scp_envelope_stamps_broadcast_phase() {
+        use henyey_herder::{ReadyPath, ScpRelayEnvelope};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-relay-phase.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Fresh App has no overlay wired, so relay_ready_scp_envelope returns
+        // early after stamping phase 3 + a phase-3 sub-phase.
+        assert!(app.overlay().await.is_none(), "fresh app has no overlay");
+
+        let relay_env = ScpRelayEnvelope {
+            envelope: make_test_envelope(100, 2_000_000_000),
+            received_at: None,
+            ready_path: ReadyPath::Immediate,
+        };
+        app.relay_ready_scp_envelope(relay_env).await;
+
+        let (phase, sub) = app.phase_snapshot_for_test();
+        assert_eq!(phase, 3, "relay path must stamp phase=3 (broadcast)");
+        assert_ne!(sub, 0, "relay path must stamp a non-zero phase-3 sub-phase");
     }
 
     /// #3625 (app-side consumer touch): when the SCP consumer drains a
