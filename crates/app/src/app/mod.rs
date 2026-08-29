@@ -4907,11 +4907,7 @@ impl WatchdogSnapshot {
     /// tiny abort thresholds (1–3), where integer `* 3 / 4` would round to 0
     /// (#3767).
     pub(crate) fn pre_abort_threshold_secs(&self) -> u64 {
-        if self.abort_threshold_secs > 0 {
-            (self.abort_threshold_secs * 3 / 4).max(1)
-        } else {
-            0
-        }
+        derive_pre_abort_threshold_secs(self.abort_threshold_secs)
     }
 
     /// Whether the event loop has been stale long enough to warrant a
@@ -4996,6 +4992,28 @@ pub(crate) fn pre_abort_edge(warned: &mut bool, should_warn: bool) -> bool {
     }
 }
 
+/// Derive the pre-abort near-miss threshold in seconds from the armed abort
+/// threshold: 0.75× floored at 1s, or 0 when auto-abort is disabled
+/// (`abort_threshold_secs == 0`). The `.max(1)` floor prevents a degenerate
+/// trip at `stale_secs == 0` for tiny abort thresholds (1–3) (#3767). Single
+/// source of truth for both the runtime tier
+/// ([`WatchdogSnapshot::pre_abort_threshold_secs`]) and the boot diagnostics
+/// line ([`emit_watchdog_started_line`]).
+const fn derive_pre_abort_threshold_secs(abort_threshold_secs: u64) -> u64 {
+    if abort_threshold_secs > 0 {
+        // Equivalent to `(abort_threshold_secs * 3 / 4).max(1)`, written without
+        // `Ord::max` because that is not yet const-stable.
+        let pre = abort_threshold_secs * 3 / 4;
+        if pre > 1 {
+            pre
+        } else {
+            1
+        }
+    } else {
+        0
+    }
+}
+
 /// Emit the boot-time INFO line recording every armed watchdog threshold.
 ///
 /// Extracted as a free fn (called from `start_event_loop_watchdog`) so the
@@ -5005,11 +5023,7 @@ pub(crate) fn pre_abort_edge(warned: &mut bool, should_warn: bool) -> bool {
 /// (0.75× floored at 1, or 0 when abort is disabled) so the boot line and the
 /// runtime tier cannot drift (#3767).
 pub(crate) fn emit_watchdog_started_line(abort_threshold_secs: u64) {
-    let pre_abort_threshold_secs = if abort_threshold_secs > 0 {
-        (abort_threshold_secs * 3 / 4).max(1)
-    } else {
-        0
-    };
+    let pre_abort_threshold_secs = derive_pre_abort_threshold_secs(abort_threshold_secs);
     tracing::info!(
         abort_threshold_secs,
         warn_threshold_secs = EVENT_LOOP_STALL_WARN_SECS,
@@ -9169,6 +9183,17 @@ mod tests {
             snap.should_warn_pre_abort(),
             "stale=1 at floored pre-abort=1 must trip"
         );
+    }
+
+    /// Pin the single-source-of-truth pre-abort derivation directly, so both
+    /// the runtime tier and the boot diagnostics line cannot drift (#3767,
+    /// #3912).
+    #[test]
+    fn derive_pre_abort_threshold_secs_formula() {
+        assert_eq!(super::derive_pre_abort_threshold_secs(120), 90);
+        assert_eq!(super::derive_pre_abort_threshold_secs(0), 0);
+        assert_eq!(super::derive_pre_abort_threshold_secs(1), 1);
+        assert_eq!(super::derive_pre_abort_threshold_secs(2), 1);
     }
 
     /// The pure `pre_abort_edge` helper fires exactly once per stall episode
