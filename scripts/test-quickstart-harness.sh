@@ -1970,6 +1970,196 @@ EOF
 }
 
 # ============================================================
+# Test 31: test_testnet_hang_watchdog_unwedges_step_before_job_cancel
+#
+# Regression for #3768. The #3286 watchdog only writes a process dump; it does
+# NOT unwedge the hung "Run probes through wrapper" step, so on the ~55-min
+# recurrence the step never reaches a terminal conclusion and the 45-min JOB
+# wall-clock *cancels* it — which loses the log blob, discards the watchdog
+# dump (upload was gated on if: failure()), and disables the auto-retry.
+#
+# The fix adds a bounded ESCALATION phase to the watchdog: after writing the
+# dump it sleeps WATCHDOG_ESCALATE_DELAY, then `timeout 30 docker kill
+# <container>` (the probe blocks on I/O against the container, so killing it
+# makes `go run` error out and return) plus a belt-and-suspenders
+# `pkill -9 -f <WATCHDOG_PROC_PATTERN>` — each `|| true`. That unblocks the
+# foreground probe, the wrapper returns, and the step reaches a terminal
+# conclusion WELL before the job cancel.
+#
+# This test drives the watchdog directly with tight timers (WATCHDOG_DELAY=1,
+# WATCHDOG_ESCALATE_DELAY=1, container `quickstart`) and a UNIQUE-marker
+# WATCHDOG_PROC_PATTERN, a fake `docker` on PATH that logs its argv, and a hung
+# foreground "probe" (argv[0]=marker via `exec -a`, per the Test 30/28 pattern)
+# run under an OUTER timeout that stands in for the 45-min job cancel and is set
+# comfortably LONGER than the escalation. It asserts:
+#   (a) the dump is written,
+#   (b) the fake docker log records `kill quickstart` (the escalation fired),
+#   (c) the hung marked probe is killed by the escalation, so the step body
+#       returns on its own (outer rc != 124) BEFORE the outer job-cancel timeout.
+# FAILS on origin/main: there is no escalation phase there, so (b) never logs a
+# docker kill and (c) runs to the outer timeout (rc 124). PASSES after the fix.
+# ============================================================
+test_testnet_hang_watchdog_unwedges_step_before_job_cancel() {
+    local watchdog="$REPO_ROOT/scripts/ci/quickstart-hang-watchdog.sh"
+    if [[ ! -f "$watchdog" ]]; then
+        tap_not_ok "unwedge_watchdog_script_exists" "scripts/ci/quickstart-hang-watchdog.sh not found"
+        tap_not_ok "unwedge_dump_written" "watchdog script missing"
+        tap_not_ok "unwedge_docker_kill_issued" "watchdog script missing"
+        tap_not_ok "unwedge_step_returns_before_job_cancel" "watchdog script missing"
+        return
+    fi
+    tap_ok "unwedge_watchdog_script_exists"
+
+    local diag_dir="$TMPDIR_BASE/diag-test31"
+    mkdir -p "$diag_dir"
+    local out_dir="$diag_dir/testnet-hang-watchdog"
+
+    # Unique sentinel so the escalation's pkill only ever kills THIS test's hung
+    # probe, never an unrelated process on a shared CI runner (Critic A).
+    local marker="qs-unwedge-test31-$$-${RANDOM}"
+
+    # Reap any leftovers from this test on function return, scoped to the marker.
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    # Fake `docker` first on PATH: logs its argv so the test can confirm the
+    # escalation issued `docker kill quickstart`, then returns immediately.
+    local fakebin="$TMPDIR_BASE/fakebin-test31"
+    mkdir -p "$fakebin"
+    local docker_log="$TMPDIR_BASE/docker-log-test31.txt"
+    cat > "$fakebin/docker" <<EOF
+#!/bin/bash
+echo "\$*" >> "$docker_log"
+exit 0
+EOF
+    chmod +x "$fakebin/docker"
+
+    # Simulated step body: capture STEP_PID, launch the watchdog with TIGHT
+    # timers + the marker-scoped kill pattern + container `quickstart`, then
+    # `exec` into a hung foreground "probe" tagged with the unique marker in
+    # argv[0] (a bare `sleep 30 "$marker"` would treat the marker as a second
+    # time arg and exit immediately, so it must go in argv[0] via `exec -a`).
+    local step_body="$TMPDIR_BASE/stepbody-test31.sh"
+    cat > "$step_body" <<EOF
+#!/usr/bin/env bash
+set -u
+STEP_PID=\$\$
+WATCHDOG_DELAY=1 WATCHDOG_ESCALATE_DELAY=1 WATCHDOG_PROC_PATTERN='$marker' \\
+  PATH="$fakebin:\$PATH" bash "$watchdog" "$out_dir" "\$STEP_PID" quickstart &
+exec -a "$marker" sleep 30
+EOF
+    chmod +x "$step_body"
+
+    # OUTER timeout = stand-in for the 45-min job cancel. It fires at 8s, well
+    # AFTER the escalation (dump at ~1s + escalate delay 1s -> ~2s), so on the
+    # FIXED watchdog the escalation kills the hung probe and the step returns
+    # (~2s) long before this fires. On UNFIXED main the probe sleeps 30s and
+    # only this outer timeout ends it (rc 124).
+    local start_epoch end_epoch elapsed outer_rc=0
+    start_epoch=$(date +%s)
+    timeout -k 2s 8 bash "$step_body" >/dev/null 2>&1 || outer_rc=$?
+    end_epoch=$(date +%s)
+    elapsed=$((end_epoch - start_epoch))
+
+    # Let the backgrounded watchdog's dump write + docker-kill log settle.
+    local waited=0
+    while [[ ! -s "$docker_log" && $waited -lt 5 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # (a) The dump was written.
+    if [[ -s "$out_dir/dump.txt" ]]; then
+        tap_ok "unwedge_dump_written"
+    else
+        tap_not_ok "unwedge_dump_written" \
+            "expected non-empty $out_dir/dump.txt"
+    fi
+
+    # (b) The escalation issued `docker kill quickstart`.
+    if grep -q 'kill quickstart' "$docker_log" 2>/dev/null; then
+        tap_ok "unwedge_docker_kill_issued"
+    else
+        tap_not_ok "unwedge_docker_kill_issued" \
+            "fake docker log did not record 'kill quickstart' (log: $(tr '\n' ' ' < "$docker_log" 2>/dev/null))"
+    fi
+
+    # (c) The escalation unwedged the step: the step body returned on its own
+    # (rc != 124, i.e. NOT killed by the outer job-cancel timeout) and did so
+    # before the outer timeout would have fired.
+    if [[ $outer_rc -ne 124 && $elapsed -lt 8 ]]; then
+        tap_ok "unwedge_step_returns_before_job_cancel"
+    else
+        tap_not_ok "unwedge_step_returns_before_job_cancel" \
+            "step not unwedged: outer_rc=$outer_rc elapsed=${elapsed}s (rc 124 / elapsed>=8 == ran to the job-cancel timeout)"
+    fi
+
+    # Reap the hung probe explicitly via the unique marker (the RETURN trap also
+    # covers this, belt-and-suspenders).
+    pkill -f "$marker" 2>/dev/null || true
+}
+
+# ============================================================
+# Test 32: test_quickstart_diagnostics_upload_runs_always
+#
+# Regression for #3768 (harm #2: the watchdog dump was discarded). The "Upload
+# diagnostics" step was gated on `if: failure() || cancelled()`, so on the
+# intended terminal disposition of a wedged testnet shard — a NEUTRAL GREEN
+# soft-skip (#3272) — the upload never ran and the dump was thrown away. The fix
+# switches that gate to `if: always()` (a strict superset) so the dump and
+# soft-skip diagnostics are retained on the green path AND on any residual
+# failure/cancel.
+#
+# This is a STATIC assertion scoped to the "Upload diagnostics" step block by
+# step name — NOT a file-wide grep, since the `Cleanup` step already carries
+# `if: always()` and a file-wide grep would false-pass on main. It asserts the
+# step's rendered `if:` is `always()` and is no longer `failure() || cancelled()`.
+# FAILS on origin/main, where the step is `failure() || cancelled()`.
+# ============================================================
+test_quickstart_diagnostics_upload_runs_always() {
+    if [[ ! -f "$WORKFLOW" ]]; then
+        tap_not_ok "upload_diagnostics_if_is_always" "workflow not found"
+        tap_not_ok "upload_diagnostics_if_not_failure_or_cancelled" "workflow not found"
+        return
+    fi
+
+    # Extract the "Upload diagnostics" step block: from its `- name:` line up to
+    # (but excluding) the next `- name:` line. The `if:` we assert on is this
+    # step's, not the neighbouring Cleanup step's.
+    local block
+    block=$(awk '
+        /^      - name: Upload diagnostics/ {f=1; print; next}
+        f && /^      - name: / {exit}
+        f {print}
+    ' "$WORKFLOW")
+
+    if [[ -z "$block" ]]; then
+        tap_not_ok "upload_diagnostics_if_is_always" "Upload diagnostics step block not found"
+        tap_not_ok "upload_diagnostics_if_not_failure_or_cancelled" "Upload diagnostics step block not found"
+        return
+    fi
+
+    local if_line
+    if_line=$(echo "$block" | grep -E '^[[:space:]]*if:' | head -1)
+
+    # (a) The step's `if:` renders always().
+    if echo "$if_line" | grep -q 'always()'; then
+        tap_ok "upload_diagnostics_if_is_always"
+    else
+        tap_not_ok "upload_diagnostics_if_is_always" \
+            "expected the Upload diagnostics step's if: to be always(), got: '${if_line}'"
+    fi
+
+    # (b) The step's `if:` is no longer the old failure()||cancelled() gate.
+    if echo "$if_line" | grep -qE 'failure\(\)|cancelled\(\)'; then
+        tap_not_ok "upload_diagnostics_if_not_failure_or_cancelled" \
+            "Upload diagnostics step still gated on failure()/cancelled(): '${if_line}'"
+    else
+        tap_ok "upload_diagnostics_if_not_failure_or_cancelled"
+    fi
+}
+
+# ============================================================
 # Test: regression for #3835 — extract_pubnet_matrix_block must not SIGPIPE
 #
 # The harness runs under `set -euo pipefail`. A `producer-streams-file |
@@ -2029,7 +2219,7 @@ test_pubnet_block_extraction_byte_identical_to_original_shape() {
 }
 
 # --- Run all tests ---
-tap_plan 103
+tap_plan 109
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -2062,6 +2252,8 @@ test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
 test_testnet_hang_watchdog_emits_process_dump_before_step_kill
 test_testnet_shard_renders_step_timeout_25_others_360
 test_capture_diagnostics_docker_calls_are_time_bounded
+test_testnet_hang_watchdog_unwedges_step_before_job_cancel
+test_quickstart_diagnostics_upload_runs_always
 test_pubnet_block_extraction_no_sigpipe_on_oversized_workflow
 test_pubnet_block_extraction_byte_identical_to_original_shape
 
