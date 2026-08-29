@@ -31,9 +31,9 @@
 //!   `MAX_UNAUTH_MESSAGE_SIZE = 0x1000`.
 
 use crate::{OverlayError, Result};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use stellar_xdr::{AuthenticatedMessage, Limits, ReadXdr, WriteXdr};
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::codec::Decoder;
 
 /// Maximum message size (16 MB) - prevents memory exhaustion.
 /// Spec: OVERLAY_SPEC §3.3 — MAX_MESSAGE_SIZE = 16,777,216 bytes.
@@ -48,11 +48,10 @@ const MIN_MESSAGE_SIZE: usize = 12;
 
 /// Rejects an outbound XDR payload whose length exceeds `MAX_MESSAGE_SIZE`.
 ///
-/// This is the single enforcement point for the encode-side size bound, shared
-/// by the real send-path encoder (`MessageCodec::encode_message`) and the
-/// `Encoder` trait impl. Keeping one implementation prevents the two paths from
-/// silently diverging again (see #3774). Mirrors the receive-side rejection in
-/// `Decoder::decode` and stellar-core's `TCPPeer.cpp:690-701`.
+/// This is the single enforcement point for the encode-side size bound, called
+/// from the real send-path encoder (`MessageCodec::encode_message`). Mirrors the
+/// receive-side rejection in `Decoder::decode` and stellar-core's
+/// `TCPPeer.cpp:690-701`.
 fn check_encode_size(xdr_len: usize) -> Result<()> {
     if xdr_len > MAX_MESSAGE_SIZE {
         return Err(OverlayError::Message(format!(
@@ -97,8 +96,9 @@ impl MessageFrame {
 
 /// Codec for encoding and decoding Stellar overlay messages.
 ///
-/// Implements tokio's `Encoder` and `Decoder` traits for use with framed
-/// TCP streams. Handles the length-prefixed framing protocol automatically.
+/// Implements tokio's `Decoder` trait for use with framed TCP streams, and
+/// provides [`MessageCodec::encode_message`] for the send path. Handles the
+/// length-prefixed framing protocol automatically.
 ///
 /// # Usage
 ///
@@ -265,29 +265,6 @@ impl Decoder for MessageCodec {
                 }
             }
         }
-    }
-}
-
-impl Encoder<AuthenticatedMessage> for MessageCodec {
-    type Error = OverlayError;
-
-    fn encode(&mut self, message: AuthenticatedMessage, dst: &mut BytesMut) -> Result<()> {
-        // Encode to XDR
-        let xdr_bytes = message.to_xdr(Limits::none())?;
-
-        // Check size (shared with the real send-path encoder, `encode_message`).
-        check_encode_size(xdr_bytes.len())?;
-
-        // Write XDR record-marking prefix. Bit 31 is the final-fragment bit,
-        // not an authentication marker.
-        let len = xdr_bytes.len() as u32;
-        dst.reserve(4 + xdr_bytes.len());
-        dst.put_u32(len | 0x80000000);
-
-        // Write message body
-        dst.extend_from_slice(&xdr_bytes);
-
-        Ok(())
     }
 }
 
@@ -508,7 +485,7 @@ mod tests {
             message: StellarMessage::Peers(VecM::default()),
             mac: HmacSha256Mac { mac: [42u8; 32] },
         });
-        codec.encode(auth_msg, &mut buf).unwrap();
+        buf.extend_from_slice(&MessageCodec::encode_message(&auth_msg).unwrap());
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert!(
             frame.is_last_fragment,
@@ -521,7 +498,7 @@ mod tests {
             message: StellarMessage::Hello(Default::default()),
             mac: HmacSha256Mac { mac: [0u8; 32] },
         });
-        codec.encode(hello_msg, &mut buf).unwrap();
+        buf.extend_from_slice(&MessageCodec::encode_message(&hello_msg).unwrap());
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert!(
             frame.is_last_fragment,
@@ -601,7 +578,7 @@ mod tests {
         let mut buf = BytesMut::new();
 
         // Encode
-        codec.encode(msg, &mut buf).unwrap();
+        buf.extend_from_slice(&MessageCodec::encode_message(&msg).unwrap());
 
         // Decode
         let decoded = codec.decode(&mut buf).unwrap();
