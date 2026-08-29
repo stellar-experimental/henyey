@@ -12,10 +12,20 @@
 #     SIGTERM → SIGKILL (default: 30s). Load-bearing (#3273): the upstream
 #     `go run` probe ignores SIGTERM, so without a kill-after grace `timeout`
 #     blocks in wait() forever and the CI step hangs instead of timing out.
+#   STEP_BUDGET_SECONDS / STEP_START_EPOCH — the GitHub STEP's total
+#     `timeout-minutes` budget (in seconds) and the epoch second at which the
+#     step began. Set by .github/workflows/quickstart.yml. When BOTH are present
+#     AND --soft-on-timeout is on, the wrapper schedules attempts against the
+#     REMAINING step budget (#3768) instead of blindly starting an attempt the
+#     step cap will kill mid-flight. Unset ⇒ mechanism inert, behaviour
+#     byte-identical. See the "Budget-aware scheduling" block below.
+#   BUDGET_MARGIN_SECONDS (default 60) / BUDGET_MIN_ATTEMPT_SECONDS (default 15)
+#     — tuning knobs for the above.
 #
 # Exit codes:
 #   0 — probe passed (possibly after one retry), OR a timeout (exit 124) was
-#       soft-skipped under --soft-on-timeout (see below)
+#       soft-skipped under --soft-on-timeout (see below), OR the step budget was
+#       exhausted before an attempt could be started (BUDGET-EXHAUSTED, #3768)
 #   1 — probe failed (non-timeout, or second timeout on retryable shard)
 #   2 — usage error
 #
@@ -101,6 +111,32 @@ DIAGNOSTICS_DIR=""
 SOFT_ON_TIMEOUT=false
 PROBE_CMD=()
 
+# --- Step-budget awareness (#3768) ---
+# Set by .github/workflows/quickstart.yml from the step's own `timeout-minutes`
+# and the step's start time. When BOTH are set AND --soft-on-timeout is on, the
+# wrapper knows how much of the GitHub STEP budget is left and will not start an
+# attempt that provably cannot finish inside it. See budget_plan_attempt() for
+# the full rationale. When either is unset/non-numeric the whole mechanism is
+# inert and behaviour is byte-identical to before (every non-testnet shard, and
+# every direct/manual invocation).
+STEP_BUDGET_SECONDS="${STEP_BUDGET_SECONDS:-}"
+STEP_START_EPOCH="${STEP_START_EPOCH:-}"
+# Seconds reserved at the end of the step budget for the post-probe work the
+# wrapper still has to do (capture_diagnostics + the workflow's remaining loop
+# iterations). Calibrated from run 31745517379, where diagnostics capture after
+# a 124 took 15s (23:15:07 timeout → 23:15:22 diagnostics written); 60s is 4x
+# that, and is the margin BELOW which no new attempt may be started.
+BUDGET_MARGIN_SECONDS="${BUDGET_MARGIN_SECONDS:-60}"
+# Floor: with less usable budget than this we do not start an attempt at all.
+# Above it we still run the probe (at a capped timeout) so a genuine assertion
+# failure — which exits in well under a second — is still OBSERVED and stays RED.
+BUDGET_MIN_ATTEMPT_SECONDS="${BUDGET_MIN_ATTEMPT_SECONDS:-15}"
+# Per-attempt budget actually handed to GNU `timeout`. Equal to $TIMEOUT unless
+# the remaining step budget forces a cap (see budget_plan_attempt).
+ATTEMPT_TIMEOUT=""
+# Usable seconds remaining at the moment a budget skip was decided (for the log).
+BUDGET_REMAINING_AT_SKIP=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --network) NETWORK="$2"; shift 2 ;;
@@ -121,6 +157,8 @@ fi
 
 DIAGNOSTICS_DIR="${DIAGNOSTICS_DIR:-/tmp/quickstart-diagnostics/$NETWORK-$ENABLE-$PROBE}"
 mkdir -p "$DIAGNOSTICS_DIR"
+
+ATTEMPT_TIMEOUT="$TIMEOUT"
 
 # --- Helper: is this the retryable shard? ---
 # The testnet/core,horizon shard is the known slow-startup shard (#2916/#3185):
@@ -186,6 +224,106 @@ emit_soft_skip() {
     echo "=== SOFT-SKIP: $NETWORK/$ENABLE/$PROBE exit $soft_skip_exit treated as neutral (#3272); diagnostics preserved ===" >&2
 }
 
+# --- Budget-aware scheduling (#3768) -------------------------------------
+#
+# WHY. The soft-skip above can only classify an outcome the wrapper actually
+# OBSERVES. A GitHub *step-level* `timeout-minutes` kill is invisible to it: the
+# runner kills the step and marks the job RED with no exit code for the wrapper
+# to soft-skip. Run 31745517379 died exactly this way — every probe disposition
+# in it was `exit 124` on a `--soft-on-timeout` shard (i.e. the exact
+# environmental class #3272 exists to neutralise), but `horizon-core-up` burned
+# 19m33s of the 25-minute step budget, leaving `horizon-ingesting` attempt 2
+# about 45 seconds. The step cap fired mid-attempt and converted a run that
+# should have been neutral-green into a hard RED.
+#
+# WHAT. Before starting an attempt, compare the REMAINING step budget with the
+# per-probe timeout:
+#   * usable = step_start + step_budget - now - BUDGET_MARGIN_SECONDS
+#   * usable < BUDGET_MIN_ATTEMPT_SECONDS  → do not start an attempt at all;
+#     the caller emits the BUDGET-EXHAUSTED soft-skip and exits 0 (neutral).
+#   * BUDGET_MIN_ATTEMPT_SECONDS <= usable < TIMEOUT → still RUN the attempt,
+#     but CAP its `timeout` at `usable` so it cannot overrun the step cap.
+#   * usable >= TIMEOUT → run at the full per-probe budget (unchanged).
+#
+# The middle branch is deliberate and is what keeps the safety contract intact:
+# a genuine probe assertion failure exits in well under a second, so it is still
+# OBSERVED and still propagates as RED even when the budget is tight. Only when
+# there is effectively no budget left at all do we skip without running — and in
+# that situation the alternative is not "we see the failure", it is "the step
+# cap kills us and we see nothing at all".
+#
+# SCOPE. Everything here is gated on SOFT_ON_TIMEOUT (the testnet shard only)
+# AND on both budget env vars being present and numeric. Every other shard /
+# caller never enters any of these branches, so their behaviour — including a
+# genuine `go` exit 1 staying RED — is byte-identical to before.
+#
+# NOT a timer loosening: no timeout is raised anywhere. #3273 (`-k`) and #3287
+# (redirect) already showed that loosening/redirecting timers does not fix this.
+budget_enabled() {
+    [[ "$SOFT_ON_TIMEOUT" == true ]] || return 1
+    [[ "$STEP_BUDGET_SECONDS" =~ ^[0-9]+$ ]] || return 1
+    [[ "$STEP_START_EPOCH" =~ ^[0-9]+$ ]] || return 1
+    return 0
+}
+
+# Usable seconds left in the step budget after reserving BUDGET_MARGIN_SECONDS
+# for the wrapper's own post-probe work (diagnostics capture, remaining loop).
+# May be negative when the budget is already blown.
+budget_usable_seconds() {
+    local now
+    now="$(date -u +%s)"
+    echo $(( STEP_START_EPOCH + STEP_BUDGET_SECONDS - now - BUDGET_MARGIN_SECONDS ))
+}
+
+# budget_plan_attempt
+# Sets ATTEMPT_TIMEOUT for the next attempt.
+# Returns 0 → start the attempt with ATTEMPT_TIMEOUT.
+# Returns 1 → budget exhausted, do NOT start an attempt (BUDGET_REMAINING_AT_SKIP
+#             holds the usable seconds for the log).
+budget_plan_attempt() {
+    ATTEMPT_TIMEOUT="$TIMEOUT"
+    budget_enabled || return 0
+
+    local usable
+    usable="$(budget_usable_seconds)"
+
+    if [[ "$usable" -lt "$BUDGET_MIN_ATTEMPT_SECONDS" ]]; then
+        BUDGET_REMAINING_AT_SKIP="$usable"
+        return 1
+    fi
+
+    if [[ "$usable" -lt "$TIMEOUT" ]]; then
+        ATTEMPT_TIMEOUT="$usable"
+        echo "=== Step budget short: capping this attempt at ${ATTEMPT_TIMEOUT}s (per-probe budget ${TIMEOUT}s) so it cannot overrun the step cap (#3768) ===" >&2
+    fi
+    return 0
+}
+
+# Emit the grep-able SOFT-SKIP marker for a BUDGET-EXHAUSTED skip. Keeps the
+# stable `SOFT-SKIP` prefix that downstream log-scraping greps for, and adds the
+# distinct `BUDGET-EXHAUSTED` token so triage can never confuse it with a
+# genuine probe timeout (exit 124/137), which carries `exit <code>` instead.
+emit_budget_skip() {
+    local usable="$1"
+    local attempt="$2"
+    echo "=== SOFT-SKIP: BUDGET-EXHAUSTED — not enough step budget left to run attempt $attempt (environmental, not a henyey failure) ===" >&2
+    echo "=== SOFT-SKIP: BUDGET-EXHAUSTED $NETWORK/$ENABLE/$PROBE — ${usable}s usable of the ${STEP_BUDGET_SECONDS}s step budget (per-probe timeout ${TIMEOUT}s, reserve ${BUDGET_MARGIN_SECONDS}s, floor ${BUDGET_MIN_ATTEMPT_SECONDS}s); NO probe attempt started, treated as neutral (#3768) ===" >&2
+    # Leave a breadcrumb in the uploaded diagnostics artifact so the skip is
+    # observable outside the job log.
+    {
+        echo "budget-exhausted soft-skip (#3768)"
+        echo "when (UTC):            $(date -u 2>/dev/null || true)"
+        echo "shard/probe:           $NETWORK/$ENABLE/$PROBE"
+        echo "attempt not started:   $attempt"
+        echo "usable seconds left:   $usable"
+        echo "step budget seconds:   $STEP_BUDGET_SECONDS"
+        echo "step start epoch:      $STEP_START_EPOCH"
+        echo "per-probe timeout:     $TIMEOUT"
+        echo "reserve margin:        $BUDGET_MARGIN_SECONDS"
+        echo "min attempt floor:     $BUDGET_MIN_ATTEMPT_SECONDS"
+    } > "$DIAGNOSTICS_DIR/budget-skip.txt" 2>/dev/null || true
+}
+
 # --- Helper: capture diagnostics ---
 capture_diagnostics() {
     local attempt="$1"
@@ -233,7 +371,11 @@ run_probe() {
     local exit_code=0
 
     echo "=== Attempt $attempt: $PROBE ($NETWORK/$ENABLE) ===" >&2
-    echo "Command: timeout -k ${KILL_GRACE} ${TIMEOUT}s ${PROBE_CMD[*]}" >&2
+    # ATTEMPT_TIMEOUT is $TIMEOUT unless budget_plan_attempt capped it because
+    # the remaining STEP budget is shorter than the per-probe budget (#3768).
+    # With the budget mechanism inert (every non-testnet shard / any caller that
+    # does not set the budget env) it is always exactly $TIMEOUT.
+    echo "Command: timeout -k ${KILL_GRACE} ${ATTEMPT_TIMEOUT}s ${PROBE_CMD[*]}" >&2
 
     # Use PIPESTATUS[0] to capture the timeout exit code, not the tee exit.
     #
@@ -258,7 +400,7 @@ run_probe() {
     # (see should_soft_skip_timeout). A genuine probe assertion failure exits
     # with its own (non-124, non-137) code, propagated unchanged, and stays red.
     set +o pipefail
-    timeout -k "$KILL_GRACE" "$TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log"
+    timeout -k "$KILL_GRACE" "$ATTEMPT_TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log"
     exit_code=${PIPESTATUS[0]}
     set -o pipefail
 
@@ -270,6 +412,17 @@ run_probe() {
 }
 
 # --- Main execution ---
+# Budget gate BEFORE attempt 1 (#3768). If the previous probes in this step have
+# already eaten the step budget, starting an attempt here provably cannot
+# complete — the GitHub step cap would kill it mid-flight and turn a shard whose
+# timeouts are explicitly non-gating into a hard RED. Emit the neutral
+# BUDGET-EXHAUSTED soft-skip instead. Inert unless --soft-on-timeout AND the
+# budget env vars are set (see budget_plan_attempt).
+if ! budget_plan_attempt; then
+    emit_budget_skip "$BUDGET_REMAINING_AT_SKIP" 1
+    exit 0
+fi
+
 EXIT_CODE=0
 run_probe 1 || EXIT_CODE=$?
 
@@ -282,6 +435,22 @@ if is_retryable_exit "$EXIT_CODE" && is_retryable_shard; then
     # Transient-infra failure (timeout 124 / runner-shutdown 143) on the
     # known-flaky shard — retry once under the same per-attempt budget.
     echo "=== Transient-infra failure (exit $EXIT_CODE) on retryable shard ($NETWORK/$ENABLE/$PROBE), retrying ===" >&2
+
+    # Budget gate BEFORE the retry (#3768). Same reasoning as the pre-attempt-1
+    # gate, with one extra guard: we only convert to a neutral skip when the
+    # disposition we ALREADY observed is itself soft-skippable (124/137). For
+    # any other retryable-but-not-soft-skippable exit (143 — runner SIGTERM,
+    # which today stays RED after a double failure) we deliberately do NOT
+    # widen the soft-skip: we fall through and retry at the full budget exactly
+    # as before, so that contract is untouched.
+    if ! budget_plan_attempt; then
+        if should_soft_skip_timeout "$EXIT_CODE"; then
+            emit_budget_skip "$BUDGET_REMAINING_AT_SKIP" 2
+            exit 0
+        fi
+        ATTEMPT_TIMEOUT="$TIMEOUT"
+    fi
+
     EXIT_CODE=0
     run_probe 2 || EXIT_CODE=$?
 
