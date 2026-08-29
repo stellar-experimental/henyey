@@ -83,21 +83,17 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
     // Open database to get current state
     let db = henyey_db::Database::open(&config.database.path)?;
 
-    // #3812: remove any ahead-of-LCL history rows left by an interrupted catchup
-    // before anchoring on MAX(ledgerseq), so we publish only complete checkpoints
-    // at or below the durable LCL (mirrors stellar-core CheckpointBuilder::cleanup).
-    if let Some(deleted) = db.cleanup_ahead_of_lcl()? {
-        if deleted > 0 {
-            println!(
-                "Removed {} ahead-of-LCL history row(s) left by an interrupted catchup",
-                deleted
-            );
-        }
-    }
-
-    // Get current ledger from database
+    // #3870: publish-history is a read-only path and MUST NOT mutate history.
+    // It takes no single-instance lock, so it can run concurrently with a
+    // catchup that has legitimately persisted ahead-of-LCL rows (#3827);
+    // deleting them here (the pre-#3870 behavior) would leave a permanent
+    // history hole once catchup advances the LCL. Instead, anchor publishing at
+    // the durable LCL (falling back to MAX(ledgerseq) only when no durable LCL
+    // exists yet) so only complete checkpoints at or below the LCL are
+    // considered — matching stellar-core CheckpointBuilder, which publishes from
+    // LCL-durable state, never ahead-of-LCL rows.
     let current_ledger = db
-        .get_latest_ledger_seq()?
+        .durable_read_anchor()?
         .ok_or_else(|| anyhow::anyhow!("No ledger data in database. Run the node first."))?;
 
     println!("Current ledger in database: {}", current_ledger);

@@ -244,6 +244,39 @@ impl Database {
         })
     }
 
+    /// Returns the ledger sequence an offline reader should anchor its queries
+    /// at: the durable last-closed-ledger when present, else `MAX(ledgerseq)`.
+    ///
+    /// This is the **read-only, non-mutating** counterpart to
+    /// [`Database::cleanup_ahead_of_lcl`]. Offline CLI readers (`self-check`,
+    /// `publish-history`) must never *observe* ahead-of-LCL history rows left by
+    /// an in-flight catchup (#3827), but — unlike node startup — they run with no
+    /// single-instance guard and must not *delete* them either: a concurrent
+    /// catchup persists those rows precisely because they are legitimately ahead
+    /// of the LCL at that moment, and deleting them creates a permanent history
+    /// hole once catchup advances the LCL past them (#3870).
+    ///
+    /// Anchoring at the durable LCL bounds every read at or below authoritative
+    /// state without touching the database. `LCL <= MAX(ledgerseq)` always holds
+    /// when an LCL is present (its header row is durably stored), so the anchor
+    /// is a safe lower bound.
+    ///
+    /// Return semantics mirror `cleanup_ahead_of_lcl`'s two branches:
+    /// - `Some(lcl)` when a durable LCL exists.
+    /// - `Some(max_seq)` when there is no durable LCL yet but ledgers exist
+    ///   (fresh/legacy DB — same fallback as `cleanup_ahead_of_lcl`'s `None`
+    ///   case, which leaves `MAX(ledgerseq)` as the effective anchor).
+    /// - `None` for an empty database.
+    pub fn durable_read_anchor(&self) -> Result<Option<u32>> {
+        self.with_connection(|conn| {
+            use queries::{LedgerQueries, StateQueries};
+            match conn.get_last_closed_ledger()? {
+                Some(lcl) => Ok(Some(lcl)),
+                None => conn.get_latest_ledger_seq(),
+            }
+        })
+    }
+
     /// Returns the stored network passphrase, if set.
     ///
     /// The network passphrase identifies the Stellar network (mainnet, testnet, etc.)
@@ -384,6 +417,71 @@ mod tests {
 
         assert_eq!(db.cleanup_ahead_of_lcl().unwrap(), None);
         assert_eq!(db.get_latest_ledger_seq().unwrap(), Some(5));
+    }
+
+    /// Helper: insert `ledgerheaders` rows for seqs `1..=max_seq`.
+    #[cfg(test)]
+    fn seed_headers(db: &Database, max_seq: u32) {
+        db.with_connection(|conn| {
+            for seq in 1..=max_seq {
+                conn.execute(
+                    "INSERT INTO ledgerheaders \
+                     (ledgerhash, prevhash, bucketlisthash, ledgerseq, closetime, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        format!("h{seq}"),
+                        format!("p{seq}"),
+                        format!("b{seq}"),
+                        seq,
+                        0i64,
+                        vec![0u8]
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// #3870: `durable_read_anchor` must return the durable LCL when present AND
+    /// must NOT mutate the database — rows above the LCL stay intact (proving the
+    /// offline CLI readers can anchor at the LCL without deleting ahead-of-LCL
+    /// rows). This is the shared contract both CLI paths now rely on. FAILS on
+    /// origin/main: the method does not exist.
+    #[test]
+    fn test_durable_read_anchor_returns_lcl_and_preserves_rows() {
+        use crate::queries::StateQueries;
+
+        let db = Database::open_in_memory().unwrap();
+        db.with_connection(|conn| {
+            conn.set_last_closed_ledger(100)?;
+            Ok(())
+        })
+        .unwrap();
+        seed_headers(&db, 110);
+
+        // Anchors at the durable LCL, not MAX(ledgerseq).
+        assert_eq!(db.durable_read_anchor().unwrap(), Some(100));
+        // And it did not delete anything: MAX(ledgerseq) is still 110.
+        assert_eq!(db.get_latest_ledger_seq().unwrap(), Some(110));
+    }
+
+    /// #3870: with no durable LCL yet (fresh/legacy DB), `durable_read_anchor`
+    /// falls back to `MAX(ledgerseq)` — parity with `cleanup_ahead_of_lcl`'s
+    /// `None` branch, which leaves MAX as the effective anchor.
+    #[test]
+    fn test_durable_read_anchor_falls_back_to_max_without_lcl() {
+        let db = Database::open_in_memory().unwrap();
+        seed_headers(&db, 5);
+
+        assert_eq!(db.durable_read_anchor().unwrap(), Some(5));
+    }
+
+    /// #3870: an empty database (no LCL, no ledgers) yields `None`.
+    #[test]
+    fn test_durable_read_anchor_empty_db() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.durable_read_anchor().unwrap(), None);
     }
 
     #[test]
