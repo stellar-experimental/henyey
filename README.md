@@ -1,5 +1,14 @@
 # henyey
 
+> [!WARNING]
+> **This project is deprecated and no longer maintained.**
+>
+> henyey was an experimental Rust reimplementation of stellar-core. Active development has stopped. Scheduled CI and the mainnet validator have been turned off, open issues and pull requests will not be addressed, and no further releases are planned.
+>
+> **Do not use henyey to run a production Stellar node.** Use [stellar-core](https://github.com/stellar/stellar-core) instead.
+>
+> The code stays available for reference and educational use.
+
 A Rust reimplementation of [Stellar Core](https://github.com/stellar/stellar-core) targeting protocol v25 parity. Supports testnet, mainnet, and local standalone networks. Can serve as a drop-in replacement for stellar-core inside the [stellar/quickstart](https://github.com/stellar/quickstart) Docker image. This is an educational experiment and **not** production-grade software.
 
 ## What is Stellar Core?
