@@ -1,9 +1,10 @@
 name: History Publish (Testnet)
 
 on:
-  schedule:
-    # Daily at 08:00 UTC (offset from verify-execution at 06:00)
-    - cron: "0 8 * * *"
+  # Daily schedule disabled 2026-09-23: failing every day. Manual dispatch only.
+  # schedule:
+  #   # Daily at 08:00 UTC (offset from verify-execution at 06:00)
+  #   - cron: "0 8 * * *"
   workflow_dispatch:
     inputs:
       timeout:
