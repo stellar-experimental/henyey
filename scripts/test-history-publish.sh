@@ -13,6 +13,7 @@
 #   ./scripts/test-history-publish.sh --classify-only /path/to/data-dir  # offline classifier (tests)
 #   ./scripts/test-history-publish.sh --stall-threshold 180   # in-loop stall detector threshold
 #   ./scripts/test-history-publish.sh --classify-stall-only /path/to/validator.log 180  # offline stall classifier (tests)
+#   ./scripts/test-history-publish.sh --emit-new-lines-only /path/to/validator.log 0  # offline live-tail diagnostic emitter (tests)
 #
 # Exit codes:
 #   0 = checkpoint matches SDF archive (or an environmental sync-timeout was
@@ -120,6 +121,25 @@ STALL_THRESHOLD_SECS=180
 # Used by scripts/test-history-publish-harness.sh.
 CLASSIFY_STALL_LOG=""
 CLASSIFY_STALL_THRESHOLD=""
+# Offline test seam: when set (via --emit-new-lines-only <log_file> <last_line>)
+# run only emit_new_diagnostic_lines() against an existing log file, echo the
+# new diagnostic-filtered slice, and print the new absolute offset as
+# `NEW_LAST_LINE: <n>` — no validator/build/testnet required. Used by
+# scripts/test-history-publish-harness.sh.
+EMIT_NEW_LOG=""
+EMIT_NEW_LAST_LINE=""
+
+# Live diagnostic tail (#3741): grep filter for the known diagnostic families
+# already root-caused for this exact fixture (#3727: SCP-verify falling behind
+# under load) and the #3702 db_write_ctx/WAL-contention instrumentation.
+# Grep-filtered (not a full firehose) so it doesn't meaningfully add to CI log
+# volume or runner I/O load. Pinned by
+# scripts/test-history-publish-harness.sh::test_diagnostic_grep_pins_known_signal_names
+# so a future wording change in the Rust source breaks that test loudly instead
+# of silently rotting this filter into a no-op. Defined here (up in the config
+# region) so both the --emit-new-lines-only seam and the poll loop share one
+# definition.
+DIAG_GREP_PATTERN='WATCHDOG|maxtps_scp|database is locked|straggler timeout|db_write_ctx'
 
 # The exact run-loop sync marker (crates/app/src/run_cmd.rs::wait_for_sync logs
 # tracing::info!(..., "Node is synced") once on reaching Synced/Validating). This
@@ -142,6 +162,7 @@ while [[ $# -gt 0 ]]; do
     --classify-only)        CLASSIFY_ONLY_DIR="$2"; shift 2 ;;
     --stall-threshold)      STALL_THRESHOLD_SECS="$2"; shift 2 ;;
     --classify-stall-only)  CLASSIFY_STALL_LOG="$2"; CLASSIFY_STALL_THRESHOLD="$3"; shift 3 ;;
+    --emit-new-lines-only)  EMIT_NEW_LOG="$2"; EMIT_NEW_LAST_LINE="$3"; shift 3 ;;
     -h|--help)
       sed -n '3,14p' "$0" | sed 's/^# \?//'
       exit 0 ;;
@@ -252,6 +273,54 @@ if [[ -n "$CLASSIFY_STALL_LOG" ]]; then
     exit 1
   fi
   echo "DISPOSITION: not stalled — validator.log updated within ${CLASSIFY_STALL_THRESHOLD}s"
+  exit 0
+fi
+
+# --- Incremental live-tail diagnostic echo (#3741, #3745) ---
+# Read the new slice of <log_file> starting after <last_line>, echo the lines
+# matching <pattern> to stdout, and report the new absolute line offset via the
+# LAST_LOG_LINE_OUT global. Pure except for that stdout + the one global, so the
+# harness can drive it offline via --emit-new-lines-only.
+#
+# The offset is derived from EXACTLY the slice that was read in a SINGLE `tail`
+# (not from an independent second `wc -l < file`), which is the fix for the
+# #3745 TOCTOU: with only one read there is no window for the log to grow
+# between a line-count and the tail, so the recorded offset can never lag what
+# was actually emitted and already-seen lines are never reprinted. Anything
+# appended after this single read is simply picked up on the next poll.
+emit_new_diagnostic_lines() {
+  local log_file="$1"
+  local last_line="$2"
+  local pattern="$3"
+
+  local slice
+  slice=$(tail -n "+$(( last_line + 1 ))" "$log_file" 2>/dev/null || true)
+
+  if [[ -z "$slice" ]]; then
+    # No new content (or unreadable log) — no advance, nothing printed. Mirrors
+    # the old `CURRENT_LOG_LINES > LAST_LOG_LINE` guard's no-op branch.
+    LAST_LOG_LINE_OUT="$last_line"
+    return 0
+  fi
+
+  # `consumed` counts the lines in the captured slice. Note bash `$(...)` strips
+  # trailing newlines, so trailing blank line(s) are under-counted and may be
+  # re-read next poll — harmless, since blank lines never match the filter, so
+  # no visible duplicate.
+  local consumed
+  consumed=$(printf '%s\n' "$slice" | wc -l)
+  LAST_LOG_LINE_OUT=$(( last_line + consumed ))
+
+  printf '%s\n' "$slice" | grep -E "$pattern" || true
+}
+
+# Offline test seam: emit the new diagnostic-filtered slice of a single log
+# starting after <last_line>, print the new absolute offset, and exit 0.
+# --emit-new-lines-only <log_file> <last_line>
+if [[ -n "$EMIT_NEW_LOG" ]]; then
+  LAST_LOG_LINE_OUT=0
+  emit_new_diagnostic_lines "$EMIT_NEW_LOG" "$EMIT_NEW_LAST_LINE" "$DIAG_GREP_PATTERN"
+  echo "NEW_LAST_LINE: $LAST_LOG_LINE_OUT"
   exit 0
 fi
 
@@ -379,15 +448,8 @@ echo
 HAS_FILE="$HISTORY_DIR/.well-known/stellar-history.json"
 echo "Waiting for first published checkpoint (timeout: ${TIMEOUT}s, stall threshold: ${STALL_THRESHOLD_SECS}s)..."
 
-# Live diagnostic tail (#3741): grep filter for the known diagnostic families
-# already root-caused for this exact fixture (#3727: SCP-verify falling behind
-# under load) and the #3702 db_write_ctx/WAL-contention instrumentation.
-# Grep-filtered (not a full firehose) so it doesn't meaningfully add to CI log
-# volume or runner I/O load. Pinned by
-# scripts/test-history-publish-harness.sh::test_diagnostic_grep_pins_known_signal_names
-# so a future wording change in the Rust source breaks that test loudly instead
-# of silently rotting this filter into a no-op.
-DIAG_GREP_PATTERN='WATCHDOG|maxtps_scp|database is locked|straggler timeout|db_write_ctx'
+# DIAG_GREP_PATTERN is defined up in the config region so both the poll loop
+# below and the --emit-new-lines-only test seam share one definition.
 LAST_LOG_LINE=0
 
 START_TIME=$(date +%s)
@@ -438,11 +500,8 @@ while true; do
   # captures even under an external job-level cancellation (unlike the
   # artifact upload). No background process/PID cleanup needed — this stays
   # inside the existing single-threaded 5s poll loop.
-  CURRENT_LOG_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
-  if [[ "$CURRENT_LOG_LINES" -gt "$LAST_LOG_LINE" ]]; then
-    tail -n "+$(( LAST_LOG_LINE + 1 ))" "$LOG_FILE" | grep -E "$DIAG_GREP_PATTERN" || true
-    LAST_LOG_LINE="$CURRENT_LOG_LINES"
-  fi
+  emit_new_diagnostic_lines "$LOG_FILE" "$LAST_LOG_LINE" "$DIAG_GREP_PATTERN"
+  LAST_LOG_LINE="$LAST_LOG_LINE_OUT"
 
   # Check for published HAS
   if [[ -f "$HAS_FILE" ]]; then
